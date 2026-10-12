@@ -1,8 +1,0 @@
-[
-  {
-    "platform": 1,
-    "abilitys": [
-      { "feature": "remote_clipboard_v5", "original_version": "4.20.0", "final_version": "" }
-    ]
-  }
-]

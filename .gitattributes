@@ -1,3 +1,0 @@
-# Catalog signatures cover exact file bytes, including INF line endings.
-/assets/drivers/** binary
-/drivers/**/*.inf -text whitespace=cr-at-eol
