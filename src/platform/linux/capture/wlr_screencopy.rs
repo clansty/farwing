@@ -17,8 +17,8 @@
 //!
 //! The copy carries no scaling: the buffer has to be exactly the output's size,
 //! and the caller scales afterwards like it does for the portal.
-use super::Screen;
 use super::Picture;
+use super::Screen;
 use anyhow::{Context, Result, bail, ensure};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::time::{Duration, Instant};
