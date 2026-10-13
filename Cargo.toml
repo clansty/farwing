@@ -202,6 +202,7 @@ pollster = "0.4"
 # everything built on them serve it, and unlike the portal it never asks the
 # local user for consent.
 wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 
 [patch.crates-io]
