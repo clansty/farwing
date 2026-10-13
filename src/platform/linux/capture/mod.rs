@@ -285,6 +285,9 @@ impl Desktop {
         let screen = refresh(selected)?;
         let size = (screen.width & !1, screen.height & !1);
         let backend = Backend::select(&screen, false, size)?;
+        if wayland_session() {
+            tracing::info!("Wayland session: the compositor draws the pointer into the frames");
+        }
         Ok(Self {
             device: Device,
             screen,
@@ -331,6 +334,15 @@ impl Desktop {
                 self.last = None;
             }
         }
+        // A compositor draws the pointer into the frames when it is asked to,
+        // and on a Wayland session it is the only one that can: X11 sampling
+        // cannot see a compositor's pointer at all -- it reports a position
+        // that never leaves where XWayland started it, and a shape some X11
+        // client last set -- so there is nothing true to publish in its place.
+        // Asking for the cursor is not optional here, then: a controller that
+        // draws the pointer itself would have nothing to draw it with.
+        let composited = wayland_session();
+        let cursor = cursor || composited;
         // The portal and wlr-screencopy draw the cursor or leave it out for the
         // whole session; a change of request moves to a session with the other
         // mode.
@@ -354,11 +366,19 @@ impl Desktop {
         {
             self.backend = Backend::NvFbc(nvfbc::Grab::open(&self.screen, cursor, wanted)?);
         }
-        self.cursor = match self.sampler.sample() {
-            Ok(pointer) => Some(pointer),
-            Err(error) => {
-                tracing::debug!(%error, "host cursor sampling failed");
-                None
+        // Left unsampled on a Wayland session: what the sampler would report is
+        // an X11 pointer, not the one the compositor is drawing. The channel
+        // then says the pointer is hidden, which is what keeps a controller
+        // that draws its own pointer from painting a second one over this one.
+        self.cursor = if composited {
+            None
+        } else {
+            match self.sampler.sample() {
+                Ok(pointer) => Some(pointer),
+                Err(error) => {
+                    tracing::debug!(%error, "host cursor sampling failed");
+                    None
+                }
             }
         };
         let deadline = Instant::now() + Duration::from_millis(u64::from(timeout));
