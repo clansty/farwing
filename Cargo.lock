@@ -3678,6 +3678,8 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "wayland-client",
+ "wayland-protocols-wlr",
  "webrtc",
  "webrtc-srtp",
  "wgpu",

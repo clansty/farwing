@@ -19,8 +19,8 @@ use crate::media::encoding::rate::Controller;
 use crate::media::encoding::{Backend, Codec, Color, Encoded, Format, Rate};
 use anyhow::{Context as _, Result, bail, ensure};
 use cros_libva::{
-    Buffer, BufferType, Context, Display, Image as VaImage, MappedCodedBuffer, Picture, Surface,
-    UsageHint, VA_RT_FORMAT_YUV420, VAConfigAttrib, VAConfigAttribType, VAEntrypoint,
+    Context, Display, Image as VaImage, MappedCodedBuffer, Picture, Surface, UsageHint,
+    VA_RT_FORMAT_YUV420, VAConfigAttrib, VAConfigAttribType, VAEntrypoint,
 };
 use std::cell::RefCell;
 use std::rc::Rc;

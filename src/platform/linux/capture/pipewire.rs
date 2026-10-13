@@ -9,6 +9,7 @@
 //! Frames are requested in shared memory (MemPtr/MemFd), read on PipeWire's
 //! loop thread into BGRA and handed to the capture thread as the latest
 //! picture; DMA-BUF import belongs with a GPU encoder.
+use super::Picture;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -363,11 +364,6 @@ unsafe fn parse_format(pod: *const c_void) -> Option<(u32, u32, u32)> {
 // --- Stream ----------------------------------------------------------------------
 
 /// One captured picture as the stream delivered it, converted to BGRA.
-pub(super) struct Picture {
-    pub width: u32,
-    pub height: u32,
-    pub pixels: Vec<u8>,
-}
 
 #[derive(Default)]
 struct State {
