@@ -1,44 +1,119 @@
 //! VA-API encoding on the GPU that drives the display: the counterpart of
 //! NVENC on NVIDIA, and the only hardware encoder an AMD or Intel host has.
 //!
-//! SPS/PPS come from the driver. Packed headers are deliberately not requested
-//! through the config, so the driver writes the parameter sets into the coded
-//! buffer itself, which is also what the probe in `encoder.rs` parses back.
+//! Parameter sets come from this crate, not the driver: libva writes them only
+//! when the pipeline is configured for packed headers, so a stream from
+//! `vaEndPicture` carries slices alone and each codec's module supplies the
+//! rest. `h264.rs` and `hevc.rs` own everything codec-specific, including the
+//! frame parameters, which have to agree with those parameter sets.
 //!
 //! Capture hands over tightly packed BGRA while every encode entrypoint takes
 //! NV12, so each frame converts on the CPU into the mapped NV12 image of the
 //! input surface. `yuv` does the colour work with the same BT.601 limited range
 //! the software encoder declares.
 mod h264;
+mod hevc;
 
 use super::capture::Image as Captured;
 use crate::media::encoding::rate::Controller;
 use crate::media::encoding::{Backend, Codec, Color, Encoded, Format, Rate};
-use anyhow::{Context as _, Result, ensure};
+use anyhow::{Context as _, Result, bail, ensure};
 use cros_libva::{
-    BufferType, Context, Display, EncPictureParameter, EncPictureParameterBufferH264,
-    EncSequenceParameter, EncSequenceParameterBufferH264, EncSliceParameter,
-    EncSliceParameterBufferH264, H264EncPicFields, H264EncSeqFields, Image as VaImage,
-    MappedCodedBuffer, Picture, PictureH264, Surface, UsageHint, VA_INVALID_ID, VA_INVALID_SURFACE,
-    VA_PICTURE_H264_SHORT_TERM_REFERENCE, VA_RT_FORMAT_YUV420, VAConfigAttrib, VAConfigAttribType,
-    VAEntrypoint, VAProfile,
+    Buffer, BufferType, Context, Display, Image as VaImage, MappedCodedBuffer, Picture, Surface,
+    UsageHint, VA_RT_FORMAT_YUV420, VAConfigAttrib, VAConfigAttribType, VAEntrypoint,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// H.264 codes whole macroblocks.
+/// H.264 codes whole macroblocks. HEVC's larger coding tree blocks live with it.
 const MB: u32 = 16;
-/// The sequence header below uses `log2_max_frame_num_minus4 = 1` and
-/// `log2_max_pic_order_cnt_lsb_minus4 = 2`, so these are the wrap points of the
-/// two counters that go into the picture and slice headers.
-const FRAME_NUM_MODULO: u16 = 1 << 5;
-const POC_MODULO: u16 = 1 << 6;
-const SLICE_REFS: usize = 32;
-
 /// The PCI vendors whose VA-API encoder is what the protocol already calls
 /// `Amd` and `Intel`. Any other vendor stays unclaimed rather than mislabelled.
 const PCI_VENDOR_AMD: u16 = 0x1002;
 const PCI_VENDOR_INTEL: u16 = 0x8086;
+
+/// Bit-level writer for the RBSP of a parameter set, shared by the codec
+/// modules.
+#[derive(Default)]
+pub(super) struct BitWriter {
+    bytes: Vec<u8>,
+    /// Bits already occupied in the last byte of `bytes`.
+    used: u8,
+}
+
+impl BitWriter {
+    fn bit(&mut self, value: u32) {
+        if self.used == 0 {
+            self.bytes.push(0);
+        }
+        if value & 1 != 0 {
+            let last = self.bytes.len() - 1;
+            self.bytes[last] |= 0x80 >> self.used;
+        }
+        self.used = (self.used + 1) % 8;
+    }
+
+    /// Writes `count` bits, most significant first. A field wider than the
+    /// value it is written from has to be split by the caller.
+    pub(super) fn bits(&mut self, value: u32, count: u32) {
+        debug_assert!(count <= 32, "位宽超过 u32 的字段要分段写入");
+        for shift in (0..count).rev() {
+            self.bit((value >> shift) & 1);
+        }
+    }
+
+    /// Unsigned Exp-Golomb.
+    pub(super) fn ue(&mut self, value: u32) {
+        let leading = 31 - value.saturating_add(1).leading_zeros();
+        self.bits(0, leading);
+        self.bits(value + 1, leading + 1);
+    }
+
+    /// Signed Exp-Golomb.
+    pub(super) fn se(&mut self, value: i32) {
+        self.ue(if value <= 0 {
+            (-value * 2) as u32
+        } else {
+            (value * 2 - 1) as u32
+        });
+    }
+
+    /// Closes the RBSP and turns it into an EBSP: a 0x03 is inserted after any
+    /// two zero bytes that a following byte would otherwise turn into a start
+    /// code, which is what a decoder strips back out.
+    pub(super) fn finish(mut self) -> Vec<u8> {
+        self.bit(1);
+        while self.used != 0 {
+            self.bit(0);
+        }
+        let mut escaped = Vec::with_capacity(self.bytes.len() + 8);
+        let mut zeros = 0u8;
+        for byte in self.bytes {
+            if zeros >= 2 && byte <= 3 {
+                escaped.push(3);
+                zeros = 0;
+            }
+            zeros = if byte == 0 { zeros + 1 } else { 0 };
+            escaped.push(byte);
+        }
+        escaped
+    }
+}
+
+pub(super) fn start_code() -> [u8; 4] {
+    [0, 0, 0, 1]
+}
+
+/// The length of the start code a coded buffer's NAL unit begins with.
+pub(super) fn start_code_len(payload: &[u8]) -> Result<usize> {
+    if payload.starts_with(&[0, 0, 0, 1]) {
+        Ok(4)
+    } else if payload.starts_with(&[0, 0, 1]) {
+        Ok(3)
+    } else {
+        bail!("编码器输出没有起始码");
+    }
+}
 
 thread_local! {
     /// `vaInitialize` is expensive and a display is bound to the thread that
@@ -130,10 +205,6 @@ fn device() -> Result<(Rc<Display>, u16)> {
     })
 }
 
-fn display() -> Result<Rc<Display>> {
-    device().map(|(display, _)| display)
-}
-
 /// The wire backend for this machine's VA-API encoder, or `None` when the GPU
 /// is from a vendor the protocol has no id for.
 pub(crate) fn hardware_backend() -> Option<Backend> {
@@ -144,12 +215,12 @@ pub(crate) fn hardware_backend() -> Option<Backend> {
     }
 }
 
-/// The profile the emitted parameter sets declare. Constrained baseline is
-/// what the stream is: CAVLC, no B frames, no scaling matrices.
+/// The VA profile a format is encoded with.
 fn profile(format: Format) -> Option<i32> {
     match format.codec {
-        Codec::H264 => Some(VAProfile::VAProfileH264ConstrainedBaseline),
-        _ => None,
+        Codec::H264 => Some(h264::profile()),
+        Codec::H265 => Some(hevc::profile()),
+        Codec::Av1 => None,
     }
 }
 
@@ -167,11 +238,21 @@ fn entrypoint(display: &Display, profile: i32) -> Option<u32> {
 }
 
 fn profile_entrypoint(format: Format) -> Option<(Rc<Display>, i32, u32)> {
-    let display = display().ok()?;
+    let display = device().map(|(display, _)| display).ok()?;
     let profile = profile(format)?;
     let entrypoint = entrypoint(&display, profile)?;
     Some((display, profile, entrypoint))
 }
+
+/// HEVC is written but deliberately not offered yet. The slice headers the
+/// driver produces do not line up with the parameter sets in `hevc.rs` — the
+/// driver decides for itself which conditional fields to write, and the ones it
+/// picks do not match what those sets declare, so a decoder misparses the
+/// header (`alignment_bit_equal_to_one=0`). Everything else about the codec is
+/// in place; see AGENTS_QA.md for what has been ruled out. Flip this on once
+/// the slice header agrees, never before: an advertised codec that produces
+/// undecodable streams would be picked by negotiation.
+const HEVC_ADVERTISED: bool = false;
 
 /// Whether this GPU declares support for `format`. Only the profile and
 /// entrypoint are checked; whether a usable stream comes out is decided by the
@@ -179,7 +260,8 @@ fn profile_entrypoint(format: Format) -> Option<(Rc<Display>, i32, u32)> {
 pub(crate) fn accepts(format: Format) -> bool {
     // The capture backends deliver 8-bit BGRA; any other input format would
     // need a different surface type and conversion here.
-    format.chroma == 1 && format.depth == 8 && profile_entrypoint(format).is_some()
+    let codec = h264::accepts(format) || (HEVC_ADVERTISED && hevc::accepts(format));
+    codec && profile_entrypoint(format).is_some()
 }
 
 /// The largest picture this profile accepts, used to cap the negotiated size.
@@ -201,25 +283,82 @@ pub(crate) fn maximum_size(format: Format) -> (u32, u32) {
     )
 }
 
-fn invalid_picture() -> PictureH264 {
-    PictureH264::new(VA_INVALID_ID, 0, VA_INVALID_SURFACE, 0, 0)
+/// Which codec's headers and counters a stream uses.
+enum CodecState {
+    H264(h264::State),
+    H265(hevc::State),
 }
 
-fn reference_picture(surface: u32, frame_idx: u32, poc: i32) -> PictureH264 {
-    PictureH264::new(
-        surface,
-        frame_idx,
-        VA_PICTURE_H264_SHORT_TERM_REFERENCE,
-        poc,
-        poc,
-    )
+impl CodecState {
+    fn new(format: Format) -> Option<Self> {
+        match format.codec {
+            Codec::H264 => Some(Self::H264(h264::State::new())),
+            Codec::H265 => Some(Self::H265(hevc::State::new())),
+            Codec::Av1 => None,
+        }
+    }
+
+    /// The level whose limits cover this picture size.
+    fn level(format: Format, size: (u32, u32)) -> u8 {
+        match format.codec {
+            Codec::H265 => hevc::level(size),
+            _ => h264::level(size),
+        }
+    }
+
+    fn reset(&mut self, keyframe: bool) {
+        match self {
+            Self::H264(state) => state.reset(keyframe),
+            Self::H265(state) => state.reset(keyframe),
+        }
+    }
+
+    fn advance(&mut self) {
+        match self {
+            Self::H264(state) => state.advance(),
+            Self::H265(state) => state.advance(),
+        }
+    }
+
+    fn parameter_sets(&self, size: (u32, u32), level: u8) -> Vec<u8> {
+        match self {
+            Self::H264(_) => h264::parameter_sets(size, level),
+            Self::H265(_) => hevc::parameter_sets(size, level),
+        }
+    }
+
+    fn patch_nal(&self, payload: &mut [u8], keyframe: bool) -> Result<()> {
+        match self {
+            Self::H264(_) => h264::State::patch_nal(payload, keyframe),
+            Self::H265(_) => hevc::State::patch_nal(payload, keyframe),
+        }
+    }
+
+    fn buffers(
+        &self,
+        context: &Rc<Context>,
+        coded: u32,
+        reconstructed: u32,
+        size: (u32, u32),
+        rate: Rate,
+        qp: u8,
+        keyframe: bool,
+    ) -> Result<Vec<cros_libva::Buffer>> {
+        match self {
+            Self::H264(state) => {
+                state.buffers(context, coded, reconstructed, size, rate, qp, keyframe)
+            }
+            Self::H265(state) => {
+                state.buffers(context, coded, reconstructed, size, rate, qp, keyframe)
+            }
+        }
+    }
 }
 
-/// One reconstructed picture, kept so the next P frame can point at it.
-#[derive(Clone, Copy)]
-struct Reference {
-    frame_idx: u32,
-    poc: i32,
+/// The frame QP for a quality setting. Quality rises with the value, so the QP
+/// falls.
+fn qp(quality: i32) -> u8 {
+    (51 - 4 * quality.clamp(0, 5)).clamp(1, 51) as u8
 }
 
 pub(crate) struct Encoder {
@@ -240,11 +379,7 @@ pub(crate) struct Encoder {
     frame_rate: Controller,
     /// Reused BGRA to planar conversion output: Y, then U, then V.
     planar: Vec<u8>,
-    frame_num: u16,
-    frame_idx: u32,
-    idr_pic_id: u16,
-    poc_lsb: u16,
-    reference: Option<Reference>,
+    codec: CodecState,
     force_keyframe: bool,
 }
 
@@ -252,9 +387,10 @@ impl Encoder {
     pub(crate) fn new(size: (u32, u32), format: Format, rate: Rate) -> Result<Self> {
         ensure!(size.0 >= 2 * MB && size.1 >= 2 * MB, "编码尺寸过小");
         ensure!(
-            format.chroma == 1 && format.depth == 8,
-            "VA-API 输入只支持 8 位 4:2:0"
+            Format { depth: 8, ..format } == format,
+            "VA-API 输入只支持 8 位"
         );
+        let codec = CodecState::new(format).context("VA-API 不支持该编码格式")?;
         let (display, profile, entrypoint) =
             profile_entrypoint(format).context("VA-API 不支持该编码格式")?;
 
@@ -311,11 +447,7 @@ impl Encoder {
             rate,
             frame_rate: Controller::new(rate),
             planar: vec![0; size.0 as usize * size.1 as usize * 3 / 2],
-            frame_num: 0,
-            frame_idx: 0,
-            idr_pic_id: 0,
-            poc_lsb: 0,
-            reference: None,
+            codec,
             force_keyframe: true,
         })
     }
@@ -400,21 +532,12 @@ impl Encoder {
     }
 
     fn encode_frame(&mut self, timestamp_100ns: i64, keyframe: bool) -> Result<Vec<Encoded>> {
-        // An IDR resets the counter cycle it opens, so the reset happens before
-        // the headers are built rather than after.
-        if keyframe {
-            self.frame_num = 0;
-            self.frame_idx = 0;
-            self.poc_lsb = 0;
-            self.idr_pic_id = self.idr_pic_id.wrapping_add(1) & 0xffff;
-            self.reference = None;
-        }
-        let (frame_idx, frame_num, poc_lsb) = (self.frame_idx, self.frame_num, self.poc_lsb);
-        let poc = i32::from(poc_lsb);
-        let reference = self.reference;
+        self.codec.reset(keyframe);
         let (width, height) = self.size;
-        let level = level_idc(width, height);
+        let size = (width, height);
+        let level = CodecState::level(self.format, size);
         let quality_qp = qp(self.rate.quality);
+
         let source = self.input.take().context("编码输入 surface 已被取走")?;
         let mut picture = Picture::new(
             timestamp_100ns.max(0) as u64,
@@ -423,105 +546,17 @@ impl Encoder {
         );
         self.upload(&picture)?;
 
-        let mut references: [PictureH264; 16] = std::array::from_fn(|_| invalid_picture());
-        if let Some(reference) = reference {
-            references[0] =
-                reference_picture(self.reconstructed_id, reference.frame_idx, reference.poc);
+        for buffer in self.codec.buffers(
+            &self.context,
+            self.coded.id(),
+            self.reconstructed_id,
+            size,
+            self.rate,
+            quality_qp,
+            keyframe,
+        )? {
+            picture.add_buffer(buffer);
         }
-
-        let sequence = BufferType::EncSequenceParameter(EncSequenceParameter::H264(
-            EncSequenceParameterBufferH264::new(
-                0,
-                level,
-                self.rate.fps.max(1),
-                self.rate.fps.max(1),
-                1,
-                self.rate.target,
-                1,
-                width.div_ceil(MB) as u16,
-                height.div_ceil(MB) as u16,
-                &H264EncSeqFields::new(1, 1, 0, 0, 1, 1, 0, 2, 0),
-                0,
-                0,
-                0,
-                0,
-                0,
-                [0; 256],
-                None,
-                None,
-                255,
-                1,
-                1,
-                1,
-                self.rate.fps.max(1) * 2,
-            ),
-        ));
-
-        let picture_parameter = BufferType::EncPictureParameter(EncPictureParameter::H264(
-            EncPictureParameterBufferH264::new(
-                reference_picture(self.reconstructed_id, frame_idx, poc),
-                references,
-                self.coded.id(),
-                0,
-                0,
-                0,
-                frame_num,
-                quality_qp,
-                0,
-                0,
-                0,
-                0,
-                &H264EncPicFields::new(u32::from(keyframe), 1, 0, 0, 0, 0, 0, 0, 0, 0, 0),
-            ),
-        ));
-
-        let mut slice_refs: [PictureH264; SLICE_REFS] = std::array::from_fn(|_| invalid_picture());
-        if let Some(reference) = reference {
-            slice_refs[0] =
-                reference_picture(self.reconstructed_id, reference.frame_idx, reference.poc);
-        }
-        let slice = BufferType::EncSliceParameter(EncSliceParameter::H264(
-            EncSliceParameterBufferH264::new(
-                0,
-                width.div_ceil(MB) * height.div_ceil(MB),
-                VA_INVALID_ID,
-                if keyframe { 2 } else { 0 },
-                0,
-                self.idr_pic_id,
-                poc_lsb,
-                0,
-                [0, 0],
-                1,
-                0,
-                0,
-                0,
-                slice_refs,
-                std::array::from_fn(|_| invalid_picture()),
-                0,
-                0,
-                0,
-                [0; 32],
-                [0; 32],
-                0,
-                [[0; 2]; 32],
-                [[0; 2]; 32],
-                0,
-                [0; 32],
-                [0; 32],
-                0,
-                [[0; 2]; 32],
-                [[0; 2]; 32],
-                0,
-                0,
-                0,
-                2,
-                2,
-            ),
-        ));
-
-        picture.add_buffer(self.context.create_buffer(sequence)?);
-        picture.add_buffer(self.context.create_buffer(picture_parameter)?);
-        picture.add_buffer(self.context.create_buffer(slice)?);
 
         let picture = picture.begin()?.render()?.end()?;
         let picture = picture.sync().map_err(|(error, _)| error)?;
@@ -530,13 +565,7 @@ impl Encoder {
                 .take_surface()
                 .map_err(|_| anyhow::anyhow!("编码输入 surface 仍被占用"))?,
         );
-
-        // The reconstruction of this frame is what the next one references, so
-        // what gets recorded is the identity this frame was encoded with.
-        self.reference = Some(Reference { frame_idx, poc });
-        self.frame_idx = frame_idx + 1;
-        self.frame_num = (frame_num + 1) % FRAME_NUM_MODULO;
-        self.poc_lsb = (poc_lsb + 2) % POC_MODULO;
+        self.codec.advance();
 
         let mut payload = Vec::new();
         let mut segments = 0;
@@ -547,23 +576,11 @@ impl Encoder {
                 payload.extend_from_slice(segment.buf);
             }
         }
-        // The driver emits a start code and then leaves the slice's NAL header
-        // to the application: a zero placeholder byte sits where the header
-        // belongs, and the slice header follows it. Every picture here is a
-        // reference for the next one, so the importance is always 2.
         ensure!(segments == 1, "编码器返回了 {segments} 段码流");
-        let prefix = if payload.starts_with(&[0, 0, 0, 1]) {
-            4
-        } else if payload.starts_with(&[0, 0, 1]) {
-            3
-        } else {
-            anyhow::bail!("编码器输出没有起始码");
-        };
-        let header = if keyframe { 0x65 } else { 0x41 };
-        payload[prefix] = header;
+        self.codec.patch_nal(&mut payload, keyframe)?;
 
         let mut data = if keyframe {
-            h264::parameter_sets(width, height, level)
+            self.codec.parameter_sets(size, level)
         } else {
             Vec::new()
         };
@@ -594,29 +611,9 @@ impl Encoder {
     }
 }
 
-/// The H.264 level whose limits cover this picture size.
-fn level_idc(width: u32, height: u32) -> u8 {
-    match width.div_ceil(MB) * height.div_ceil(MB) {
-        0..=99 => 10,
-        100..=396 => 20,
-        397..=1620 => 30,
-        1621..=3600 => 31,
-        3601..=8192 => 40,
-        8193..=22080 => 41,
-        22081..=87040 => 50,
-        _ => 51,
-    }
-}
-
-/// The frame QP for a quality setting. Quality rises with the value, so the QP
-/// falls.
-fn qp(quality: i32) -> u8 {
-    (51 - 4 * quality.clamp(0, 5)).clamp(1, 51) as u8
-}
-
-/// Encodes a synthetic frame and parses the SPS back, which is the same check
-/// `encoder::probe` applies. Needs a GPU with a VA-API encoder:
-/// `cargo test -- --ignored encodes_h264_with_a_parseable_sps`.
+/// Encodes synthetic frames and parses the parameter sets back, then leaves the
+/// stream in `/tmp` for a decoder to check. Needs a GPU with a VA-API encoder:
+/// `cargo test -- --ignored encodes_with_parseable_parameter_sets`.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,6 +637,7 @@ mod tests {
         for (index, pixel) in bgra.chunks_exact_mut(4).enumerate() {
             let column = (index as u32 % width) as u8;
             let row = (index as u32 / width) as u8;
+            // BGRA: blue follows the row, green the column, red the sum.
             pixel.copy_from_slice(&[row, column, row.wrapping_add(column), 0xff]);
         }
         Captured::Cpu {
@@ -649,15 +647,13 @@ mod tests {
         }
     }
 
-    #[test]
-    #[ignore]
-    fn encodes_h264_with_a_parseable_sps() {
+    fn check(codec: Codec, media: crate::media::VideoCodec, name: &str) {
         let format = Format {
-            codec: Codec::H264,
+            codec,
             chroma: 1,
             depth: 8,
         };
-        assert!(accepts(format), "VA-API 不接受 H.264 4:2:0 8 位");
+        assert!(accepts(format), "VA-API 不接受这个格式");
         println!("device: {:?}", display_node());
         println!("backend: {:?}", hardware_backend());
         println!("maximum {:?}", maximum_size(format));
@@ -665,47 +661,51 @@ mod tests {
         let size = (1280, 720);
         let mut encoder = Encoder::new(size, format, rate()).unwrap();
         let source = frame(size.0, size.1);
-
         let mut stream = Vec::new();
         for index in 0..4 {
             let encoded = encoder
                 .encode(&source, i64::from(index) * 166_666, index == 0)
                 .unwrap();
-            let parsed = crate::media::video_format::parse_stream_format(
-                crate::media::VideoCodec::H264,
-                &encoded[0].data,
-            );
             stream.extend_from_slice(&encoded[0].data);
             let units = crate::media::video_format::annex_b_units(&encoded[0].data);
             println!(
-                "frame {index}: {} bytes, keyframe {}, {} units, NAL types {:?}",
+                "frame {index}: {} bytes, keyframe {}, units {}",
                 encoded[0].data.len(),
                 encoded[0].keyframe,
-                units.len(),
-                units
-                    .iter()
-                    .map(|unit| unit.first().map_or(255, |header| header & 0x1f))
-                    .collect::<Vec<_>>()
+                units.len()
             );
             if index == 0 {
-                println!(
-                    "head: {:02x?}",
-                    &encoded[0].data[..encoded[0].data.len().min(48)]
-                );
-                let parsed = parsed.expect("首个 IDR 里没有 SPS");
+                let parsed =
+                    crate::media::video_format::parse_stream_format(media, &encoded[0].data)
+                        .expect("首个 IDR 里没有参数集");
                 assert_eq!(parsed.chroma_format_idc, 1);
                 assert_eq!(parsed.bit_depth_luma, 8);
                 assert_eq!(
                     (parsed.visible_width, parsed.visible_height),
                     size,
-                    "SPS 里的画面尺寸与请求不一致"
+                    "参数集里的画面尺寸与请求不一致"
                 );
             }
         }
-        std::fs::write("/tmp/openuuyc-vaapi-test.h264", &stream).unwrap();
-        println!(
-            "wrote /tmp/openuuyc-vaapi-test.h264 ({} bytes)",
-            stream.len()
-        );
+        let extension = match media {
+            crate::media::VideoCodec::H264 => "h264",
+            crate::media::VideoCodec::H265 => "h265",
+            crate::media::VideoCodec::Av1 => "obu",
+        };
+        let path = format!("/tmp/openuuyc-vaapi-{name}.{extension}");
+        std::fs::write(&path, &stream).unwrap();
+        println!("wrote {path} ({} bytes)", stream.len());
+    }
+
+    #[test]
+    #[ignore]
+    fn encodes_h264_with_parseable_parameter_sets() {
+        check(Codec::H264, crate::media::VideoCodec::H264, "h264");
+    }
+
+    #[test]
+    #[ignore]
+    fn encodes_h265_with_parseable_parameter_sets() {
+        check(Codec::H265, crate::media::VideoCodec::H265, "h265");
     }
 }
