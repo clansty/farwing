@@ -43,6 +43,18 @@ pub(super) async fn run(
             .filter(|(_, m)| m.capturing && m.visible)
             .max_by_key(|(_, m)| m.screen.id == current)
             .and_then(|(index, _)| lock(&reports.pointers[*index]).clone());
+        // Which screen the pointer is on is only known while it is on one this
+        // connection is streaming: those are the coordinates the sampler's
+        // report is in, and the screen the controller draws the pointer on.
+        //
+        // The shape does not depend on that. A controller that draws the
+        // pointer itself -- which is what it asks for when it turns capture
+        // composition off -- draws it where it is aiming, and needs the shape
+        // to draw; a pointer that cannot be placed, because it is on a monitor
+        // nobody is watching or because the sampler is an X11 one that cannot
+        // see a Wayland compositor's pointer, is still the shape the controller
+        // should be showing. Reporting it as hidden instead leaves the picture
+        // with no pointer at all.
         let screen = pointer.as_ref().and_then(|p| {
             lock(&reports.catalog)
                 .iter()
@@ -60,8 +72,7 @@ pub(super) async fn run(
         });
         let visible = pointer
             .as_ref()
-            .is_some_and(|p| p.showing && p.image.is_some())
-            && screen.is_some();
+            .is_some_and(|p| p.showing && p.image.is_some());
         let image = if visible {
             pointer.as_ref().and_then(|p| p.image.clone())
         } else {
