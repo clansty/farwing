@@ -99,6 +99,14 @@ impl Injector {
         }
     }
 
+    /// Whether absolute positions reach the pointer through the compositor's
+    /// own layout rather than through the display server's. The virtual devices
+    /// are resolved by the compositor, which reads them as a fraction of that
+    /// layout; X Test is resolved by X, in X's rectangles.
+    pub fn aims_in_compositor_layout(&self) -> bool {
+        matches!(self, Self::UInput(_))
+    }
+
     /// What the diagnostics page calls this session's injector.
     pub fn label(&self) -> &'static str {
         match self {
@@ -370,7 +378,6 @@ mod session_tests {
         injector.move_to(before.0, before.1).unwrap();
         injector.flush().unwrap();
     }
-
     /// Types OPENUUYC_TYPE_TEXT into whatever has focus.
     #[test]
     #[ignore = "types into the focused window of the live session"]

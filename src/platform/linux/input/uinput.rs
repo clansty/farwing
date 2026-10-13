@@ -60,6 +60,7 @@ const UI_SET_EVBIT: libc::c_ulong = 0x4004_5564;
 const UI_SET_KEYBIT: libc::c_ulong = 0x4004_5565;
 const UI_SET_RELBIT: libc::c_ulong = 0x4004_5566;
 const UI_SET_ABSBIT: libc::c_ulong = 0x4004_5567;
+
 const UI_SET_LEDBIT: libc::c_ulong = 0x4004_5569;
 const UI_SET_PROPBIT: libc::c_ulong = 0x4004_556E;
 const UI_DEV_CREATE: libc::c_ulong = 0x0000_5501;
@@ -265,6 +266,10 @@ pub(super) struct Injector {
     /// only appears once the desktop size is known.
     absolute: Option<Device>,
     desktop: Option<Desktop>,
+    /// When the absolute device was made, and the position to keep writing
+    /// until the compositor has certainly opened it.
+    made: Option<std::time::Instant>,
+    repeat: Option<Repeat>,
     /// Where this backend last left the pointer. The kernel cannot be asked.
     position: (i32, i32),
     /// The lock keys, as a mask of the LEDs they drive.
@@ -298,7 +303,7 @@ impl Injector {
             for axis in [REL_X, REL_Y, REL_WHEEL, REL_HWHEEL] {
                 device.relative(axis)?;
             }
-            device.property(INPUT_PROP_POINTER)
+            device.property(INPUT_PROP_DIRECT)
         })
         .context("创建虚拟鼠标失败")?;
         Ok(Self {
@@ -306,6 +311,8 @@ impl Injector {
             relative,
             absolute: None,
             desktop: None,
+            made: None,
+            repeat: None,
             position: (0, 0),
             leds: 0,
         })
@@ -313,6 +320,20 @@ impl Injector {
 
     pub(super) fn label(&self) -> &'static str {
         "uinput · 系统级虚拟输入"
+    }
+
+    /// Makes the absolute device early, from the desk the compositor itself
+    /// describes, so that it has been open for a while before anything aims at
+    /// it. A compositor opens a device this process has just made in its own
+    /// time -- hundreds of milliseconds -- and evdev hands a reader only what
+    /// arrives after it opens, so a position written in that window reaches
+    /// nobody. The rounds the session later reports replace this desk if it is
+    /// not the same one.
+    pub(super) fn prime(&mut self) -> Result<()> {
+        let Some(desk) = compositor_desktop() else {
+            return Ok(());
+        };
+        self.set_geometry(desk)
     }
 
     /// Records the desktop the absolute pointer spans and creates that device
@@ -325,6 +346,8 @@ impl Injector {
         // The ranges are what the compositor divides the desktop by, so a
         // desktop of a different size needs a device that says so.
         self.absolute = None;
+        self.made = None;
+        self.repeat = None;
         if desktop.width == 0 || desktop.height == 0 {
             return Ok(());
         }
@@ -338,12 +361,14 @@ impl Injector {
             device.event_type(EV_ABS)?;
             device.absolute(ABS_X, width)?;
             device.absolute(ABS_Y, height)?;
-            // "The coordinates map onto the output": without this a compositor
-            // has no reason to read an absolute pointer as screen positions.
-            device.property(INPUT_PROP_DIRECT)
+            // A pointer, not a direct device: `INPUT_PROP_DIRECT` tells a
+            // compositor the coordinates map onto a single output, and these
+            // are a fraction of the whole desk.
+            device.property(INPUT_PROP_POINTER)
         })
         .context("创建虚拟绝对鼠标失败")?;
         self.absolute = Some(device);
+        self.made = Some(std::time::Instant::now());
         Ok(())
     }
 
@@ -379,6 +404,20 @@ impl Injector {
                 return Ok(());
             }
         };
+        self.write_absolute(target_x, target_y)?;
+        if let Some(made) = self.made.filter(|made| made.elapsed() < FRESH_FOR) {
+            self.repeat = Some(Repeat {
+                until: made + FRESH_FOR,
+                at: std::time::Instant::now(),
+                position: (target_x, target_y),
+                offset: 0,
+            });
+        }
+        Ok(())
+    }
+
+    /// Writes one absolute position, in the desk's own coordinates.
+    fn write_absolute(&mut self, target_x: i32, target_y: i32) -> Result<()> {
         let Some(desktop) = self.desktop else {
             bail!("尚未取得桌面尺寸，无法绝对定位");
         };
@@ -512,10 +551,74 @@ impl Injector {
         result
     }
 
-    /// Every event is written as it is made, so there is nothing buffered.
+    /// Every event is written as it is made, so there is nothing buffered --
+    /// except a position aimed at a device that may not have been opened yet,
+    /// which goes out again until it certainly has been.
     pub(super) fn flush(&mut self) -> Result<()> {
-        Ok(())
+        let Some(repeat) = &mut self.repeat else {
+            return Ok(());
+        };
+        let now = std::time::Instant::now();
+        if now >= repeat.until {
+            let (x, y) = repeat.position;
+            self.repeat = None;
+            return self.write_absolute(x, y);
+        }
+        if now.duration_since(repeat.at) < REPEAT_EVERY {
+            return Ok(());
+        }
+        repeat.at = now;
+        repeat.offset ^= 1;
+        let (x, y) = repeat.position;
+        let offset = repeat.offset;
+        self.write_absolute(x + offset, y)
     }
+}
+
+/// How long a device that has just been made is given before a position aimed
+/// at it stops being written again. A compositor opens a device this process
+/// has just created in its own time, and evdev hands a reader only what arrives
+/// after it opens, so a position written in that window reaches nobody.
+const FRESH_FOR: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// How often that position is written again while the window lasts.
+const REPEAT_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// A position aimed at a device the compositor may not have opened yet.
+///
+/// The repeat cannot be the same value: the kernel drops an absolute value
+/// equal to the one the device already holds, which is exactly the case here.
+/// It is written one unit along instead -- one unit of a range that spans the
+/// whole desk, so not a pixel anyone can see -- and the exact position is
+/// written once more when the window closes.
+struct Repeat {
+    until: std::time::Instant,
+    at: std::time::Instant,
+    position: (i32, i32),
+    offset: i32,
+}
+
+/// The desk the compositor lays out, as the bounds of every output it
+/// describes. `None` where there is no compositor to ask, which is every
+/// session whose pointer space is the display server's own.
+fn compositor_desktop() -> Option<Desktop> {
+    let layout = crate::platform::linux::display::compositor_layout()?;
+    let left = layout.iter().map(|output| output.left).min()?;
+    let top = layout.iter().map(|output| output.top).min()?;
+    let right = layout
+        .iter()
+        .map(|output| output.left + output.width as i32)
+        .max()?;
+    let bottom = layout
+        .iter()
+        .map(|output| output.top + output.height as i32)
+        .max()?;
+    (right > left && bottom > top).then(|| Desktop {
+        left,
+        top,
+        width: (right - left) as u32,
+        height: (bottom - top) as u32,
+    })
 }
 
 /// The LED a lock key drives.
