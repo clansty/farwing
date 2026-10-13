@@ -434,6 +434,10 @@ impl EncPictureParameterBufferVP9 {
             skip_frame_flag,
             number_skip_frames,
             skip_frames_size,
+            // VA_SEGID_BLOCK_16X16。libva 1.21 起新增这两个字段，
+            // 本 crate 其余部分不涉及分段映射。
+            seg_id_block_size: 0,
+            va_reserved8: Default::default(),
             va_reserved: Default::default(),
         }))
     }
