@@ -339,6 +339,23 @@ pub(crate) async fn receive_session(
                             setting.screen_id = id;
                         }
                     }
+                    // A controller picks another monitor by pointing its
+                    // settings at that screen -- the official one does exactly
+                    // this, and never sends the older restart-capture action for
+                    // it. Nothing is capturing that screen yet, and a request
+                    // naming a screen nobody has started is refused further
+                    // down, which is what "switching does nothing" looks like
+                    // from the controller's side. Start it, and let the refusal
+                    // below speak for a screen that really is gone.
+                    if setting.screen_id >= 0 && session.active_slot(setting.screen_id).is_none() {
+                        if let Err(error) = session.start(setting.screen_id).await {
+                            tracing::warn!(
+                                screen_id = setting.screen_id,
+                                %error,
+                                "host could not start the requested screen"
+                            );
+                        }
+                    }
                     let ids: Vec<_> = if setting.screen_id == EXISTING_SESSION_TRACKS {
                         session
                             .slots
