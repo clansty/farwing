@@ -541,7 +541,17 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
             return;
         };
         let response = shell.input.on_window_event(&window, &event);
-        let consumed = response.consumed;
+        // egui-winit calls every Tab press consumed so that it can move focus,
+        // and counts any focused widget as wanting the keyboard. Neither means
+        // the user is typing into this window, and a remote desktop has to be
+        // able to send Tab: Alt+Tab and Win+Tab are how the far side switches
+        // windows. The player therefore asks egui whether a text field is
+        // taking input, which is the same question the Windows viewer asks
+        // before it lets a key through.
+        let consumed = match event {
+            WindowEvent::KeyboardInput { .. } => shell.context.text_edit_focused(),
+            _ => response.consumed,
+        };
         if let Stage::Playing(player) = &mut self.stage {
             player.on_window_event(&window, &shell.context, &event, consumed);
         }
