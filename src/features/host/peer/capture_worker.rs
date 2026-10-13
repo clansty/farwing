@@ -388,6 +388,7 @@ pub(super) fn capture_loop(
             drop(encoder.take());
             let created = if hardware {
                 encoder::Encoder::hardware_format(
+                    candidate.capability.backend,
                     &device,
                     size,
                     wanted.format,

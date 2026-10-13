@@ -22,6 +22,7 @@ mod software_encoder;
 pub(crate) mod surface;
 pub(crate) mod system_power;
 pub(crate) mod transfer;
+pub(crate) mod vaapi;
 mod video_layer;
 pub(crate) mod virtual_audio;
 pub(crate) mod wol;

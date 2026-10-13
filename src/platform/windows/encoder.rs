@@ -109,6 +109,7 @@ pub(crate) fn probe(
                 Encoder::software_format(&device, (frame.width, frame.height), format, rate)?
             } else {
                 Encoder::hardware_format(
+                    backend,
                     &device,
                     (frame.width, frame.height),
                     format,
@@ -235,7 +236,11 @@ pub(crate) enum Encoder {
     Software(Box<super::software_encoder::Encoder>),
 }
 impl Encoder {
+    /// Windows answers which hardware encoder to build from the adapter behind
+    /// `device` alone, so the negotiated backend is only carried for symmetry
+    /// with the platforms that cannot tell from a device.
     pub(crate) fn hardware_format(
+        _backend: super::format::Backend,
         device: &ID3D11Device,
         size: (u32, u32),
         format: super::format::Format,

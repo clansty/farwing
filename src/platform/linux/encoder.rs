@@ -1,7 +1,7 @@
-//! Linux host encoding: NVENC on the GPU driving the display when the driver
-//! offers it, the Rust H.264 software codec otherwise. As on Windows, hardware comes
-//! first and every candidate is proven on the selected desktop by encoding a
-//! frame and checking the SPS it produced.
+//! Linux host encoding: NVENC on NVIDIA, VA-API on AMD and Intel, the Rust
+//! H.264 software codec otherwise. As on Windows, hardware comes first and every
+//! candidate is proven on the selected desktop by encoding a frame and checking
+//! the SPS it produced.
 use super::capture::{Desktop, Device, Image};
 use super::cuda;
 use crate::media::encoding::{Backend, Capability, Codec, Color, Format, QualityTarget, Rate};
@@ -39,6 +39,18 @@ pub(crate) fn probe(
             }
         }
     }
+    if let Some(backend) = super::vaapi::hardware_backend() {
+        for codec in [Codec::H264] {
+            let format = Format {
+                codec,
+                chroma: 1,
+                depth: 8,
+            };
+            if super::vaapi::accepts(format) {
+                candidates.push((backend, format));
+            }
+        }
+    }
     candidates.push((Backend::Software, Format::AVC));
     let rate = Rate {
         target: 2_000_000,
@@ -60,7 +72,7 @@ pub(crate) fn probe(
             let mut encoder = if backend == Backend::Software {
                 Encoder::software_format(&desktop.device, size, format, rate)?
             } else {
-                Encoder::hardware_format(&desktop.device, size, format, rate, Color::Sdr)?
+                Encoder::hardware_format(backend, &desktop.device, size, format, rate, Color::Sdr)?
             };
             let mut output = None;
             for index in 0..20 {
@@ -119,26 +131,42 @@ impl Runtime {
 
 pub(crate) enum Encoder {
     Nvidia(super::nvenc::Encoder),
+    /// VA-API reports the vendor whose encoder it is: the protocol has ids for
+    /// AMD and Intel hardware, and the local name is derived from the id.
+    Vaapi {
+        backend: Backend,
+        encoder: super::vaapi::Encoder,
+    },
     Software(Box<super::software_encoder::Encoder>),
 }
 impl Encoder {
     pub(crate) fn hardware_format(
+        backend: Backend,
         _device: &Device,
         size: (u32, u32),
         format: Format,
         rate: Rate,
         color: Color,
     ) -> Result<Self> {
-        ensure!(
-            super::nvenc::Encoder::accepts(format),
-            "NVENC 的 CUDA 输入不支持该格式"
-        );
         // The capture backends deliver 8-bit SDR BGRA only.
         ensure!(!color.is_hdr(), "Linux 版暂不支持 HDR 采集");
-        let context = cuda::display_context()?;
-        Ok(Self::Nvidia(super::nvenc::Encoder::new(
-            &context, size, format, rate,
-        )?))
+        match backend {
+            Backend::Amd | Backend::Intel => Ok(Self::Vaapi {
+                backend,
+                encoder: super::vaapi::Encoder::new(size, format, rate)?,
+            }),
+            Backend::Nvidia => {
+                ensure!(
+                    super::nvenc::Encoder::accepts(format),
+                    "NVENC 的 CUDA 输入不支持该格式"
+                );
+                let context = cuda::display_context()?;
+                Ok(Self::Nvidia(super::nvenc::Encoder::new(
+                    &context, size, format, rate,
+                )?))
+            }
+            Backend::Software => bail!("软件编码请走 software_format"),
+        }
     }
     pub(crate) fn software_format(
         _device: &Device,
@@ -153,18 +181,21 @@ impl Encoder {
     pub(crate) fn implementation(&self) -> i32 {
         match self {
             Self::Nvidia(_) => Backend::Nvidia.implementation(),
+            Self::Vaapi { backend, .. } => backend.implementation(),
             Self::Software(_) => Backend::Software.implementation(),
         }
     }
     pub(crate) fn maximum_size(&self) -> (u32, u32) {
         match self {
             Self::Nvidia(encoder) => encoder.maximum_size(),
+            Self::Vaapi { encoder, .. } => encoder.maximum_size(),
             Self::Software(encoder) => encoder.maximum_size(),
         }
     }
     pub(crate) fn configure_rate(&mut self, rate: Rate) -> Result<bool> {
         match self {
             Self::Nvidia(encoder) => encoder.configure_rate(rate),
+            Self::Vaapi { encoder, .. } => encoder.configure_rate(rate),
             Self::Software(encoder) => encoder.configure(rate),
         }
     }
@@ -197,6 +228,7 @@ impl Encoder {
         );
         match self {
             Self::Nvidia(encoder) => encoder.encode(image, timestamp, keyframe),
+            Self::Vaapi { encoder, .. } => encoder.encode(image, timestamp, keyframe),
             Self::Software(encoder) => encoder.encode(image, timestamp, keyframe, cancel),
         }
     }
@@ -241,9 +273,19 @@ mod throughput_tests {
                 fps: 60,
             },
         };
-        let mut encoder =
-            super::Encoder::hardware_format(&desktop.device, size, Format::AVC, rate, Color::Sdr)
-                .unwrap();
+        // Whichever hardware encoder this machine has: VA-API where a driver
+        // offers it, NVENC on NVIDIA, which has no VA-API encoder to report.
+        let backend = super::super::vaapi::hardware_backend()
+            .unwrap_or(crate::media::encoding::Backend::Nvidia);
+        let mut encoder = super::Encoder::hardware_format(
+            backend,
+            &desktop.device,
+            size,
+            Format::AVC,
+            rate,
+            Color::Sdr,
+        )
+        .unwrap();
         let started = std::time::Instant::now();
         let (mut frames, mut capture, mut encode, mut bytes) = (
             0u32,
