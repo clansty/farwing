@@ -1,6 +1,6 @@
 //! The Linux input engine: the same ownership contract as the Windows engine
 //! (every down it sends is released on loss, interruption or disconnect) on
-//! top of the X Test injector.
+//! top of whichever injector the session allows.
 use super::geometry::Geometry;
 use super::wire::{Event, KeyOrButton};
 use crate::platform::linux::input::{self as native, Injector, Lock};
@@ -19,6 +19,35 @@ const BUTTONS: [(u8, u8, u8); 5] = [
     (32, 8, 8),
     (64, 16, 9),
 ];
+
+/// The bounding box of every screen, which is the desk an absolute position
+/// is resolved against.
+fn desktop(geometry: &Geometry) -> native::Desktop {
+    let mut left = i32::MAX;
+    let mut top = i32::MAX;
+    let mut right = i32::MIN;
+    let mut bottom = i32::MIN;
+    for screen in &geometry.screens {
+        left = left.min(screen.left);
+        top = top.min(screen.top);
+        right = right.max(screen.left.saturating_add(screen.width as i32));
+        bottom = bottom.max(screen.top.saturating_add(screen.height as i32));
+    }
+    if left >= right || top >= bottom {
+        return native::Desktop {
+            left: 0,
+            top: 0,
+            width: 0,
+            height: 0,
+        };
+    }
+    native::Desktop {
+        left,
+        top,
+        width: (right - left) as u32,
+        height: (bottom - top) as u32,
+    }
+}
 
 pub(crate) struct Engine {
     injector: Injector,
@@ -44,8 +73,8 @@ pub(crate) struct Engine {
 }
 
 impl Engine {
-    /// `hardware`, `origin` and `privileged` describe a Windows session; the X
-    /// session injector is the same for every caller.
+    /// `hardware`, `origin` and `privileged` describe a Windows session; the
+    /// injector is the same for every caller.
     pub fn new(
         _hardware: bool,
         policy: super::wire::Policy,
@@ -79,7 +108,7 @@ impl Engine {
         })
     }
     pub fn backend(&self) -> &'static str {
-        "X11 XTest · 当前用户"
+        self.injector.label()
     }
     /// Ctrl+Alt+Del is an ordinary key chord to an X session, so nothing is
     /// ever withheld for a secure-attention path.
@@ -142,6 +171,12 @@ impl Engine {
         if geometry != self.geometry {
             self.release()?;
             self.geometry = geometry;
+            // The backends that name a position rather than a displacement
+            // need the desk those positions are in. A backend that cannot make
+            // the device it needs is not worth losing the whole session over.
+            if let Err(error) = self.injector.set_geometry(desktop(&self.geometry)) {
+                tracing::warn!(%error, "injector geometry unavailable");
+            }
         }
         self.observe_foreground();
         Ok(())
@@ -336,7 +371,7 @@ impl Engine {
                     self.wheel(horizontal, delta)?;
                 }
             }
-            Event::Text(text) => self.injector.text(&text, permitted)?,
+            Event::Text(text) => self.injector.text(&text, &self.keys, permitted)?,
             Event::Combination { down, keys } => {
                 for item in keys {
                     ensure!(permitted(), "组合输入已取消");
