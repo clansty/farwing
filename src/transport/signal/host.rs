@@ -245,7 +245,7 @@ impl Session {
                     } else if self.active_encoder.as_ref() != Some(&metadata) {
                         use crate::features::host::format::Backend;
                         let infos: Vec<_> = metadata.iter().map(|(index,implementation,_,capture)| {
-                            let encoder = match implementation { 0=>Backend::Nvidia,1=>Backend::Amd,2=>Backend::Intel,_=>Backend::Software }.name();
+                            let encoder = Backend::from_implementation(*implementation).name();
                             serde_json::json!({"video_track_index":index,"capture_impl":capture,"encoder_impl":encoder})
                         }).collect();
                         let first = &infos[0];

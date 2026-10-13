@@ -119,6 +119,16 @@ pub(crate) enum Backend {
     Software,
 }
 impl Backend {
+    /// The backend a negotiated implementation id names. Ids the protocol has
+    /// no hardware meaning for are software.
+    pub fn from_implementation(value: i32) -> Self {
+        match value {
+            0 => Self::Nvidia,
+            1 => Self::Amd,
+            2 => Self::Intel,
+            _ => Self::Software,
+        }
+    }
     pub fn implementation(self) -> i32 {
         match self {
             Self::Nvidia => 0,

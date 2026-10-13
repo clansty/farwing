@@ -559,6 +559,19 @@ impl DeviceCenterApp {
                 "输入后端",
                 host.input_backend.as_deref().unwrap_or("等待控制"),
             );
+            // What this machine encodes with, not what a peer reports: the
+            // remote side's encoder has its own row under the viewing section.
+            let encoder = diagnostics_row(
+                ui,
+                "编码器",
+                match host.encoder {
+                    Some((implementation, _)) => local_encoder_name(implementation),
+                    None => "等待编码",
+                },
+            );
+            if let Some((_, maximum)) = host.encoder {
+                encoder.on_hover_text(format!("编码尺寸上限 {}×{}", maximum.0, maximum.1));
+            }
             diagnostics_row(
                 ui,
                 "剪贴板同步",
@@ -735,6 +748,20 @@ impl DeviceCenterApp {
                 );
             }
         }
+    }
+}
+
+/// The encoder this machine runs, named as this platform calls it. The
+/// protocol's implementation ids are shared across platforms — id 1 is AMF on
+/// Windows and VA-API here — so the label is decided locally and nothing about
+/// what is sent to or received from a peer changes.
+fn local_encoder_name(implementation: i32) -> &'static str {
+    match implementation {
+        #[cfg(target_os = "linux")]
+        1 => "VA-API（AMD）",
+        #[cfg(target_os = "linux")]
+        2 => "VA-API（Intel）",
+        other => Backend::from_implementation(other).name(),
     }
 }
 
