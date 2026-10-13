@@ -1,11 +1,13 @@
 //! Bounded diagnostics for the driver's synchronous encode path. CPU call
 //! durations include any driver waits; conversion submission is not GPU time.
+//! Mapping, encoding and bitstream retrieval all happen inside the shared
+//! NVENC session, so they are measured as one stage.
 use std::time::{Duration, Instant};
 
 pub(super) struct Frame {
     started: Instant,
     checkpoint: Instant,
-    stages: [Duration; 5],
+    stages: [Duration; 3],
 }
 impl Frame {
     pub fn new() -> Self {
@@ -13,7 +15,7 @@ impl Frame {
         Self {
             started: now,
             checkpoint: now,
-            stages: [Duration::ZERO; 5],
+            stages: [Duration::ZERO; 3],
         }
     }
     pub fn stage(&mut self, index: usize) {
@@ -27,7 +29,7 @@ impl Frame {
 pub(super) struct Diagnostics {
     last_report: Option<Instant>,
     slow_frames: u64,
-    worst: Option<(Duration, [Duration; 5], Duration, bool)>,
+    worst: Option<(Duration, [Duration; 3], bool)>,
 }
 impl Diagnostics {
     pub fn record(&mut self, frame: Frame, success: bool) {
@@ -36,12 +38,7 @@ impl Diagnostics {
         if total >= Duration::from_millis(100) {
             self.slow_frames += 1;
             if self.worst.as_ref().is_none_or(|old| total > old.0) {
-                self.worst = Some((
-                    total,
-                    frame.stages,
-                    now.duration_since(frame.checkpoint),
-                    success,
-                ));
+                self.worst = Some((total, frame.stages, success));
             }
         }
         if self
@@ -50,16 +47,13 @@ impl Diagnostics {
         {
             return;
         }
-        if let Some((total, stages, output, success)) = self.worst.take() {
+        if let Some((total, stages, success)) = self.worst.take() {
             tracing::warn!(
                 slow_frames = self.slow_frames,
                 total_ms = total.as_secs_f64() * 1000.,
                 conversion_submit_ms = stages[0].as_secs_f64() * 1000.,
                 cuda_input_ms = stages[1].as_secs_f64() * 1000.,
-                map_input_ms = stages[2].as_secs_f64() * 1000.,
-                encode_picture_ms = stages[3].as_secs_f64() * 1000.,
-                lock_bitstream_ms = stages[4].as_secs_f64() * 1000.,
-                output_cleanup_ms = output.as_secs_f64() * 1000.,
+                session_encode_ms = stages[2].as_secs_f64() * 1000.,
                 success,
                 "NVENC slow frame driver stages (worst sample)"
             );
