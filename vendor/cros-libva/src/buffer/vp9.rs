@@ -434,9 +434,13 @@ impl EncPictureParameterBufferVP9 {
             skip_frame_flag,
             number_skip_frames,
             skip_frames_size,
-            // VA_SEGID_BLOCK_16X16。libva 1.21 起新增这两个字段，
-            // 本 crate 其余部分不涉及分段映射。
+            // libva 1.21 起 VAEncPictureParameterBufferVP9 末尾多了这两个字段，
+            // 而 bindgen 是按构建机的头文件生成的：低版本构建机上它们并不存在，
+            // 所以必须跟着 build.rs 发出的版本 cfg 走，否则会在旧发行版上编不过。
+            // VA_SEGID_BLOCK_16X16 == 0，且本 crate 其余部分不涉及分段映射。
+            #[cfg(libva_1_21_or_higher)]
             seg_id_block_size: 0,
+            #[cfg(libva_1_21_or_higher)]
             va_reserved8: Default::default(),
             va_reserved: Default::default(),
         }))
