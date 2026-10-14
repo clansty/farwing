@@ -625,9 +625,6 @@ struct State {
     watch: Option<super::watch::Watch>,
     /// 我们已知的这份剪贴板内容对应的写次数。
     own_generation: u64,
-    /// 刚才是我们自己写的（把远端的副本挂到本地剪贴板），下一次前进要吃掉，
-    /// 否则会把刚挂上来的远端副本当成本地新复制又发回给对端。
-    absorb_own_write: bool,
 }
 
 pub(super) fn start() -> Result<()> {
@@ -700,7 +697,6 @@ fn run(receiver: Receiver<Command>) {
         writing: false,
         watch: Some(super::watch::Watch::start()),
         own_generation: 0,
-        absorb_own_write: false,
     };
     loop {
         match state.receiver.recv_timeout(POLL) {
@@ -1035,9 +1031,9 @@ fn write_text(state: &mut State, text: &str) -> Result<()> {
         text: Some(text.to_owned()),
         ..Default::default()
     };
-    // 我们自己这次写也会让写次数前进：记下来，下一次前进要吃掉，
-    // 否则会把刚挂上来的这份当成本地新复制又发回给对端。
-    state.absorb_own_write = true;
+    // 这里**不能**像文件那条一样把记下来的本地内容作废：文本没有「挂载点」那样的
+    // 记号，下一轮读到的就是这段文字本身，当成新复制就会原样发回对端，两边互相
+    // 接力变成死循环。文件那条可以做，因为挂载点能被 `own_copy` 认出来。
     state.tasks.clear();
     state.mounted = None;
     state.offer = None;
@@ -1057,9 +1053,9 @@ fn write_files(state: &mut State, paths: &[PathBuf]) -> Result<()> {
         sources: paths.to_vec(),
         ..Default::default()
     };
-    // 我们自己这次写也会让写次数前进：记下来，下一次前进要吃掉，
-    // 否则会把刚挂上来的这份当成本地新复制又发回给对端。
-    state.absorb_own_write = true;
+    // 同上：拿到剪贴板的是远端那份副本（挂载点），之前记的本地内容作废。
+    state.wayland = LocalSnapshot::default();
+    state.x11 = LocalSnapshot::default();
     state.tasks.clear();
     Ok(())
 }
@@ -1123,8 +1119,7 @@ fn write_image(state: &mut State, dib: &[u8]) -> Result<()> {
         image: Some(dib.to_vec()),
         ..Default::default()
     };
-    // 我们自己这次写也会让写次数前进，别把它当成本地新复制发回去。
-    state.absorb_own_write = true;
+    // 同上：图片也没有记号，作废会把这张图原样发回去。
     state.tasks.clear();
     state.mounted = None;
     state.offer = None;
@@ -1170,9 +1165,10 @@ fn poll_local(state: &mut State) -> Result<()> {
         .watch
         .as_ref()
         .map_or(0, super::watch::Watch::generation);
-    let written = if state.absorb_own_write {
-        state.absorb_own_write = false;
-        state.own_generation = generation;
+    let written = if own_wayland || own_x11 {
+        // 这一轮看到的内容还是我们自己挂上去的那份（远端复制过来的副本）：写次数
+        // 前进不算理由——那次前进很可能就是我们自己写它引起的，而合成器的事件到得
+        // 比这一轮轮询晚，拿它当真就会把远端刚给我们的东西又发回去。
         false
     } else {
         generation != 0 && generation != state.own_generation
@@ -1231,6 +1227,7 @@ fn poll_local(state: &mut State) -> Result<()> {
                 files_allowed = session.file_allowed(),
                 advertised = links.len(),
                 formats = %links.iter().map(|f| f.wire.name.clone()).collect::<Vec<_>>().join(","),
+                generation,
                 "本地文件剪贴板已发布给对端"
             );
         }

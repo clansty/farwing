@@ -32,14 +32,16 @@ impl Watch {
             .name("clipboard write watch".into())
             .spawn(move || {
                 if let Err(error) = run(&counter) {
-                    tracing::debug!(
+                    // 这条要看得见：接不上时调用方会安静地退回按内容判断，
+                    // 而「重复复制同一个文件没反应」正是那一路的老毛病。
+                    tracing::info!(
                         error = format!("{error:#}"),
                         "剪贴板写事件通道不可用，退回按内容判断"
                     );
                 }
             });
         if let Err(error) = spawned {
-            tracing::debug!(%error, "剪贴板写事件线程起不来");
+            tracing::info!(%error, "剪贴板写事件线程起不来");
         }
         Self { generation }
     }
