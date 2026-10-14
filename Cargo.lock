@@ -3722,6 +3722,7 @@ dependencies = [
  "uuid",
  "wayland-client",
  "wayland-protocols",
+ "wayland-protocols-misc",
  "wayland-protocols-wlr",
  "webrtc",
  "webrtc-srtp",

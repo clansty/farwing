@@ -18,7 +18,11 @@
 //! Typing is the one place this backend is weaker than X Test: there is no
 //! keymap to extend, so a character can only be typed if the layout the user
 //! configured produces it. The table here describes the US layout.
-use super::{Lock, evdev};
+//!
+//! On a Wayland session that gap is closed by `zwp_virtual_keyboard_v1`
+//! (`virtual_keyboard`), which carries a keymap of our own making. This table
+//! stays as the fallback for sessions whose compositor does not serve it.
+use super::{Lock, evdev, virtual_keyboard};
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::BTreeSet;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -274,6 +278,8 @@ pub(super) struct Injector {
     position: (i32, i32),
     /// The lock keys, as a mask of the LEDs they drive.
     leds: u32,
+    /// Text with a keymap of our own, where the compositor offers it.
+    virtual_keyboard: Option<virtual_keyboard::Keyboard>,
 }
 
 impl Injector {
@@ -306,6 +312,18 @@ impl Injector {
             device.property(INPUT_PROP_DIRECT)
         })
         .context("创建虚拟鼠标失败")?;
+        // Nothing here is Wayland only: an Xorg session keeps typing through
+        // X Test, where the spare-keycode trick already covers any character.
+        let virtual_keyboard = match virtual_keyboard::Keyboard::connect() {
+            Ok(keyboard) => {
+                tracing::info!("文字输入走 zwp_virtual_keyboard（可输入任意字符）");
+                Some(keyboard)
+            }
+            Err(error) => {
+                tracing::debug!(%error, "没有虚拟键盘协议，文字输入退回本地布局");
+                None
+            }
+        };
         Ok(Self {
             keyboard,
             relative,
@@ -315,6 +333,7 @@ impl Injector {
             repeat: None,
             position: (0, 0),
             leds: 0,
+            virtual_keyboard,
         })
     }
 
@@ -485,20 +504,45 @@ impl Injector {
         None
     }
 
-    /// Type text with the local layout, which is the only mapping that exists:
-    /// the compositor reads these key codes as if a keyboard had sent them.
+    /// Types text, with the keys the controller is holding lifted for the
+    /// duration — a held Ctrl would otherwise turn every character into a
+    /// control code.
     ///
-    /// A Windows line break (CR LF) is one Enter, and the keys the controller
-    /// is holding are lifted for the duration — a held Ctrl would otherwise
-    /// turn every character into a control code.
+    /// Two mappings can do it. The virtual keyboard carries a keymap of our
+    /// own, so any character goes through; the local layout is the fallback,
+    /// and can only produce what that layout has. A Windows line break (CR LF)
+    /// is one Enter either way.
     pub(super) fn text(
         &mut self,
         text: &str,
         held: &BTreeSet<u16>,
         permitted: impl Fn() -> bool,
     ) -> Result<()> {
-        ensure!(us_layout(), "本地键盘布局不是 us，uinput 无法按字符输入");
-        let caps = self.toggled(Lock::Caps).unwrap_or(false);
+        let lifted = self.lift(held)?;
+        let typed = self
+            .virtual_keyboard
+            .as_mut()
+            .map(|keyboard| keyboard.text(text, &permitted));
+        let result = match typed {
+            Some(Ok(())) => Ok(()),
+            other => {
+                if let Some(Err(error)) = other {
+                    // Half a text may already be through; typing it again from
+                    // the top beats dropping the rest of it.
+                    tracing::warn!(%error, "虚拟键盘输入失败，改用本地布局");
+                }
+                self.type_locally(text, &permitted)
+            }
+        };
+        for code in lifted {
+            let _ = self.keyboard.send(&[(EV_KEY, code, 1)]);
+        }
+        result
+    }
+
+    /// Releases the keys the controller still holds, and reports them so they
+    /// can be pressed again afterwards.
+    fn lift(&mut self, held: &BTreeSet<u16>) -> Result<Vec<u16>> {
         let mut lifted = Vec::new();
         for key in held {
             if let Some(code) = evdev(*key) {
@@ -506,6 +550,15 @@ impl Injector {
                 lifted.push(code);
             }
         }
+        Ok(lifted)
+    }
+
+    /// Types text with the local layout: the compositor reads these key codes
+    /// as if a keyboard had sent them, so only the characters that layout
+    /// produces can be typed.
+    fn type_locally(&mut self, text: &str, permitted: impl Fn() -> bool) -> Result<()> {
+        ensure!(us_layout(), "本地键盘布局不是 us，uinput 无法按字符输入");
+        let caps = self.toggled(Lock::Caps).unwrap_or(false);
         // Caps Lock changes the case of letters, so it is off while typing.
         if caps {
             let code = evdev(0x14).context("缺少 Caps Lock 键")?;
@@ -544,9 +597,6 @@ impl Injector {
         if caps {
             let code = evdev(0x14).context("缺少 Caps Lock 键")?;
             let _ = self.keyboard.send(&[(EV_KEY, code, 1), (EV_KEY, code, 0)]);
-        }
-        for code in lifted {
-            let _ = self.keyboard.send(&[(EV_KEY, code, 1)]);
         }
         result
     }

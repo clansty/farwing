@@ -203,6 +203,9 @@ pollster = "0.4"
 # local user for consent.
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+# Text input: the client brings its own keymap, so characters the local
+# layout cannot produce (a phone input method's Chinese) are typeable.
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 
 # Linux 上把编码这一段交给 libavcodec：它自己管 SPS/PPS、POC/DPB、GOP 与码率控制，
