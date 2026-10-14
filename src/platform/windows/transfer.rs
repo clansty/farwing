@@ -129,7 +129,8 @@ impl Transfer {
             && self.destination == *destination
             && self.size == (desc.Width, desc.Height, desc.Format)
     }
-    pub fn copy(&mut self, frame: &Frame) -> Result<Option<Delivery>> {
+    pub fn copy(&mut self, frame: &Frame, active: impl Fn() -> bool) -> Result<Option<Delivery>> {
+        ensure!(active(), "GPU交付已取消");
         match &mut self.engine {
             Engine::Local(gpu) => match gpu.copy(frame) {
                 Ok(frame) => return Ok(frame),
@@ -143,14 +144,14 @@ impl Transfer {
                     tracing::debug!(%error,"cross-adapter GPU strategy failed; selecting staging")
                 }
             },
-            Engine::Staging(staging) => return staging.copy(frame).map(Some),
+            Engine::Staging(staging) => return staging.copy(frame, active).map(Some),
         }
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         unsafe {
             frame.image.GetDesc(&mut desc);
         }
         self.engine = Engine::Staging(Staging::new(&self.source, &self.destination, desc)?);
-        self.copy(frame)
+        self.copy(frame, active)
     }
 }
 struct Staging {
@@ -197,12 +198,12 @@ impl Staging {
             })
         }
     }
-    fn copy(&self, frame: &Frame) -> Result<Delivery> {
+    fn copy(&self, frame: &Frame, active: impl Fn() -> bool) -> Result<Delivery> {
         unsafe {
+            // 上游这里换了带重试的读回（驱动忙时不像原来那样直接失败），字段名
+            // 沿用我们这边的 `image`（这条分支上把 `texture` 改名过）。
             self.source.CopyResource(&self.read, &frame.image);
-            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            self.source
-                .Map(&self.read, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+            let mapped = super::gpu_readback::map(&self.source, &self.read, active)?;
             if mapped.pData.is_null() {
                 self.source.Unmap(&self.read, 0);
                 anyhow::bail!("跨卡读回未返回像素");

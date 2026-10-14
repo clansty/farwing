@@ -43,6 +43,7 @@ pub(in crate::application::viewer) fn viewer_shortcut(
 }
 
 pub(in crate::application::viewer) struct ThreadedWindowsApp {
+    fullscreen_chrome: super::fullscreen::FullscreenChrome,
     drag: Option<crate::application::viewer::windows_drag::WindowDrag>,
     _shortcuts: crate::application::viewer_shortcuts::Watcher,
     pub(in crate::application::viewer) annotation:
@@ -70,6 +71,7 @@ pub(in crate::application::viewer) struct ThreadedWindowsApp {
     pub(in crate::application::viewer) last_window_size: PhysicalSize<u32>,
     pub(in crate::application::viewer) pending_aspect_size: Option<PhysicalSize<u32>>,
     pub(in crate::application::viewer) last_aspect_video_size: Option<(u32, u32)>,
+    display_aspect: Option<(u32, u32)>,
     pub(in crate::application::viewer) window_move: WindowMoveState,
     pub(in crate::application::viewer) window_resize: WindowResizeState,
     pub(in crate::application::viewer) timing_audit: Option<UiTimingAudit>,
@@ -150,6 +152,7 @@ impl ThreadedWindowsApp {
             Arc::clone(&cpu_device),
         )?;
         Ok(Self {
+            fullscreen_chrome: super::fullscreen::FullscreenChrome::default(),
             drag: Some(crate::application::viewer::windows_drag::WindowDrag::new(
                 window,
                 &stream_control,
@@ -185,6 +188,7 @@ impl ThreadedWindowsApp {
             last_window_size: window.inner_size(),
             pending_aspect_size: None,
             last_aspect_video_size: None,
+            display_aspect: None,
             window_move: WindowMoveState::default(),
             window_resize: WindowResizeState::default(),
             timing_audit: connecting.timing_audit,
@@ -294,15 +298,18 @@ impl ThreadedWindowsApp {
                 }
             }
             ViewerShortcut::Fullscreen => {
+                self.mouse.release(window);
                 self.pending_aspect_size = None;
                 self.window_move = WindowMoveState::default();
                 self.window_resize = WindowResizeState::default();
                 self.stream_control_ui.open = false;
+                self.plugin_menu_open = false;
                 let fullscreen = window
                     .fullscreen()
                     .is_none()
                     .then(|| winit::window::Fullscreen::Borderless(window.current_monitor()));
                 set_fullscreen(window, fullscreen);
+                self.fullscreen_chrome.sync(window.fullscreen().is_some());
                 // A maximized window may keep the same outer size. Update
                 // the video origin even if no size-change event follows.
                 self.resize_targets(window, window.inner_size())?;
@@ -336,6 +343,15 @@ impl ThreadedWindowsApp {
 
     pub(super) fn refresh_mouse(&mut self, window: &Window, event_loop: &ActiveEventLoop) {
         self.sync_device_view_preferences(window);
+        let display_aspect = self
+            .stream_control
+            .display_aspect(self._session.track_index);
+        if self.display_aspect != display_aspect {
+            self.mouse.release(window);
+            self.display_aspect = display_aspect;
+            self.renderer
+                .send(RenderCommand::DisplayAspect(display_aspect));
+        }
         if let Ok(hwnd) = window_hwnd(window) {
             crate::application::viewer::windows_keyboard::finish_lock_releases(hwnd.0 as u64);
         }
@@ -367,6 +383,10 @@ impl ThreadedWindowsApp {
         // The visible transition owns the obscured desktop, like a local menu.
         // Release held input while it is shown; the title bar remains interactive.
         let display_transition = self.stream_control.annotation_snapshot().enabled
+            || self.fullscreen_chrome.owns_pointer(
+                &self.egui_context,
+                self.stream_control.mouse().relative_mode(),
+            )
             || self
                 .stream_control
                 .remote_upgrade()
@@ -465,16 +485,27 @@ impl ThreadedWindowsApp {
         };
         let mut chrome_action = PlayerChromeAction::default();
         let fullscreen = window.fullscreen().is_some();
-        if fullscreen {
-            self.plugin_menu_open = false;
-            self.stream_control_ui.open = false;
-        }
+        self.fullscreen_chrome.sync(fullscreen);
         let mut resize = None;
-        let resize_aspect = self.current_video_size();
-        let plugin_video_size = self.current_video_size();
+        let resize_aspect = self.current_presentation_size();
+        let plugin_video_size = self.current_presentation_size();
         let output = self.egui_context.run_ui(input, |ui| {
             let ctx = ui.ctx().clone();
-            if !fullscreen {
+            if fullscreen {
+                chrome_action = self.fullscreen_chrome.show(
+                    &ctx,
+                    PlayerTitleBar {
+                        screens: &mut self.screen_tabs,
+                        window,
+                        title: &self.title,
+                        performance: &self.performance,
+                        stream_control: &self.stream_control,
+                        stream_control_ui: &mut self.stream_control_ui,
+                        plugin_menu_open: &mut self.plugin_menu_open,
+                        move_state: None,
+                    },
+                );
+            } else {
                 resize =
                     borderless_resize(ui, window, Some((&mut self.window_resize, resize_aspect)));
                 title_bar_panel(
@@ -508,6 +539,7 @@ impl ThreadedWindowsApp {
                 self._session.screen_id(),
                 ui.available_rect_before_wrap(),
             );
+            let menu_inset = self.fullscreen_chrome.menu_inset(&ctx);
             show_stream_control_window(
                 &ctx,
                 &self.stream_control,
@@ -517,12 +549,13 @@ impl ThreadedWindowsApp {
                 window
                     .current_monitor()
                     .map(|m| (m.size().width, m.size().height)),
+                egui::vec2(-114.0 - menu_inset, 52.0),
             );
             self.renderer.plugins.window(
                 &ctx,
                 &mut self.plugin_menu_open,
                 crate::application::viewer::stream_menu::menu_style,
-                &self.stream_control,
+                egui::vec2(-148.0 - menu_inset, 52.0),
             );
             let size = window.inner_size();
             let top = title_bar_height_pixels(window);
@@ -652,11 +685,14 @@ impl ThreadedWindowsApp {
         if let Some(size) = self.window_resize.requested_render_size.take() {
             self.resize_targets(window, size)?;
         }
-        let current_video_size = self.current_video_size();
+        let current_video_size = self.current_presentation_size();
         if current_video_size.is_some() && current_video_size != self.last_aspect_video_size {
             self.fit_window_to_current_aspect(window);
         }
         self.last_aspect_video_size = current_video_size;
+        if chrome_action.exit_fullscreen && window.fullscreen().is_some() {
+            self.apply_shortcut(window, ViewerShortcut::Fullscreen)?;
+        }
         if chrome_action.close {
             self.mouse.release(window);
             self.close_requested = true;
@@ -725,13 +761,14 @@ impl ThreadedWindowsApp {
         Ok(())
     }
 
-    pub(in crate::application::viewer) fn current_video_size(&self) -> Option<(u32, u32)> {
+    pub(in crate::application::viewer) fn current_presentation_size(&self) -> Option<(u32, u32)> {
         mutex_lock(&self.renderer.current_video_size).map(|(width, height, rotation)| {
-            if rotation == 90 || rotation == 270 {
+            let size = if rotation == 90 || rotation == 270 {
                 (height, width)
             } else {
                 (width, height)
-            }
+            };
+            self.display_aspect.unwrap_or(size)
         })
     }
 
@@ -743,20 +780,28 @@ impl ThreadedWindowsApp {
         constrain_window_aspect(
             window,
             size,
-            self.current_video_size(),
+            self.current_presentation_size(),
             &mut self.last_window_size,
             &mut self.pending_aspect_size,
         );
     }
 
     pub(in crate::application::viewer) fn fit_window_to_current_aspect(&mut self, window: &Window) {
-        if let Some(video_size) = self.current_video_size() {
+        if let Some(video_size) = self.current_presentation_size() {
             fit_window_to_aspect(window, video_size, &mut self.pending_aspect_size);
         }
     }
 
     pub(in crate::application::viewer) fn resize_window_one_to_one(&mut self, window: &Window) {
-        if let Some(video_size) = self.current_video_size() {
+        let video_size = mutex_lock(&self.renderer.current_video_size).map(|(w, h, rotation)| {
+            let size = if matches!(rotation, 90 | 270) {
+                (h, w)
+            } else {
+                (w, h)
+            };
+            crate::media::geometry::DisplayAspect::size(size, self.display_aspect)
+        });
+        if let Some(video_size) = video_size {
             resize_window_one_to_one(window, video_size, &mut self.pending_aspect_size);
         }
     }

@@ -62,6 +62,11 @@ pub(crate) struct Target {
     pub available: bool,
     pub virtual_provider: Option<VirtualProvider>,
     pub modes: Vec<Mode>,
+    /// 驱动报的首选模式（Windows 那边问 DISPLAYCONFIG_TARGET_PREFERRED_MODE，
+    /// 远端拿它算「跟随目标显示器比例」）。RandR 没有这个标志，而模式表的顺序不是
+    /// 约定——猜一个错的比报不知道更糟（不知道时远端会退回当前分辨率），所以这里
+    /// 空着。真要用得上，Wayland 采集那边读得到 `wl_output` 的 PREFERRED 标志。
+    pub preferred_mode: Option<(u32, u32)>,
     /// X11 has no per-output scale; desktops that scale do it for the whole
     /// session, so no output offers a DPI choice.
     pub dpi: Option<Dpi>,
@@ -295,6 +300,7 @@ impl Topology {
                     target: output.id,
                     source_adapter: 0,
                     source_id: output.info.crtc,
+                    preferred_mode: None,
                     active: active.is_some(),
                     available: output.connected(),
                     virtual_provider: None,

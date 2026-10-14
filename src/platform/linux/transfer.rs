@@ -15,7 +15,9 @@ impl Transfer {
     pub fn matches(&self, _source: &Device, _destination: &Device, _frame: &Frame) -> bool {
         match *self {}
     }
-    pub fn copy(&mut self, _frame: &Frame) -> Result<Option<Delivery>> {
+    /// `active` 是 Windows 那边读回时的取消闸（那边会轮询驱动忙不忙）；这个类型
+    /// 一个值都构造不出来，参数只为和共享的调用处对上形状。
+    pub fn copy(&mut self, _frame: &Frame, _active: impl Fn() -> bool) -> Result<Option<Delivery>> {
         match *self {}
     }
 }

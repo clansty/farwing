@@ -918,6 +918,8 @@ impl Player {
             &mut view,
             screen_id,
             display_size,
+            // Windows 那边这里要减掉全屏标题栏的宽度（`menu_inset`），Linux 没有那截。
+            egui::vec2(-114.0, 52.0),
         );
         self.set_performance_mode(view.performance_mode);
         self.session

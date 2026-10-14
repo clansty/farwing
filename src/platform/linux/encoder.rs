@@ -137,6 +137,13 @@ impl Runtime {
     pub(crate) fn new() -> Result<Self> {
         Ok(Self)
     }
+    /// Windows 那边这个构造器会顺手抢一份 GPU 调度租约（采集和编码挤在同一块卡上
+    /// 时给谁优先）；Linux 没有这回事，只为让共享的采集循环两边同一个形状。
+    pub(crate) fn with_gpu_compatibility(_compatible: bool) -> Result<Self> {
+        Self::new()
+    }
+    pub(crate) fn begin_gpu_work(&mut self, _compatible: bool) {}
+    pub(crate) fn end_gpu_work(&mut self) {}
 }
 
 pub(crate) enum Encoder {
@@ -250,6 +257,18 @@ impl Encoder {
         })
     }
 
+    /// 只有 Windows 的 QSV 能在不拆驱动会话的前提下换尺寸/格式；Linux 这条路
+    /// 一律重建（返回 false 就是「照旧走重建」）。
+    pub(crate) fn reconfigure_stream(
+        &mut self,
+        _device: &Device,
+        _size: (u32, u32),
+        _format: Format,
+        _rate: Rate,
+        _color: Color,
+    ) -> Result<bool> {
+        Ok(false)
+    }
     pub(crate) fn software_format(
         _device: &Device,
         size: (u32, u32),
