@@ -248,6 +248,14 @@ opt-level = "s"
 [profile.release.package.x509-parser]
 opt-level = "s"
 
+# The application's own capture path is hot code as well: the scaler, the
+# colour conversion feeding it and the encoder's upload all run once per frame,
+# and at the dev profile's default they are an order of magnitude slower than
+# this crate's other work. Optimize this package without dropping the debug
+# assertions or the overflow checks, which the kernel packages below give up.
+[profile.dev.package.openuuyc]
+opt-level = 3
+
 [profile.dev.package.yuv]
 opt-level = 3
 debug-assertions = false
