@@ -26,4 +26,5 @@ pub(crate) mod ffmpeg;
 pub(crate) mod vaapi;
 mod video_layer;
 pub(crate) mod virtual_audio;
+pub(crate) mod virtual_display;
 pub(crate) mod wol;
