@@ -1,0 +1,163 @@
+//! 本地剪贴板的「写次数」。
+//!
+//! 判断「本地剪贴板变了没有」不能只看内容：同一个文件复制第二遍，路径、文本、像素
+//! 全都一样，可它仍然是一次新的复制——对端可能已经把上一次那份用掉了（官方 Windows
+//! 客户端粘完就不再拿那个 offer），不重新广播它就一直粘不上。
+//!
+//! Windows 那边用的是 `GetClipboardSequenceNumber()`，每次写剪贴板都会加一。这里取
+//! 它的等价物：合成器的 `zwlr_data_control_device_v1.selection` 事件——每次有人认领
+//! 剪贴板都会收到一次，**内容相同也一样**（本机实测：连写两次同一段文本，两次都到）。
+//! XWayland 里的程序写完会被 XWayland 桥成合成器的那次选择，所以两个世界一起覆盖。
+//!
+//! 接不上（合成器没这个协议、没有会话）就安静收场：计数保持 0，调用方退回按内容判断。
+use anyhow::{Context as _, Result, bail};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+use wayland_client::protocol::{wl_registry, wl_seat};
+use wayland_client::{Connection, Dispatch, QueueHandle};
+use wayland_protocols_wlr::data_control::v1::client::{
+    zwlr_data_control_device_v1, zwlr_data_control_manager_v1, zwlr_data_control_offer_v1,
+};
+
+pub(super) struct Watch {
+    generation: Arc<AtomicU64>,
+}
+impl Watch {
+    pub(super) fn start() -> Self {
+        let generation = Arc::new(AtomicU64::new(0));
+        let counter = generation.clone();
+        let spawned = std::thread::Builder::new()
+            .name("clipboard write watch".into())
+            .spawn(move || {
+                if let Err(error) = run(&counter) {
+                    tracing::debug!(
+                        error = format!("{error:#}"),
+                        "剪贴板写事件通道不可用，退回按内容判断"
+                    );
+                }
+            });
+        if let Err(error) = spawned {
+            tracing::debug!(%error, "剪贴板写事件线程起不来");
+        }
+        Self { generation }
+    }
+    /// 0 表示这条通道没起来，调用方要退回按内容判断。
+    pub(super) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+}
+
+struct State {
+    counter: Arc<AtomicU64>,
+    manager: Option<zwlr_data_control_manager_v1::ZwlrDataControlManagerV1>,
+    seat: Option<wl_seat::WlSeat>,
+    /// 最近一个 offer。要一直拿着，而且要等下一个来了才拆上一个：合成器可能在下一次
+    /// `selection` 里再引用它，提前拆掉就是收一个已经没有的对象的 id。
+    offer: Option<zwlr_data_control_offer_v1::ZwlrDataControlOfferV1>,
+    finished: bool,
+}
+
+fn run(counter: &Arc<AtomicU64>) -> Result<()> {
+    let connection = Connection::connect_to_env().context("没有可用的 Wayland 会话")?;
+    let mut queue = connection.new_event_queue::<State>();
+    let handle = queue.handle();
+    connection.display().get_registry(&handle, ());
+    let mut state = State {
+        counter: counter.clone(),
+        manager: None,
+        seat: None,
+        offer: None,
+        finished: false,
+    };
+    queue
+        .roundtrip(&mut state)
+        .context("读取 Wayland 全局对象失败")?;
+    let (Some(manager), Some(seat)) = (state.manager.clone(), state.seat.clone()) else {
+        bail!("合成器没有 zwlr_data_control_manager_v1 或 wl_seat");
+    };
+    let device = manager.get_data_device(&seat, &handle, ());
+    while !state.finished {
+        if let Err(error) = queue.blocking_dispatch(&mut state) {
+            // 连接断了（合成器重启之类）：到此为止，调用方退回按内容判断。
+            return Err(error).context("剪贴板写事件通道已断开");
+        }
+    }
+    device.destroy();
+    Ok(())
+}
+
+impl Dispatch<wl_registry::WlRegistry, ()> for State {
+    fn event(
+        state: &mut Self,
+        registry: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _: &(),
+        _: &Connection,
+        handle: &QueueHandle<Self>,
+    ) {
+        let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        else {
+            return;
+        };
+        match interface.as_str() {
+            "zwlr_data_control_manager_v1" => {
+                state.manager = Some(registry.bind(name, version.min(2), handle, ()))
+            }
+            "wl_seat" => state.seat = Some(registry.bind(name, version.min(7), handle, ())),
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &zwlr_data_control_device_v1::ZwlrDataControlDeviceV1,
+        event: zwlr_data_control_device_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwlr_data_control_device_v1::Event::DataOffer { id } => {
+                if let Some(previous) = state.offer.replace(id) {
+                    previous.destroy();
+                }
+            }
+            // 有人认领了剪贴板：内容一样也算一次新的复制，这正是要数的东西。
+            zwlr_data_control_device_v1::Event::Selection { .. } => {
+                state.counter.fetch_add(1, Ordering::AcqRel);
+            }
+            zwlr_data_control_device_v1::Event::PrimarySelection { .. } => {}
+            zwlr_data_control_device_v1::Event::Finished => state.finished = true,
+            _ => {}
+        }
+    }
+
+    // `data_offer` 是「创建子对象」的事件，少了这条特化，合成器真送来事件时会
+    // panic，而那个 panic 要跨过 C 回调、没法 unwinding，整个进程直接 abort。
+    wayland_client::event_created_child!(State, zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, [
+        zwlr_data_control_device_v1::EVT_DATA_OFFER_OPCODE => (zwlr_data_control_offer_v1::ZwlrDataControlOfferV1, ()),
+    ]);
+}
+
+impl Dispatch<zwlr_data_control_offer_v1::ZwlrDataControlOfferV1, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &zwlr_data_control_offer_v1::ZwlrDataControlOfferV1,
+        _: zwlr_data_control_offer_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+wayland_client::delegate_noop!(State: ignore wl_seat::WlSeat);
+wayland_client::delegate_noop!(State: ignore zwlr_data_control_manager_v1::ZwlrDataControlManagerV1);

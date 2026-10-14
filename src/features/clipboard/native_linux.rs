@@ -620,6 +620,14 @@ struct State {
     drag_tasks: HashMap<(u64, u32), Arc<LocalFiles>>,
     /// Set while this adapter writes, so the poll does not report its own write.
     writing: bool,
+    /// 本地剪贴板的「写次数」通道：内容没变但有人重新复制过时，只有它看得出来。
+    /// `0` 表示没接上（合成器没这个协议），那时退回按内容判断。
+    watch: Option<super::watch::Watch>,
+    /// 我们已知的这份剪贴板内容对应的写次数。
+    own_generation: u64,
+    /// 刚才是我们自己写的（把远端的副本挂到本地剪贴板），下一次前进要吃掉，
+    /// 否则会把刚挂上来的远端副本当成本地新复制又发回给对端。
+    absorb_own_write: bool,
 }
 
 pub(super) fn start() -> Result<()> {
@@ -690,6 +698,9 @@ fn run(receiver: Receiver<Command>) {
         drag_files: HashMap::new(),
         drag_tasks: HashMap::new(),
         writing: false,
+        watch: Some(super::watch::Watch::start()),
+        own_generation: 0,
+        absorb_own_write: false,
     };
     loop {
         match state.receiver.recv_timeout(POLL) {
@@ -1024,6 +1035,9 @@ fn write_text(state: &mut State, text: &str) -> Result<()> {
         text: Some(text.to_owned()),
         ..Default::default()
     };
+    // 我们自己这次写也会让写次数前进：记下来，下一次前进要吃掉，
+    // 否则会把刚挂上来的这份当成本地新复制又发回给对端。
+    state.absorb_own_write = true;
     state.tasks.clear();
     state.mounted = None;
     state.offer = None;
@@ -1043,6 +1057,9 @@ fn write_files(state: &mut State, paths: &[PathBuf]) -> Result<()> {
         sources: paths.to_vec(),
         ..Default::default()
     };
+    // 我们自己这次写也会让写次数前进：记下来，下一次前进要吃掉，
+    // 否则会把刚挂上来的这份当成本地新复制又发回给对端。
+    state.absorb_own_write = true;
     state.tasks.clear();
     Ok(())
 }
@@ -1106,6 +1123,8 @@ fn write_image(state: &mut State, dib: &[u8]) -> Result<()> {
         image: Some(dib.to_vec()),
         ..Default::default()
     };
+    // 我们自己这次写也会让写次数前进，别把它当成本地新复制发回去。
+    state.absorb_own_write = true;
     state.tasks.clear();
     state.mounted = None;
     state.offer = None;
@@ -1143,9 +1162,24 @@ fn poll_local(state: &mut State) -> Result<()> {
     let x11 = super::x11_read::read();
     // 自己挂上去的远端副本不算「本地复制」：发回去等于向远端要它刚给我们的东西。
     let (own_wayland, own_x11) = (own_copy(&wayland.sources), own_copy(&x11.sources));
+    // 「变了没有」不能只看内容：同一个文件复制第二遍，路径、文本、像素全都一样，
+    // 但那是一次新的复制，对端可能已经把上一份用掉了（官方 Windows 客户端粘完就不
+    // 再拿那个 offer），不重新广播它就一直粘不上。Windows 那边有
+    // `GetClipboardSequenceNumber()`，Linux 这边就是合成器给的这个写次数。
+    let generation = state
+        .watch
+        .as_ref()
+        .map_or(0, super::watch::Watch::generation);
+    let written = if state.absorb_own_write {
+        state.absorb_own_write = false;
+        state.own_generation = generation;
+        false
+    } else {
+        generation != 0 && generation != state.own_generation
+    };
     let (wayland_changed, x11_changed) = (
-        !own_wayland && wayland != state.wayland,
-        !own_x11 && x11 != state.x11,
+        written || (!own_wayland && wayland != state.wayland),
+        written || (!own_x11 && x11 != state.x11),
     );
     if !own_wayland {
         state.wayland = wayland.clone();
@@ -1162,7 +1196,7 @@ fn poll_local(state: &mut State) -> Result<()> {
     } else {
         return Ok(());
     };
-    if snapshot == state.local {
+    if snapshot == state.local && !written {
         return Ok(());
     }
     if !snapshot.sources.is_empty() || !state.local.sources.is_empty() {
@@ -1174,6 +1208,8 @@ fn poll_local(state: &mut State) -> Result<()> {
         );
     }
     state.local = snapshot;
+    // 这份内容对应的写次数：下一次没前进就说明没人动过剪贴板。
+    state.own_generation = generation;
     // The previous copy is gone; a read still in flight against it now fails.
     state.tasks.clear();
     if state.local.is_empty() {

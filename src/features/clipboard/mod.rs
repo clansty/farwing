@@ -11,6 +11,9 @@ mod native;
 mod native;
 mod protocol;
 #[cfg(not(windows))]
+#[path = "watch_linux.rs"]
+mod watch;
+#[cfg(not(windows))]
 #[path = "x11_offer_linux.rs"]
 mod x11_offer;
 #[cfg(not(windows))]
