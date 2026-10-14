@@ -1187,6 +1187,17 @@ fn poll_local(state: &mut State) -> Result<()> {
             session.platform.load(Ordering::Acquire),
             session.file_allowed(),
         );
+        // 本地复制的文件有没有真的广告出去：`advertised=0` 就是没发（文件权限被关或
+        // 格式全被过滤），对面那头自然什么都不动。
+        if !state.local.sources.is_empty() {
+            tracing::info!(
+                files = state.local.sources.len(),
+                files_allowed = session.file_allowed(),
+                advertised = links.len(),
+                formats = %links.iter().map(|f| f.wire.name.clone()).collect::<Vec<_>>().join(","),
+                "本地文件剪贴板已发布给对端"
+            );
+        }
         if links.is_empty() {
             state.published.remove(&session.id);
             continue;

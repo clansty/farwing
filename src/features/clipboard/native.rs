@@ -593,10 +593,21 @@ fn set_offer(
         return Ok(());
     }
     let platform = s.platform.load(Ordering::Acquire);
+    let offered: Vec<String> = formats.iter().map(|f| f.name.clone()).collect();
     let mut links: Vec<Format> = formats
         .into_iter()
         .filter_map(|f| formats::incoming(f, platform, s.file_allowed()))
         .collect();
+    // 「对面复制了文件，这边剪贴板却不动」时先分清是哪一侧的毛病：这条把对端报上来的
+    // 格式名、我们这一侧的文件权限、以及过滤后剩下几条一起记下来——`links` 是 0 就是
+    // 上面那个直接返回，本地剪贴板根本不会动。
+    tracing::info!(
+        platform,
+        files_allowed = s.file_allowed(),
+        offered = %offered.join(","),
+        links = links.len(),
+        "远端剪贴板格式已收到"
+    );
     let descriptor = formats::register("FileGroupDescriptorW");
     let is_files = links.iter().any(|f| f.local == descriptor);
     if is_files && s.file_allowed() {
