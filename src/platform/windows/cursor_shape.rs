@@ -13,8 +13,15 @@ pub(crate) struct Image {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Snapshot {
     pub showing: bool,
-    pub x: i32,
-    pub y: i32,
+    /// Windows always knows: `GetCursorInfo` reports the desktop's own pointer.
+    /// The field is an `Option` so that this shape matches the Wayland-side one,
+    /// where the position is not knowable; see `host::peer::cursor`.
+    ///
+    /// 这个结构会长着命名管道走到采集进程那边（见 `capture_service`），默认值是为
+    /// 了老的 agent 还在跑时不至于把整条回复判成解析失败——它给的 `x`/`y` 我们不认识，
+    /// 位置就是「不知道」，主机端照旧按 `None` 处理。
+    #[serde(default)]
+    pub position: Option<(i32, i32)>,
     pub image: Option<Image>,
 }
 #[derive(Default)]
@@ -25,8 +32,6 @@ pub(crate) struct Sampler {
 }
 impl Sampler {
     pub fn sample(&mut self) -> Result<Snapshot> {
-        use base64::Engine;
-        use image::ImageEncoder;
         let pointer = pointer()?;
         if pointer.showing
             && (self.handle != pointer.handle
@@ -35,34 +40,49 @@ impl Sampler {
                     .sampled
                     .is_none_or(|at| at.elapsed() >= std::time::Duration::from_millis(250)))
         {
-            let shape = shape(pointer.handle)?;
-            let mut png = Vec::new();
-            image::codecs::png::PngEncoder::new(&mut png).write_image(
-                &shape.rgba,
-                shape.width,
-                shape.height,
-                image::ExtendedColorType::Rgba8,
-            )?;
-            ensure!(png.len() <= 4 * 1024 * 1024, "光标图片过大");
-            self.image = Some(Image {
-                width: shape.width,
-                height: shape.height,
-                hotspot: shape.hotspot,
-                kind: shape.kind,
-                png: base64::engine::general_purpose::STANDARD.encode(png),
-            });
-            self.handle = pointer.handle;
+            // 形状这一次读不到，不能把整次采样判成失败：调用方把失败当成「没有光标」，
+            // 于是「形状没读到」会变成一次「光标不见了」，下一帧它又出现了——主控那边的
+            // smart mouse 就照着这个来回切换把本地光标往采样位置挪。上一次的形状留着用，
+            // 指针的样子又不会因为我们读失败而变。隔一会儿再试一次，别再连着重试。
             self.sampled = Some(std::time::Instant::now());
+            match self.encode(pointer.handle) {
+                Ok(image) => {
+                    self.image = Some(image);
+                    self.handle = pointer.handle;
+                }
+                Err(error) => tracing::debug!(%error, "读取光标形状失败"),
+            }
         }
         Ok(Snapshot {
             showing: pointer.showing,
-            x: pointer.x,
-            y: pointer.y,
+            position: Some((pointer.x, pointer.y)),
             image: if pointer.showing {
                 self.image.clone()
             } else {
                 None
             },
+        })
+    }
+
+    /// 取一次形状并编码成 PNG。
+    fn encode(&self, handle: usize) -> Result<Image> {
+        use base64::Engine as _;
+        use image::ImageEncoder as _;
+        let shape = shape(handle)?;
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png).write_image(
+            &shape.rgba,
+            shape.width,
+            shape.height,
+            image::ExtendedColorType::Rgba8,
+        )?;
+        ensure!(png.len() <= 4 * 1024 * 1024, "光标图片过大");
+        Ok(Image {
+            width: shape.width,
+            height: shape.height,
+            hotspot: shape.hotspot,
+            kind: shape.kind,
+            png: base64::engine::general_purpose::STANDARD.encode(png),
         })
     }
 }

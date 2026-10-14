@@ -46,6 +46,9 @@ pub(super) async fn run(
         // Which screen the pointer is on is only known while it is on one this
         // connection is streaming: those are the coordinates the sampler's
         // report is in, and the screen the controller draws the pointer on.
+        // A session that cannot say where its pointer is -- a Wayland one, see
+        // `cursor_shape::reported_position` -- reports no screen instead of a
+        // made-up one, and the controller keeps its own pointer where it is.
         //
         // The shape does not depend on that. A controller that draws the
         // pointer itself -- which is what it asks for when it turns capture
@@ -55,7 +58,8 @@ pub(super) async fn run(
         // see a Wayland compositor's pointer, is still the shape the controller
         // should be showing. Reporting it as hidden instead leaves the picture
         // with no pointer at all.
-        let screen = pointer.as_ref().and_then(|p| {
+        let at = pointer.as_ref().and_then(|p| p.position);
+        let screen = at.and_then(|(x, y)| {
             lock(&reports.catalog)
                 .iter()
                 .find(|info| {
@@ -63,10 +67,10 @@ pub(super) async fn run(
                     media
                         .iter()
                         .any(|(_, m)| m.capturing && m.visible && m.screen.id == s.id)
-                        && i64::from(p.x) >= i64::from(s.left)
-                        && i64::from(p.x) < i64::from(s.left) + i64::from(s.width)
-                        && i64::from(p.y) >= i64::from(s.top)
-                        && i64::from(p.y) < i64::from(s.top) + i64::from(s.height)
+                        && i64::from(x) >= i64::from(s.left)
+                        && i64::from(x) < i64::from(s.left) + i64::from(s.width)
+                        && i64::from(y) >= i64::from(s.top)
+                        && i64::from(y) < i64::from(s.top) + i64::from(s.height)
                 })
                 .map(|info| info.screen.clone())
         });
@@ -104,10 +108,10 @@ pub(super) async fn run(
             },
             None => None,
         };
-        let position = match (pointer.as_ref(), screen.as_ref()) {
-            (Some(p), Some(s)) => [
-                (f64::from(p.x) - f64::from(s.left)) / f64::from(s.width),
-                (f64::from(p.y) - f64::from(s.top)) / f64::from(s.height),
+        let position = match (at, screen.as_ref()) {
+            (Some((x, y)), Some(s)) => [
+                (f64::from(x) - f64::from(s.left)) / f64::from(s.width),
+                (f64::from(y) - f64::from(s.top)) / f64::from(s.height),
             ],
             _ => [0.0, 0.0],
         };

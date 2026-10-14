@@ -450,13 +450,13 @@ impl Desktop {
         {
             self.backend = Backend::NvFbc(nvfbc::Grab::open(&self.screen, cursor, wanted)?);
         }
-        self.cursor = match self.sampler.sample() {
-            Ok(pointer) => Some(pointer),
-            Err(error) => {
-                tracing::debug!(%error, "host cursor sampling failed");
-                None
-            }
-        };
+        // 采样失败只是这一次读不到，不是「光标不见了」：当成隐藏会让主控的光标一闪
+        // 一闪，而 smart mouse 会照着每一次「又出现了」去挪它的本地光标。上一次的
+        // 样子留着，下一次采样（几十毫秒后）会补上。
+        match self.sampler.sample() {
+            Ok(pointer) => self.cursor = Some(pointer),
+            Err(error) => tracing::debug!(%error, "host cursor sampling failed"),
+        }
         let deadline = Instant::now() + Duration::from_millis(u64::from(timeout));
         // 零拷贝那条路：不缩放、也不在 CPU 上解旋转，画面原样留在显存里，
         // 剩下的都在 GPU 上做（见 `ffmpeg::drm`）。

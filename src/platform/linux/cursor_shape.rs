@@ -10,8 +10,8 @@ pub(crate) struct Pointer {
     /// The XFixes cursor serial: changes whenever the shape does.
     pub handle: usize,
     pub showing: bool,
-    pub x: i32,
-    pub y: i32,
+    /// Where the pointer is in the desktop, when this session can say.
+    pub position: Option<(i32, i32)>,
 }
 pub(crate) struct Shape {
     pub width: u32,
@@ -34,8 +34,8 @@ pub(crate) struct Image {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Snapshot {
     pub showing: bool,
-    pub x: i32,
-    pub y: i32,
+    /// `None` when this session has no way to know: see `reported_position`.
+    pub position: Option<(i32, i32)>,
     pub image: Option<Image>,
 }
 /// Samples the pointer for the capture, re-encoding its shape only when the
@@ -48,8 +48,6 @@ pub(crate) struct Sampler {
 }
 impl Sampler {
     pub fn sample(&mut self) -> Result<Snapshot> {
-        use base64::Engine;
-        use image::ImageEncoder;
         let pointer = pointer()?;
         if pointer.showing
             && (self.handle != pointer.handle
@@ -58,34 +56,49 @@ impl Sampler {
                     .sampled
                     .is_none_or(|at| at.elapsed() >= std::time::Duration::from_millis(250)))
         {
-            let shape = shape(pointer.handle)?;
-            let mut png = Vec::new();
-            image::codecs::png::PngEncoder::new(&mut png).write_image(
-                &shape.rgba,
-                shape.width,
-                shape.height,
-                image::ExtendedColorType::Rgba8,
-            )?;
-            ensure!(png.len() <= 4 * 1024 * 1024, "光标图片过大");
-            self.image = Some(Image {
-                width: shape.width,
-                height: shape.height,
-                hotspot: shape.hotspot,
-                kind: shape.kind,
-                png: base64::engine::general_purpose::STANDARD.encode(png),
-            });
-            self.handle = pointer.handle;
+            // 形状这一次读不到，不能把整次采样判成失败：调用方把失败当成「没有光标」，
+            // 于是「形状没读到」会变成一次「光标不见了」，下一帧它又出现了——主控那边的
+            // smart mouse 就照着这个来回切换把本地光标往采样位置挪。上一次的形状留着用，
+            // 指针的样子又不会因为我们读失败而变。隔一会儿再试一次，别再连着重试。
             self.sampled = Some(std::time::Instant::now());
+            match self.encode(pointer.handle) {
+                Ok(image) => {
+                    self.image = Some(image);
+                    self.handle = pointer.handle;
+                }
+                Err(error) => tracing::debug!(%error, "读取光标形状失败"),
+            }
         }
         Ok(Snapshot {
             showing: pointer.showing,
-            x: pointer.x,
-            y: pointer.y,
+            position: pointer.position,
             image: if pointer.showing {
                 self.image.clone()
             } else {
                 None
             },
+        })
+    }
+
+    /// 取一次形状并编码成 PNG。
+    fn encode(&self, handle: usize) -> Result<Image> {
+        use base64::Engine as _;
+        use image::ImageEncoder as _;
+        let shape = shape(handle)?;
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png).write_image(
+            &shape.rgba,
+            shape.width,
+            shape.height,
+            image::ExtendedColorType::Rgba8,
+        )?;
+        ensure!(png.len() <= 4 * 1024 * 1024, "光标图片过大");
+        Ok(Image {
+            width: shape.width,
+            height: shape.height,
+            hotspot: shape.hotspot,
+            kind: shape.kind,
+            png: base64::engine::general_purpose::STANDARD.encode(png),
         })
     }
 }
@@ -136,9 +149,20 @@ pub(crate) fn pointer() -> Result<Pointer> {
         showing: reply.width > 0
             && reply.height > 0
             && reply.cursor_image.iter().any(|pixel| pixel >> 24 != 0),
-        x: i32::from(reply.x),
-        y: i32::from(reply.y),
+        position: reported_position(reply),
     })
+}
+
+/// 指针在桌面上的位置，只有这台机器的 X 服务器**就是**桌面时才敢报。
+///
+/// Xorg 会话里两者是一回事。Wayland 会话里不是：XWayland 只有指针落在自己的窗口上
+/// 才更新这份坐标，报出来的也是那个窗口自己的坐标系（niri 不告诉 X 窗口它在屏幕
+/// 上的位置）。实机验证过：用合成器的绝对指针把光标挪到六处相距上千像素的地方，
+/// 读回来的一直是同一个值。所以 Wayland 会话上位置是**不知道**——报一个错的比不报
+/// 更糟，主控拿到它会照着把本地光标挪过去，正好落在窗口左上角那个偏移上。
+fn reported_position(reply: &GetCursorImageAndNameReply) -> Option<(i32, i32)> {
+    (!crate::platform::capture::wayland_session())
+        .then(|| (i32::from(reply.x), i32::from(reply.y)))
 }
 
 pub(crate) fn shape(handle: usize) -> Result<Shape> {
