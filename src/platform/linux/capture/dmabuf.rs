@@ -6,7 +6,7 @@
 use anyhow::{Context as _, Result, bail, ensure};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use wayland_client::protocol::wl_buffer;
-use wayland_client::{Connection, QueueHandle};
+use wayland_client::QueueHandle;
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1,
 };
@@ -78,12 +78,8 @@ pub(crate) struct Buffer {
 }
 
 impl Buffer {
-    /// 在这块 GPU 上分配一块 `width`x`height` 的 ARGB8888 线性缓冲。
-    pub(crate) fn allocate(width: u32, height: u32) -> Result<Self> {
-        Self::allocate_format(width, height, ARGB8888)
-    }
-
-    /// 同上，但指定 fourcc（合成器在 `linux_dmabuf` 事件里报的就是它要的那个）。
+    /// 在这块 GPU 上分配一块 `width`x`height` 的线性缓冲，fourcc 用合成器在
+    /// `linux_dmabuf` 事件里报的那个。
     pub(crate) fn allocate_format(width: u32, height: u32, format: u32) -> Result<Self> {
         let card = card_node()?;
         let mut create = CreateDumb {

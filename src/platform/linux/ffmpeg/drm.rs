@@ -280,6 +280,13 @@ impl Scaler {
                 ),
                 "提交 dma-buf",
             )?;
+            // `av_buffersink_get_frame` 不会先放掉传进去的那张帧，而这里从头到尾
+            // 用同一张 `output` 接结果：不显式放开，上一帧那块 VA surface 的引用
+            // 就被覆盖掉了，永远回不到池子里。实测每帧漏 20 MB 显存——这块屏
+            // 30 fps 下十几秒就能把 16 GB 显存吃干净，剩下的全溢出到系统内存，
+            // 整台机器跟着卡死。编码器那边 `avcodec_send_frame` 自己留了引用，
+            // 所以这里放掉不影响它已经拿去的那一帧。
+            ff::av_frame_unref(self.output);
             let result = ff::av_buffersink_get_frame(self.sink, self.output);
             if result == EAGAIN || result == EOF {
                 bail!("滤镜图没有给出画面（{result}）");
@@ -607,4 +614,115 @@ mod tests {
         std::fs::write("/tmp/openuuyc-zerocopy-luma.raw", &luma).unwrap();
         std::fs::write("/tmp/openuuyc-cpu-luma.raw", &reference).unwrap();
     }
+
+    /// 显存不许漏：同一块 dma-buf 一直过滤镜图（可选再喂编码器），显存必须是平的。
+    ///
+    /// 这条以前真的漏过：`av_buffersink_get_frame` 不会先放掉传进去的帧，而这里
+    /// 从头到尾用同一张 `output` 接结果，于是每帧漏 20 MB——这块屏 30 fps 下十几秒
+    /// 就把 16 GB 显存吃干净，剩下的溢出到系统内存，整台机器卡死。
+    ///
+    /// 上限是硬的：超了就直接失败退出，绝不会像上次那样把显存吃光。
+    /// `cargo test --release --lib -- --ignored the_zerocopy_path_leaks_no_vram --nocapture`
+    #[test]
+    #[ignore]
+    fn the_zerocopy_path_leaks_no_vram() {
+        use crate::media::encoding::{Codec, QualityTarget};
+        use crate::platform::linux::ffmpeg::{Encoder, Format, Rate};
+        let encoding = std::env::var("OPENUUYC_PROBE_LEAK").is_ok_and(|v| v == "encode");
+        let source = (5120u32, 2160u32);
+        let target = (3840u32, 1620u32);
+        let buffer =
+            Buffer::allocate_format(source.0, source.1, 0x3432_5258).expect("分配显存缓冲失败");
+        // 有点内容的图案：编码器真出码流，不是一屏纯色。
+        let mut pattern = vec![0u8; source.0 as usize * source.1 as usize * 4];
+        for (index, pixel) in pattern.chunks_exact_mut(4).enumerate() {
+            let (x, y) = (index as u32 % source.0, index as u32 / source.0);
+            let value = ((x / 7) ^ (y / 5)) as u8;
+            pixel.copy_from_slice(&[value, value.wrapping_add(37), value.wrapping_add(91), 255]);
+        }
+        buffer.write_pattern(&pattern).expect("写入图案失败");
+
+        let frame = Frame {
+            fd: buffer.prime.as_fd(),
+            width: buffer.width,
+            height: buffer.height,
+            stride: buffer.stride,
+            format: buffer.format,
+        };
+        let node = card_path().unwrap();
+        let mut scaler =
+            Scaler::new(&node, &frame, Rotation::None, target).expect("建立零拷贝链路失败");
+        let rate = Rate {
+            target: 24_000_000,
+            peak: 24_000_000,
+            fps: 30,
+            quality: 4,
+            quality_target: QualityTarget {
+                bitrate: 24_000_000,
+                fps: 30,
+            },
+        };
+        let mut encoder = encoding.then(|| {
+            Encoder::with_frames(
+                scaler.frames(),
+                target,
+                Format {
+                    codec: Codec::H264,
+                    chroma: 1,
+                    depth: 8,
+                },
+                rate,
+            )
+            .unwrap()
+        });
+
+        let start = vram_mb();
+        // 池子、滤镜图、编码器自己的 surface 都在最初几帧里建起来，那部分不算漏。
+        let mut run = |round: u32, scaler: &mut Scaler, encoder: &mut Option<Encoder>| {
+            let scaled = scaler.scale(&frame, i64::from(round) * 333_333).unwrap();
+            if let Some(encoder) = encoder.as_mut() {
+                encoder
+                    .encode_hardware(scaled, i64::from(round) * 333_333, round == 0)
+                    .unwrap();
+            }
+            // 真的漏起来是每秒几百 MB，别等它把机器拖垮。
+            assert!(vram_mb() < start + 600, "显存涨过头了，停下来");
+        };
+        for round in 0..10 {
+            run(round, &mut scaler, &mut encoder);
+        }
+        let settled = vram_mb();
+        for round in 10..60 {
+            run(round, &mut scaler, &mut encoder);
+        }
+        let after = vram_mb();
+        println!(
+            "{}：跑 10 帧安定到 {settled} MB，再跑 50 帧到 {after} MB（共涨 {} MB）",
+            if encoding { "缩放+编码" } else { "只缩放  " },
+            after as i64 - settled as i64,
+        );
+        // 60 帧里漏 20 MB/帧就是 1 GB，阈值 32 MB 足够灵敏也不会误报。
+        assert!(
+            after < settled + 32,
+            "50 帧里显存涨了 {} MB，又在漏",
+            after - settled
+        );
+    }
+
+    fn vram_mb() -> u64 {
+        let mut total = 0u64;
+        let Ok(entries) = std::fs::read_dir("/sys/class/drm") else {
+            return 0;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path().join("device/mem_info_vram_used");
+            if let Ok(value) = std::fs::read_to_string(&path)
+                && let Ok(value) = value.trim().parse::<u64>()
+            {
+                total += value;
+            }
+        }
+        total / 1_048_576
+    }
+
 }
