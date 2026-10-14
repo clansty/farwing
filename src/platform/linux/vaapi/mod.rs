@@ -152,7 +152,7 @@ fn connected_slots() -> Vec<String> {
 /// machine with both an integrated and a discrete GPU encodes on the one whose
 /// picture is being captured. The first node that answers is used when sysfs
 /// cannot tell.
-fn display_node() -> Option<(String, u16)> {
+pub(crate) fn display_node() -> Option<(String, u16)> {
     let connected = connected_slots();
     let mut fallback = None;
     for entry in std::fs::read_dir("/sys/class/drm").ok()?.flatten() {

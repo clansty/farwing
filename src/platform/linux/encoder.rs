@@ -118,6 +118,15 @@ pub(crate) fn probe(
     Ok(result)
 }
 
+/// 是否用 libavcodec 那版 VA-API 编码器。默认用它；`OPENUUYC_ENCODER=vaapi`
+/// 退回我们手写的那版，方便对照。
+fn libavcodec() -> bool {
+    !matches!(
+        std::env::var("OPENUUYC_ENCODER").as_deref(),
+        Ok("vaapi") | Ok("legacy")
+    )
+}
+
 /// Per-thread encoder runtime. Neither encoder needs setup.
 pub(crate) struct Runtime;
 #[derive(Debug, thiserror::Error)]
@@ -137,6 +146,13 @@ pub(crate) enum Encoder {
         backend: Backend,
         encoder: super::vaapi::Encoder,
     },
+    /// 同一块 GPU 上的 VA-API 编码，但参数集、POC/DPB、GOP 与码率控制都交给
+    /// libavcodec：手写那一层踩过的坑（回绕导致参考帧分叉、没有码率控制）都是
+    /// 库的职责。`OPENUUYC_ENCODER=vaapi` 可以退回手写那版做对照。
+    Libavcodec {
+        backend: Backend,
+        encoder: super::ffmpeg::Encoder,
+    },
     Software(Box<super::software_encoder::Encoder>),
 }
 impl Encoder {
@@ -151,6 +167,10 @@ impl Encoder {
         // The capture backends deliver 8-bit SDR BGRA only.
         ensure!(!color.is_hdr(), "Linux 版暂不支持 HDR 采集");
         match backend {
+            Backend::Amd | Backend::Intel if libavcodec() => Ok(Self::Libavcodec {
+                backend,
+                encoder: super::ffmpeg::Encoder::new(size, format, rate)?,
+            }),
             Backend::Amd | Backend::Intel => Ok(Self::Vaapi {
                 backend,
                 encoder: super::vaapi::Encoder::new(size, format, rate)?,
@@ -182,6 +202,7 @@ impl Encoder {
         match self {
             Self::Nvidia(_) => Backend::Nvidia.implementation(),
             Self::Vaapi { backend, .. } => backend.implementation(),
+            Self::Libavcodec { backend, .. } => backend.implementation(),
             Self::Software(_) => Backend::Software.implementation(),
         }
     }
@@ -189,6 +210,9 @@ impl Encoder {
         match self {
             Self::Nvidia(encoder) => encoder.maximum_size(),
             Self::Vaapi { encoder, .. } => encoder.maximum_size(),
+            Self::Libavcodec { encoder, .. } => {
+                super::ffmpeg::Encoder::maximum_size(encoder.format())
+            }
             Self::Software(encoder) => encoder.maximum_size(),
         }
     }
@@ -196,6 +220,7 @@ impl Encoder {
         match self {
             Self::Nvidia(encoder) => encoder.configure_rate(rate),
             Self::Vaapi { encoder, .. } => encoder.configure_rate(rate),
+            Self::Libavcodec { encoder, .. } => encoder.configure_rate(rate),
             Self::Software(encoder) => encoder.configure(rate),
         }
     }
@@ -229,6 +254,7 @@ impl Encoder {
         match self {
             Self::Nvidia(encoder) => encoder.encode(image, timestamp, keyframe),
             Self::Vaapi { encoder, .. } => encoder.encode(image, timestamp, keyframe),
+            Self::Libavcodec { encoder, .. } => encoder.encode(image, timestamp, keyframe),
             Self::Software(encoder) => encoder.encode(image, timestamp, keyframe, cancel),
         }
     }

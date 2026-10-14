@@ -205,6 +205,11 @@ wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 
+# Linux 上把编码这一段交给 libavcodec：它自己管 SPS/PPS、POC/DPB、GOP 与码率控制，
+# 这些我们手写过一遍并且已经踩过坑（见 AGENTS_QA.md）。只挂在 Linux 目标下，
+# Windows 目标根本不会解析这个依赖。只用 avcodec，不用 filter graph。
+ffmpeg-sys-next = "9.0"
+
 [patch.crates-io]
 dtls = { path = "vendor/dtls" }
 interceptor = { path = "vendor/interceptor" }
