@@ -419,6 +419,12 @@ impl Grab {
             .get(self.output)
             .context("采集的输出已消失")?;
         self.state.wanted = None;
+        // 上一帧已经交付（或已被放弃），这一帧的对象用完就得我们自己说一声：
+        // 放掉 proxy 一个请求都不发，而每采一帧就要新建一个 —— 合成器那边于是
+        // 每帧留下一个对象和它为这次拷贝锁住的缓冲，跑上几小时就是几十万个。
+        if let Some(frame) = self.state.frame.take() {
+            frame.destroy();
+        }
         self.state.frame =
             Some(manager.capture_output(i32::from(self.cursor), &output.proxy, &handle, ()));
         Ok(())
@@ -928,7 +934,11 @@ pub(crate) mod dmabuf_tests {
         }
         ensure!(!grab.state.failed, "合成器拒绝了 dma-buf");
         ensure!(grab.state.ready, "合成器没有在 5 秒内画进这块 dma-buf");
-        // 画面已经画完，连接可以放掉：内容在缓冲里，fd 的引用我们拿着。
+        // 画面已经画完，连接可以放掉：内容在缓冲里，fd 的引用我们拿着。这一帧也
+        // 得自己收掉，走这条路的那次拷贝不是 `request` 要的。
+        if let Some(frame) = grab.state.frame.take() {
+            frame.destroy();
+        }
         Ok(buffer)
     }
 
