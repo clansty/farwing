@@ -374,14 +374,14 @@ struct LocalFiles {
 }
 
 /// What this client currently owns locally, as the remote would see it.
-#[derive(Default)]
-struct LocalSnapshot {
-    text: Option<String>,
-    image: Option<Vec<u8>>,
+#[derive(Default, Clone, PartialEq, Eq)]
+pub(super) struct LocalSnapshot {
+    pub(super) text: Option<String>,
+    pub(super) image: Option<Vec<u8>>,
     /// The paths a local copy put on the clipboard. They are only walked when
     /// the remote asks for the list, so copying a large tree locally costs
     /// nothing until someone pastes it there.
-    sources: Vec<PathBuf>,
+    pub(super) sources: Vec<PathBuf>,
 }
 
 impl LocalSnapshot {
@@ -578,6 +578,11 @@ struct State {
     sessions: HashMap<u64, Weak<Inner>>,
     published: HashMap<u64, Vec<Format>>,
     local: LocalSnapshot,
+    /// 上一次在 Wayland 那一侧看到的、以及上一次在 X11 那一侧看到的。两座孤岛各记
+    /// 各的——共用一个的话，刚发布完 X11 那侧的内容，下一轮就会被 Wayland 那侧的
+    /// 旧内容顶掉。
+    wayland: LocalSnapshot,
+    x11: LocalSnapshot,
     /// File lists handed out per session and task, kept until the clipboard
     /// changes so a slow remote can keep reading the copy it started on.
     tasks: HashMap<(u64, u32), Arc<LocalFiles>>,
@@ -655,6 +660,8 @@ fn run(receiver: Receiver<Command>) {
         clipboard,
         sessions: HashMap::new(),
         published: HashMap::new(),
+        wayland: LocalSnapshot::default(),
+        x11: LocalSnapshot::default(),
         local: LocalSnapshot::default(),
         tasks: HashMap::new(),
         mounted: None,
@@ -1097,73 +1104,40 @@ fn trim_uri_path(path: PathBuf) -> PathBuf {
 }
 
 /// Read the local clipboard and, when it changed, announce the new formats.
+///
+/// 两个剪贴板都要读。X11 与 Wayland 在这里互不相通（见 `publish_files`）：XWayland
+/// 里的程序复制时 Wayland 那一侧什么都不会变，光看 Wayland 就等于看不见它们。
 fn poll_local(state: &mut State) -> Result<()> {
     if state.writing || state.sessions.is_empty() {
         return Ok(());
     }
-    let Some(clipboard) = state.clipboard.as_mut() else {
-        return Ok(());
-    };
-    // The whole outbound path starts here, so when files never reach the remote
-    // this says whether they were on the local clipboard at all.
-    if tracing::enabled!(target: "openuuyc::clipboard", tracing::Level::DEBUG) {
-        let probe = clipboard.get().file_list();
-        tracing::debug!(target: "openuuyc::clipboard",
-            sessions = state.sessions.len(),
-            files = ?probe.as_ref().map(Vec::len).map_err(ToString::to_string),
-            first = ?probe.as_ref().ok().and_then(|paths| paths.first().cloned()),
-            held = state.local.sources.len(),
-            "剪贴板轮询");
+    let wayland = read_wayland(state)?;
+    let x11 = super::x11_read::read();
+    // 自己挂上去的远端副本不算「本地复制」：发回去等于向远端要它刚给我们的东西。
+    let (own_wayland, own_x11) = (own_copy(&wayland.sources), own_copy(&x11.sources));
+    let (wayland_changed, x11_changed) = (
+        !own_wayland && wayland != state.wayland,
+        !own_x11 && x11 != state.x11,
+    );
+    if !own_wayland {
+        state.wayland = wayland.clone();
     }
-    // A file manager puts the paths on the clipboard as `text/uri-list` and a
-    // plain-text copy of the same names, so files are looked for first.
-    let files = clipboard
-        .get()
-        .file_list()
-        .unwrap_or_default()
-        .into_iter()
-        .map(trim_uri_path)
-        .filter(|path| path.is_absolute())
-        .collect::<Vec<_>>();
-    // A copy the remote sent is published as paths into this process's own
-    // filesystem, and under plain-text targets too. While it is still what the
-    // clipboard holds, nothing changed here: offering the paths back would
-    // ask the remote for the files it just gave us, and offering their text
-    // would replace the remote's copy with a path that only exists here.
-    if own_copy(&files) {
-        return Ok(());
+    if !own_x11 {
+        state.x11 = x11.clone();
     }
-    let sources = files;
-    let snapshot = if !sources.is_empty() {
-        LocalSnapshot {
-            sources,
-            ..Default::default()
-        }
-    } else if let Some(text) = clipboard.get_text().ok().filter(|text| !text.is_empty()) {
-        LocalSnapshot {
-            text: Some(text),
-            ..Default::default()
-        }
+    // 两边同一轮都变了时让给 X11：XWayland 里的程序只在那一侧看得见，而 Wayland
+    // 那一侧的变化更可能是我们自己的东西在动。
+    let snapshot = if x11_changed && !x11.is_empty() {
+        x11
+    } else if wayland_changed {
+        wayland
     } else {
-        match clipboard.get_image() {
-            Ok(image) => LocalSnapshot {
-                image: Some(rgba_to_dib(
-                    image.width as u32,
-                    image.height as u32,
-                    &image.bytes,
-                )?),
-                ..Default::default()
-            },
-            Err(_) => LocalSnapshot::default(),
-        }
+        return Ok(());
     };
-    if snapshot.text == state.local.text
-        && snapshot.image == state.local.image
-        && snapshot.sources == state.local.sources
-    {
+    if snapshot == state.local {
         return Ok(());
     }
-    if !state.local.sources.is_empty() || !snapshot.sources.is_empty() {
+    if !snapshot.sources.is_empty() || !state.local.sources.is_empty() {
         tracing::debug!(
             files = snapshot.sources.len(),
             text = snapshot.text.is_some(),
@@ -1204,6 +1178,60 @@ fn poll_local(state: &mut State) -> Result<()> {
         *lock(&session.error) = None;
     }
     Ok(())
+}
+
+/// Wayland 那一侧：进程里那个 arboard 实例。
+fn read_wayland(state: &mut State) -> Result<LocalSnapshot> {
+    let Some(clipboard) = state.clipboard.as_mut() else {
+        return Ok(LocalSnapshot::default());
+    };
+    // The whole outbound path starts here, so when files never reach the remote
+    // this says whether they were on the local clipboard at all.
+    if tracing::enabled!(target: "openuuyc::clipboard", tracing::Level::DEBUG) {
+        let probe = clipboard.get().file_list();
+        tracing::debug!(target: "openuuyc::clipboard",
+            sessions = state.sessions.len(),
+            files = ?probe.as_ref().map(Vec::len).map_err(ToString::to_string),
+            first = ?probe.as_ref().ok().and_then(|paths| paths.first().cloned()),
+            held = state.local.sources.len(),
+            "剪贴板轮询");
+    }
+    // A file manager puts the paths on the clipboard as `text/uri-list` and a
+    // plain-text copy of the same names, so files are looked for first.
+    let files = clipboard
+        .get()
+        .file_list()
+        .unwrap_or_default()
+        .into_iter()
+        .map(trim_uri_path)
+        .filter(|path| path.is_absolute())
+        .collect::<Vec<_>>();
+    if !files.is_empty() {
+        return Ok(LocalSnapshot {
+            sources: files,
+            ..Default::default()
+        });
+    }
+    // A copy the remote sent is published as paths into this process's own
+    // filesystem, and under plain-text targets too. Offering their text would
+    // replace the remote's copy with a path that only exists here.
+    if let Some(text) = clipboard.get_text().ok().filter(|text| !text.is_empty()) {
+        return Ok(LocalSnapshot {
+            text: Some(text),
+            ..Default::default()
+        });
+    }
+    match clipboard.get_image() {
+        Ok(image) => Ok(LocalSnapshot {
+            image: Some(rgba_to_dib(
+                image.width as u32,
+                image.height as u32,
+                &image.bytes,
+            )?),
+            ..Default::default()
+        }),
+        Err(_) => Ok(LocalSnapshot::default()),
+    }
 }
 
 fn serve(
@@ -1462,7 +1490,7 @@ fn dib_to_rgba(dib: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
     Ok((width, height, rgba))
 }
 
-fn rgba_to_dib(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>> {
+pub(super) fn rgba_to_dib(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>> {
     ensure!(width > 0 && height > 0, "图片尺寸无效");
     let pixels = width as usize * height as usize;
     ensure!(rgba.len() >= pixels * 4, "图片数据不完整");
