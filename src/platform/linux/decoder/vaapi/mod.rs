@@ -1,9 +1,12 @@
 //! VA-API hardware decode for Linux.
 //!
-//! Only the codecs this client negotiates are wired up: H.264 today, with the
-//! session enum kept so HEVC slots in beside it.
+//! H.264 与 HEVC（Main，8 位 4:2:0）走硬件，前提是驱动为该 profile 提供了
+//! VLD 入口；画面一律拷回 NV12，因此 10 位与 4:4:4 不声明。HEVC 没有软件
+//! 回退，驱动不支持时整个 H.265 就不在对端的能力清单里。
 mod avc;
 mod display;
+mod hevc;
+mod hevc_ref_list;
 mod output;
 mod ref_list;
 
@@ -23,6 +26,7 @@ pub(super) struct Session {
 
 enum Codec {
     H264(Box<avc::Avc>),
+    Hevc(Box<hevc::Hevc>),
 }
 
 impl Session {
@@ -49,8 +53,17 @@ impl Session {
                     extra: Some(config.extra_data.clone()),
                 })
             }
-            // H.265 and AV1 slice parameters are not written for VA-API yet.
-            VideoCodec::H265 | VideoCodec::Av1 => Err(DecodeError::Unsupported),
+            VideoCodec::H265 => {
+                if !probe(VideoCodec::H265, config.width, config.height, 8, 1) {
+                    return Err(DecodeError::Unsupported);
+                }
+                Ok(Self {
+                    codec: Codec::Hevc(Box::new(hevc::Hevc::new())),
+                    extra: Some(config.extra_data.clone()),
+                })
+            }
+            // AV1 slice parameters are not written for VA-API yet.
+            VideoCodec::Av1 => Err(DecodeError::Unsupported),
         }
     }
 
@@ -70,12 +83,14 @@ impl Session {
         };
         match &mut self.codec {
             Codec::H264(session) => session.decode(data, cancel),
+            Codec::Hevc(session) => session.decode(data, cancel),
         }
     }
 
     pub(super) fn reset(&mut self) {
         match &mut self.codec {
             Codec::H264(session) => session.reset(),
+            Codec::Hevc(session) => session.reset(),
         }
     }
 }
@@ -92,6 +107,8 @@ pub(super) fn probe(codec: VideoCodec, width: u32, height: u32, depth: u8, chrom
             VAProfile::VAProfileH264Main,
             VAProfile::VAProfileH264ConstrainedBaseline,
         ],
+        // Main10 的 P010 读不回来，所以只有 Main。
+        VideoCodec::H265 => &[VAProfile::VAProfileHEVCMain],
         _ => return false,
     };
     profiles

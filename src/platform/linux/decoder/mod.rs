@@ -182,3 +182,121 @@ impl Drop for LinuxVideoDecoder {
         self.pending.clear();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 把 annex-B 码流切成访问单元：`first_slice_segment_in_pic_flag`（H.264 那边是
+    /// `first_mb_in_slice` 的第一个比特）为 1 的 VCL NAL 起新的一张；硬件后端一次
+    /// 只吃一个访问单元。H.264 的 NAL 头只有一字节、HEVC 是两字节，切片头随之错开。
+    fn access_units(codec: VideoCodec, stream: &[u8]) -> Vec<Vec<u8>> {
+        let mut units = Vec::new();
+        let mut current = Vec::new();
+        // 参数集与 SEI 要跟它们之后的切片待在同一个访问单元里，所以只有已经收过
+        // 切片的单元才会被新图像的首片切开。
+        let mut saw_slice = false;
+        for nal in openuuyc_codec::syntax::h264::nal::AnnexBSplitter::new(stream) {
+            let Some(&head) = nal.first() else {
+                continue;
+            };
+            let (kind, vcl, slice) = match codec {
+                VideoCodec::H265 => ((head >> 1) & 0x3f, true, 2usize),
+                _ => (head & 0x1f, (1..=5).contains(&(head & 0x1f)), 1usize),
+            };
+            let vcl = vcl && (codec != VideoCodec::H265 || kind <= 31);
+            let first = nal.get(slice).is_some_and(|byte| byte & 0x80 != 0);
+            if vcl && first && saw_slice {
+                units.push(std::mem::take(&mut current));
+                saw_slice = false;
+            }
+            // 起始码要还回去：解码器自己也要按 annex-B 再切一遍。
+            current.extend_from_slice(&[0, 0, 0, 1]);
+            current.extend_from_slice(nal);
+            saw_slice |= vcl;
+        }
+        if !current.is_empty() {
+            units.push(current);
+        }
+        units
+    }
+
+    /// 用硬件后端把 fixture 跑完，返回 (帧数, 首帧尺寸)。本地没有该 codec 的
+    /// VA-API 解码时返回 None（没有 GPU 的机器跳过而不是失败）。
+    fn decode_fixture(
+        codec: VideoCodec,
+        stream: &[u8],
+        requested: (u32, u32),
+    ) -> Option<(usize, (u32, u32))> {
+        let config = VideoDecoderConfig {
+            codec,
+            width: requested.0,
+            height: requested.1,
+            mode: DecoderMode::Hardware,
+            gpu_device: None,
+            extra_data: Bytes::new(),
+        };
+        let mut decoder = match LinuxVideoDecoder::open(&config) {
+            Ok(decoder) => decoder,
+            Err(error) => {
+                eprintln!("跳过 {codec:?} 硬件解码：{error:?}");
+                return None;
+            }
+        };
+        let mut size = (0, 0);
+        let mut frames = 0usize;
+        for unit in access_units(codec, stream) {
+            if let Err(error) = decoder.push_packet(&unit, frames as i64) {
+                panic!("{codec:?} 第 {frames} 帧之后解码失败：{error:?}");
+            }
+            while let Ok(Some(frame)) = decoder.poll_owned_frame() {
+                let PlatformDecodedFrame::Cpu(frame) = frame;
+                assert_eq!(frame.format, CpuFormat::Nv12);
+                assert_eq!(
+                    frame.data.len(),
+                    (frame.width * frame.height * 3 / 2) as usize,
+                    "{codec:?} 的 NV12 长度不对"
+                );
+                if frames == 0 {
+                    size = (frame.width, frame.height);
+                }
+                frames += 1;
+            }
+        }
+        Some((frames, size))
+    }
+
+    #[test]
+    fn decodes_h264_and_hevc_frames_in_hardware() {
+        let h264 = include_bytes!("../../../media/decoder/fixtures/matrix/h264_1280x720.annexb");
+        let hevc = include_bytes!("../../../media/decoder/fixtures/matrix/hevc_1280x720.annexb");
+        for (codec, stream) in [
+            (VideoCodec::H264, h264.as_slice()),
+            (VideoCodec::H265, hevc.as_slice()),
+        ] {
+            let Some((frames, size)) = decode_fixture(codec, stream, (1280, 720)) else {
+                continue;
+            };
+            assert!(frames > 0, "{codec:?} 一帧都没解出来");
+            assert_eq!(size, (1280, 720), "{codec:?} 出图尺寸不对");
+            eprintln!("{codec:?} 硬件解码 {frames} 帧 @{size:?}");
+        }
+    }
+
+    #[test]
+    fn decodes_multi_frame_fixtures_in_hardware() {
+        // 多帧样本里才有 P/B 片，参考图像列表与 DPB 才算真的被走到。
+        let h264 = include_bytes!("../../../media/decoder/fixtures/h264.annexb");
+        let hevc = include_bytes!("../../../media/decoder/fixtures/hevc.annexb");
+        for (codec, stream) in [
+            (VideoCodec::H264, h264.as_slice()),
+            (VideoCodec::H265, hevc.as_slice()),
+        ] {
+            let Some((frames, size)) = decode_fixture(codec, stream, (1920, 1080)) else {
+                continue;
+            };
+            assert!(frames > 1, "{codec:?} 只解出 {frames} 帧，多帧码流没走完");
+            eprintln!("{codec:?} 硬件解码 {frames} 帧，首帧 {size:?}");
+        }
+    }
+}
