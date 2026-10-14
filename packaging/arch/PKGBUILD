@@ -113,6 +113,11 @@ build() {
   # 与 .github/workflows/linux-deb.yml 一致；CARGO_TARGET_DIR 由调用方决定，
   # 不在这里写死，本地构建才能复用工作树自己的 target/。
   cargo build --release --locked --bin OpenUUYC
+  # 虚拟显示器辅助程序是独立的 crate（自己的 workspace 和 Cargo.lock），但产物指到
+  # 同一个 target/，打包时只认一处。
+  local target_dir
+  target_dir=$(realpath "${CARGO_TARGET_DIR:-target}")
+  ( cd crates/vkms && CARGO_TARGET_DIR="$target_dir" cargo build --release --locked )
 }
 
 package() {
@@ -136,6 +141,15 @@ package() {
   # `systemctl --user enable openuuyc.service`；装包时不能替用户 enable。
   install -Dm644 packaging/linux/openuuyc.service \
     "$pkgdir/usr/lib/systemd/user/openuuyc.service"
+
+  # 虚拟显示器辅助程序：凭空多一块显示器要写 configfs，只有 root 能写，所以它是个
+  # 独立的系统服务，平时不跑，第一次用到时由套接字拉起（见 openuuyc-git.install）。
+  install -Dm755 "$target_dir/release/openuuyc-vkms" \
+    "$pkgdir/usr/bin/openuuyc-vkms"
+  install -Dm644 packaging/linux/openuuyc-vkms.socket \
+    "$pkgdir/usr/lib/systemd/system/openuuyc-vkms.socket"
+  install -Dm644 packaging/linux/openuuyc-vkms.service \
+    "$pkgdir/usr/lib/systemd/system/openuuyc-vkms.service"
 
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 THIRD_PARTY_NOTICES "$pkgdir/usr/share/licenses/$pkgname/THIRD_PARTY_NOTICES"
