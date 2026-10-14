@@ -21,8 +21,8 @@ use anyhow::{Context as _, Result, bail, ensure};
 use cros_libva::{
     BufferType, Context, Display, EncMiscParameter, EncMiscParameterFrameRate,
     EncMiscParameterRateControl, Image as VaImage, MappedCodedBuffer, Picture, RcFlags, Surface,
-    UsageHint, VA_RT_FORMAT_YUV420, VA_RC_CBR, VA_RC_VBR, VAConfigAttrib, VAConfigAttribType,
-    VAEntrypoint,
+    UsageHint, VA_RT_FORMAT_RGB32, VA_RT_FORMAT_YUV420, VA_RC_CBR, VA_RC_VBR, VAConfigAttrib,
+    VAConfigAttribType, VAEntrypoint, VAProfile,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -292,6 +292,15 @@ enum CodecState {
 }
 
 impl CodecState {
+    /// Whether the next picture would wrap a counter the sequence parameter set
+    /// declared fixed-width; the caller must send an IDR before that.
+    fn wrapping(&self) -> bool {
+        match self {
+            Self::H264(state) => state.wrapping(),
+            Self::H265(state) => state.wrapping(),
+        }
+    }
+
     fn new(format: Format) -> Option<Self> {
         match format.codec {
             Codec::H264 => Some(Self::H264(h264::State::new())),
@@ -713,6 +722,9 @@ impl Encoder {
         ensure!(image.size() == self.size, "采集画面尺寸与编码器不一致");
         let pixels = image.pixels()?;
         self.convert(&pixels)?;
+        if self.codec.wrapping() {
+            self.force_keyframe = true;
+        }
         let keyframe = keyframe || self.force_keyframe;
         self.force_keyframe = false;
         self.encode_frame(timestamp_100ns, keyframe)
@@ -882,6 +894,61 @@ mod tests {
                 (squared / compared.max(1) as f64).sqrt()
             );
             std::fs::write(format!("/tmp/openuuyc-vaapi-rate-{fps}.h264"), &stream).unwrap();
+        }
+    }
+
+    /// VPP（`VAEntrypointVideoProc`）能不能吃 RGB32、最大能到多大：GPU 缩放这条路的
+    /// 前提。`cargo test --release --lib -- --ignored reports_video_proc --nocapture`
+    #[test]
+    #[ignore]
+    fn reports_video_proc() {
+        let (display, _, _) = profile_entrypoint(Format {
+            codec: Codec::H264,
+            chroma: 1,
+            depth: 8,
+        })
+        .unwrap();
+        let Ok(entrypoints) = display.query_config_entrypoints(VAProfile::VAProfileNone) else {
+            println!("没有 VAProfileNone");
+            return;
+        };
+        println!(
+            "VAProfileNone 支持：{}",
+            if entrypoints.contains(&VAEntrypoint::VAEntrypointVideoProc) {
+                "VideoProc"
+            } else {
+                "（没有 VideoProc）"
+            }
+        );
+        let mut attrs = vec![
+            VAConfigAttrib {
+                type_: VAConfigAttribType::VAConfigAttribRTFormat,
+                value: 0,
+            },
+            VAConfigAttrib {
+                type_: VAConfigAttribType::VAConfigAttribMaxPictureWidth,
+                value: 0,
+            },
+            VAConfigAttrib {
+                type_: VAConfigAttribType::VAConfigAttribMaxPictureHeight,
+                value: 0,
+            },
+        ];
+        match display.get_config_attributes(
+            VAProfile::VAProfileNone,
+            VAEntrypoint::VAEntrypointVideoProc,
+            &mut attrs,
+        ) {
+            Ok(()) => {
+                let formats = attrs[0].value;
+                println!(
+                    "RTFormat 位图 {formats:#x}：YUV420 {}，RGB32 {}",
+                    formats & VA_RT_FORMAT_YUV420 != 0,
+                    formats & VA_RT_FORMAT_RGB32 != 0
+                );
+                println!("最大尺寸 {}x{}", attrs[1].value, attrs[2].value);
+            }
+            Err(error) => println!("get_config_attributes: {error:?}"),
         }
     }
 

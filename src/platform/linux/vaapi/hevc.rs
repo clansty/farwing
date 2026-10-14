@@ -230,6 +230,12 @@ impl State {
         self.poc_lsb = (self.poc_lsb + 1) % POC_MODULO;
     }
 
+    /// Whether the next frame would wrap the picture order count back to zero.
+    /// See `h264::State::wrapping` for why that must not happen.
+    pub(super) fn wrapping(&self) -> bool {
+        self.poc_lsb + 1 >= POC_MODULO
+    }
+
     /// The three parameter buffers one picture needs.
     pub(super) fn buffers(
         &self,

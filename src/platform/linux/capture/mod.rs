@@ -767,6 +767,111 @@ mod tests {
 }
 
 #[cfg(test)]
+mod stream_tests {
+    /// 真机采一路下来交给 VA-API 编码，逐帧留下「编码器看到的亮度」与码流：
+    /// 用 ffmpeg 解回来逐帧对，就能看出参考帧链在长时间/大变化下会不会漂。
+    /// `OPENUUYC_PROBE_OUTPUT=DP-1 cargo test --release --lib -- --ignored reports_the_real_stream --nocapture`
+    #[test]
+    #[ignore]
+    fn reports_the_real_stream() {
+        use crate::media::encoding::{Codec, Format, QualityTarget, Rate};
+        let screens = super::screens().unwrap();
+        let wanted = std::env::var("OPENUUYC_PROBE_OUTPUT").unwrap_or_default();
+        let screen = screens
+            .iter()
+            .find(|screen| screen.device_name == wanted)
+            .unwrap_or(&screens[0])
+            .clone();
+        let (quality, maximum) = (4, (3840, 2160));
+        let mut desktop = super::Desktop::open_selected(&screen).unwrap();
+        let format = Format {
+            codec: Codec::H264,
+            chroma: 1,
+            depth: 8,
+        };
+        let rate = Rate {
+            target: 24_000_000,
+            peak: 24_000_000,
+            fps: 30,
+            quality,
+            quality_target: QualityTarget {
+                bitrate: 24_000_000,
+                fps: 30,
+            },
+        };
+        let mut encoder = None;
+        let (mut stream, mut luma) = (Vec::new(), Vec::new());
+        let started = std::time::Instant::now();
+        let mut index = 0i64;
+        let (mut frames, mut keyframes, mut bytes) = (0, 0, 0usize);
+        let mut sizes = Vec::new();
+        while started.elapsed() < std::time::Duration::from_secs(15) {
+            let Ok(Some(frame)) = desktop.next(33, quality, false, false, maximum) else {
+                continue;
+            };
+            let size = (frame.width, frame.height);
+            let encoder = match encoder.as_mut() {
+                Some(encoder) => encoder,
+                None => {
+                    println!("编码尺寸 {size:?}（源 {:?}）", (screen.width, screen.height));
+                    encoder = Some(
+                        crate::platform::linux::vaapi::Encoder::new(size, format, rate).unwrap(),
+                    );
+                    encoder.as_mut().unwrap()
+                }
+            };
+            let Ok(encoded) = encoder.encode(&frame.image, index * 333_333, index == 0) else {
+                continue;
+            };
+            // 编码器看到的亮度，按 1/8 抽样留下，够看出漂移又不至于几个 G
+            let pixels = frame.image.pixels().unwrap();
+            let (width, height) = (size.0 as usize, size.1 as usize);
+            let mut plane = vec![0u8; width * height * 3 / 2];
+            let (y, uv) = plane.split_at_mut(width * height);
+            let (u, v) = uv.split_at_mut(width * height / 4);
+            yuv::bgra_to_yuv420(
+                &mut yuv::YuvPlanarImageMut {
+                    y_plane: yuv::BufferStoreMut::Borrowed(y),
+                    y_stride: size.0,
+                    u_plane: yuv::BufferStoreMut::Borrowed(u),
+                    u_stride: size.0 / 2,
+                    v_plane: yuv::BufferStoreMut::Borrowed(v),
+                    v_stride: size.0 / 2,
+                    width: size.0,
+                    height: size.1,
+                },
+                &pixels,
+                size.0 * 4,
+                yuv::YuvRange::Limited,
+                yuv::YuvStandardMatrix::Bt601,
+                yuv::YuvConversionMode::Balanced,
+            )
+            .unwrap();
+            for row in (0..height).step_by(8) {
+                for column in (0..width).step_by(8) {
+                    luma.push(y[row * width + column]);
+                }
+            }
+            for output in &encoded {
+                stream.extend_from_slice(&output.data);
+                bytes += output.data.len();
+                sizes.push((output.data.len(), output.keyframe));
+                if output.keyframe {
+                    keyframes += 1;
+                }
+            }
+            frames += 1;
+            index += 1;
+        }
+        println!("{frames} 帧，{keyframes} 个关键帧，{bytes} 字节");
+        println!("前 10 帧字节数 {:?}", sizes.iter().take(10).collect::<Vec<_>>());
+        println!("后 10 帧字节数 {:?}", sizes.iter().rev().take(10).collect::<Vec<_>>());
+        std::fs::write("/tmp/openuuyc-real.h264", &stream).unwrap();
+        std::fs::write("/tmp/openuuyc-real-luma.raw", &luma).unwrap();
+    }
+}
+
+#[cfg(test)]
 mod session_tests {
     /// Needs a desktop session: `OPENUUYC_CAPTURE=portal cargo test -- --ignored`.
     #[test]

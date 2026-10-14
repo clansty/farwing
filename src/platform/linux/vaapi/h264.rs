@@ -192,6 +192,18 @@ impl State {
         self.poc_lsb = (self.poc_lsb + 2) % POC_MODULO;
     }
 
+    /// Whether the next frame would wrap a counter back to zero.
+    ///
+    /// `frame_num` and `pic_order_cnt_lsb` are fixed-width fields, and the
+    /// widths declared in the sequence parameter set are sized so that one
+    /// group of pictures never wraps them. A wrap must not happen: the driver
+    /// orders its references by these values, and once one wraps the frame it
+    /// predicts from stops being the frame a decoder reconstructs — the picture
+    /// then drifts and never recovers, until an IDR resets both counters.
+    pub(super) fn wrapping(&self) -> bool {
+        self.frame_num + 1 >= FRAME_NUM_MODULO || self.poc_lsb + 2 >= POC_MODULO
+    }
+
     /// The three parameter buffers one picture needs. They are rebuilt per
     /// frame because a libva picture owns the buffers it renders.
     pub(super) fn buffers(
