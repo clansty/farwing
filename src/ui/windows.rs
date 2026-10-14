@@ -41,6 +41,16 @@ pub(super) fn run(config: WindowConfig, factory: AppFactory) -> Result<()> {
         viewers: HashMap::new(),
     };
     window_manager::install(Some(event_loop.create_proxy()));
+    // Linux 上这个入口只用来开控制中心主窗口（观看窗口与通知窗口走别的 runner），
+    // 所以控制通道跟着它一起建立与撤销。
+    #[cfg(target_os = "linux")]
+    let _control = super::control::listen()
+        .inspect_err(|error| tracing::warn!(error = %format!("{error:#}"), "控制通道不可用"))
+        .ok();
+    #[cfg(target_os = "linux")]
+    if let Err(error) = super::shutdown::install() {
+        tracing::warn!(error = %format!("{error:#}"), "退出信号处理不可用");
+    }
     event_loop
         .run_app(&mut runner)
         .context("run desktop event loop")?;
@@ -72,7 +82,8 @@ struct Hidden {
     context: egui::Context,
     tray: Option<super::tray::Tray>,
     /// egui 的纹理和管线都在绘制资源里，丢了就等于所有文字都要重新上载一遍。
-    retained: Retained,
+    /// 以 `--background` 启动时还没建过窗口，第一份绘制资源要等窗口建出来才有。
+    retained: Option<Retained>,
     size: Option<PhysicalSize<u32>>,
     /// Wayland 不向客户端提供窗口位置，那里拿不到值。
     position: Option<PhysicalPosition<i32>>,
@@ -155,7 +166,7 @@ impl Runner {
             ..
         } = state;
         // 绘制资源里装着 egui 的全部纹理，跟应用一起留下；surface 则随窗口放掉。
-        let retained = Retained::take(presenter);
+        let retained = Some(Retained::take(presenter));
         drop(input);
         drop(window);
         tracing::info!(?size, "主窗口已收进托盘");
@@ -167,6 +178,60 @@ impl Runner {
             size,
             position,
         });
+    }
+
+    /// 这个窗口该不该压根不建出来。Linux 的托盘走 D-Bus，不需要窗口句柄，所以
+    /// `--background`（服务与登录自启用的就是它）可以完全不开窗口；Windows 的托盘
+    /// 靠窗口消息，那里照旧把窗口建出来只是不显示。
+    fn starts_hidden(&self) -> bool {
+        cfg!(not(windows))
+            && self.root
+            && self.state.is_none()
+            && self.hidden.is_none()
+            && self.config.viewport.visible == Some(false)
+    }
+
+    /// 后台启动：只把应用、egui 上下文与托盘立起来，窗口、surface 与绘制资源都不建。
+    /// 托盘里点「打开」再走 [`Runner::create`]，那是同一个窗口的正常创建路径。
+    fn start_hidden(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
+        let context = egui::Context::default();
+        super::fonts::install(&context);
+        context.set_embed_viewports(true);
+        let factory = self
+            .factory
+            .take()
+            .context("desktop factory already consumed")?;
+        let mut app = AppSession(factory(&context, None));
+        app.0.on_focus_changed(false);
+        let wants_tray = self.root && app.0.uses_tray();
+        // 没有通知区域就把窗口建出来：否则界面被藏在一个够不着的地方，
+        // 而进程还占着实例锁，用户再点一次图标也打不开。
+        let tray = wants_tray.then(super::tray::Tray::new).and_then(|tray| {
+            tray.inspect_err(
+                |error| tracing::warn!(error = %format!("{error:#}"), "tray unavailable"),
+            )
+            .ok()
+        });
+        tracing::info!(
+            tray = tray.is_some(),
+            "以不显示主窗口的方式启动（--background）"
+        );
+        let missing_tray = wants_tray && tray.is_none();
+        self.hidden = Some(Hidden {
+            app,
+            context,
+            tray,
+            retained: None,
+            size: None,
+            position: None,
+        });
+        if missing_tray {
+            return self.create(event_loop);
+        }
+        if self.root {
+            crate::application::bootstrap::ready();
+        }
+        Ok(())
     }
 
     fn create(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
@@ -182,13 +247,7 @@ impl Runner {
                 retained,
                 size,
                 position,
-            }) => (
-                context,
-                Some(app),
-                tray,
-                Some(retained),
-                Some((size, position)),
-            ),
+            }) => (context, Some(app), tray, retained, Some((size, position))),
             None => {
                 let context = egui::Context::default();
                 super::fonts::install(&context);
@@ -530,7 +589,12 @@ impl DesktopWindow {
 
 impl ApplicationHandler<Event> for Runner {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if let Err(error) = self.create(event_loop) {
+        let result = if self.starts_hidden() {
+            self.start_hidden(event_loop)
+        } else {
+            self.create(event_loop)
+        };
+        if let Err(error) = result {
             self.fail(event_loop, error);
         }
     }
