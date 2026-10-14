@@ -16,11 +16,11 @@
 //! order.
 //!
 //! Frames are BGRA, in system memory or, from NvFBC, in CUDA device memory.
-mod dmabuf;
+pub(crate) mod dmabuf;
 mod nvfbc;
 mod pipewire;
 mod portal;
-mod wlr_screencopy;
+pub(crate) mod wlr_screencopy;
 mod x11;
 
 use anyhow::{Result, bail, ensure};
@@ -661,6 +661,15 @@ unsafe fn blend_columns_simd(row: &[u16], columns: &[Column], out: &mut [u8]) {
         }
         blend_columns_one_by_one(row, &columns[x..], &mut out[x * 4..]);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn scale_for_probe(
+    source: &[u8],
+    from: (u32, u32),
+    to: (u32, u32),
+) -> Vec<u8> {
+    scale(source, from, to)
 }
 
 #[cfg(test)]

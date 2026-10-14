@@ -8,6 +8,10 @@
 //!
 //! 色彩转换也交给库（BGRA 软件帧 → `av_hwframe_transfer_data` → NV12 硬件帧），
 //! 于是我们不再自己写 NV12 交织与上传。
+//!
+//! `drm` 那条路是零拷贝：合成器画进显存的那块 dma-buf 直接喂进编码器，
+//! CPU 一个像素都不碰（缩放与色彩转换在那条路上走 VPP，见 `drm.rs`）。
+pub(crate) mod drm;
 use crate::media::encoding::{Codec, Color, Encoded, Format, Rate};
 use crate::platform::linux::capture::Image;
 use anyhow::{Context as _, Result, bail, ensure};
@@ -59,6 +63,17 @@ fn codec_name(codec: Codec) -> Option<&'static str> {
 
 impl Encoder {
     pub(crate) fn new(size: (u32, u32), format: Format, rate: Rate) -> Result<Self> {
+        Self::create(None, size, format, rate)
+    }
+
+    /// `frames` 给定时用它（零拷贝那条路：帧来自滤镜图的 buffersink，编码器必须
+    /// 和那些帧共用同一个帧上下文），否则自己建一个并准备一块软件输入帧。
+    fn create(
+        external: Option<*mut ff::AVBufferRef>,
+        size: (u32, u32),
+        format: Format,
+        rate: Rate,
+    ) -> Result<Self> {
         ensure!(accepts(format), "libavcodec 的 VA-API 不支持该格式");
         let name = CString::new(codec_name(format.codec).context("未知编码格式")?)?;
         // Safe because every pointer below is either null-checked here or owned
@@ -68,18 +83,24 @@ impl Encoder {
             let codec = ff::avcodec_find_encoder_by_name(name.as_ptr());
             ensure!(!codec.is_null(), "libavcodec 里没有这个 VA-API 编码器");
 
-            let device = device();
-            let frames = ff::av_hwframe_ctx_alloc(device);
-            ensure!(!frames.is_null(), "分配硬件帧上下文失败");
-            {
-                let context = (*frames).data as *mut ff::AVHWFramesContext;
-                (*context).format = ff::AVPixelFormat::AV_PIX_FMT_VAAPI;
-                (*context).sw_format = ff::AVPixelFormat::AV_PIX_FMT_NV12;
-                (*context).width = size.0 as i32;
-                (*context).height = size.1 as i32;
-                (*context).initial_pool_size = 4;
-            }
-            check(ff::av_hwframe_ctx_init(frames), "初始化硬件帧上下文")?;
+            let frames = match external {
+                Some(frames) => ff::av_buffer_ref(frames),
+                None => {
+                    let device = device();
+                    let frames = ff::av_hwframe_ctx_alloc(device);
+                    ensure!(!frames.is_null(), "分配硬件帧上下文失败");
+                    {
+                        let context = (*frames).data as *mut ff::AVHWFramesContext;
+                        (*context).format = ff::AVPixelFormat::AV_PIX_FMT_VAAPI;
+                        (*context).sw_format = ff::AVPixelFormat::AV_PIX_FMT_NV12;
+                        (*context).width = size.0 as i32;
+                        (*context).height = size.1 as i32;
+                        (*context).initial_pool_size = 4;
+                    }
+                    check(ff::av_hwframe_ctx_init(frames), "初始化硬件帧上下文")?;
+                    frames
+                }
+            };
 
             let context = ff::avcodec_alloc_context3(codec);
             ensure!(!context.is_null(), "分配编码上下文失败");
@@ -116,17 +137,28 @@ impl Encoder {
                 bail!("打开 VA-API 编码器失败（libavcodec {opened}）");
             }
 
-            let scratch = ff::av_frame_alloc();
-            (*scratch).format = ff::AVPixelFormat::AV_PIX_FMT_BGRA as i32;
-            (*scratch).width = size.0 as i32;
-            (*scratch).height = size.1 as i32;
-            check(ff::av_frame_get_buffer(scratch, 0), "分配输入帧")?;
+            // 自己建帧上下文的那条路（CPU 喂进来）才需要一块软件输入帧。
+            let scratch = if external.is_none() {
+                let scratch = ff::av_frame_alloc();
+                (*scratch).format = ff::AVPixelFormat::AV_PIX_FMT_BGRA as i32;
+                (*scratch).width = size.0 as i32;
+                (*scratch).height = size.1 as i32;
+                check(ff::av_frame_get_buffer(scratch, 0), "分配输入帧")?;
+                scratch
+            } else {
+                ptr::null_mut()
+            };
 
-            let hardware = ff::av_frame_alloc();
-            (*hardware).format = ff::AVPixelFormat::AV_PIX_FMT_VAAPI as i32;
-            (*hardware).width = size.0 as i32;
-            (*hardware).height = size.1 as i32;
-            (*hardware).hw_frames_ctx = ff::av_buffer_ref(frames);
+            let hardware = if external.is_none() {
+                let hardware = ff::av_frame_alloc();
+                (*hardware).format = ff::AVPixelFormat::AV_PIX_FMT_VAAPI as i32;
+                (*hardware).width = size.0 as i32;
+                (*hardware).height = size.1 as i32;
+                (*hardware).hw_frames_ctx = ff::av_buffer_ref(frames);
+                hardware
+            } else {
+                ptr::null_mut()
+            };
 
             Ok(Self {
                 context,
@@ -145,6 +177,38 @@ impl Encoder {
 
     pub(crate) fn format(&self) -> Format {
         self.format
+    }
+
+    /// 用外部给的硬件帧上下文建编码器：零拷贝那条路上，帧来自滤镜图的
+    /// buffersink，编码器的 `hw_frames_ctx` 必须和那些帧同源。
+    pub(crate) fn with_frames(
+        frames: *mut ff::AVBufferRef,
+        size: (u32, u32),
+        format: Format,
+        rate: Rate,
+    ) -> Result<Self> {
+        Self::create(Some(frames), size, format, rate)
+    }
+
+    /// 编一帧已经在显存里的画面（零拷贝）。`frame` 由调用方持有。
+    pub(crate) fn encode_hardware(
+        &mut self,
+        frame: *mut ff::AVFrame,
+        timestamp_100ns: i64,
+        keyframe: bool,
+    ) -> Result<Vec<Encoded>> {
+        let keyframe = keyframe || self.force_keyframe;
+        self.force_keyframe = false;
+        // Safe because the frame comes from a filter graph whose frames context
+        // this encoder was built on, and it stays alive for the call.
+        unsafe {
+            (*frame).pts = timestamp_100ns;
+            if keyframe {
+                (*frame).pict_type = ff::AVPictureType::AV_PICTURE_TYPE_I;
+            }
+            check(ff::avcodec_send_frame(self.context, frame), "提交硬件帧")?;
+            self.packets()
+        }
     }
 
     /// 和 `vaapi::Encoder` 同一份契约：驱动决定实际上限，这里只给一个保守的天花板。
@@ -188,6 +252,7 @@ impl Encoder {
         keyframe: bool,
     ) -> Result<Vec<Encoded>> {
         ensure!(image.size() == self.size, "采集画面尺寸与编码器不一致");
+        ensure!(!self.scratch.is_null(), "这个编码器只用零拷贝那条路");
         let pixels = image.pixels()?;
         let keyframe = keyframe || self.force_keyframe;
         self.force_keyframe = false;
@@ -221,8 +286,17 @@ impl Encoder {
             check(ff::avcodec_send_frame(self.context, self.hardware), "提交帧")?;
             ff::av_frame_unref(self.hardware);
             (*self.hardware).hw_frames_ctx = ff::av_buffer_ref(self.frames);
+            self.packets()
+        }
+    }
 
-            let mut encoded = Vec::new();
+    /// 把编码器已经产出的包全部取出来。
+    ///
+    /// Safe as long as the context is open and belongs to this encoder.
+    unsafe fn packets(&mut self) -> Result<Vec<Encoded>> {
+        let mut encoded = Vec::new();
+        // Safe because the context and the packet belong to this encoder.
+        unsafe {
             loop {
                 let result = ff::avcodec_receive_packet(self.context, self.packet);
                 if result == EAGAIN || result == EOF {
@@ -252,8 +326,8 @@ impl Encoder {
                 });
                 ff::av_packet_unref(self.packet);
             }
-            Ok(encoded)
         }
+        Ok(encoded)
     }
 }
 

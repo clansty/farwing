@@ -162,6 +162,44 @@ impl Buffer {
 
     /// 只给探针用：把内容映射回内存看一眼。生产路径不需要这个（也不需要 CPU 读）。
     #[cfg(test)]
+    pub(crate) fn write_pattern(&self, pixels: &[u8]) -> Result<()> {
+        let mut map = MapDumb {
+            handle: self.handle,
+            ..Default::default()
+        };
+        // Safe because the handle is this buffer's and the struct matches.
+        let result = unsafe { libc::ioctl(self.card.as_raw_fd(), MAP_DUMB, &mut map) };
+        ensure!(result >= 0, "映射显存缓冲失败");
+        // Safe because the driver gave us this offset for this buffer.
+        let pointer = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                self.size as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                self.card.as_raw_fd(),
+                map.offset as i64,
+            )
+        };
+        ensure!(pointer != libc::MAP_FAILED, "mmap 显存缓冲失败");
+        let stride = self.stride as usize;
+        let row = self.width as usize * 4;
+        // Safe because the mapping is `size` bytes and each row we touch is
+        // within it.
+        unsafe {
+            for y in 0..self.height as usize {
+                let line = std::slice::from_raw_parts_mut(
+                    (pointer as *mut u8).add(y * stride),
+                    row,
+                );
+                line.copy_from_slice(&pixels[y * row..(y + 1) * row]);
+            }
+            libc::munmap(pointer, self.size as usize);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn read_back(&self) -> Result<Vec<u8>> {
         let mut map = MapDumb {
             handle: self.handle,
@@ -205,6 +243,33 @@ fn destroy(card: RawFd, handle: u32) {
     let mut request = DestroyDumb { handle, pad: 0 };
     // Safe because the handle is ours and the struct matches the ioctl.
     unsafe { libc::ioctl(card, DESTROY_DUMB, &mut request) };
+}
+
+/// 驱动着显示器的那块 GPU 的 `card` 节点路径（零拷贝那条路要拿它建 DRM 设备）。
+pub(crate) fn card_path() -> Result<String> {
+    let render = crate::platform::linux::vaapi::display_node()
+        .map(|(node, _)| node)
+        .unwrap_or_else(|| "/dev/dri/renderD128".to_owned());
+    let name = render.rsplit('/').next().unwrap_or_default().to_owned();
+    let target = std::fs::canonicalize(format!("/sys/class/drm/{name}/device")).ok();
+    for entry in std::fs::read_dir("/sys/class/drm")
+        .context("读取 /sys/class/drm 失败")?
+        .flatten()
+    {
+        let candidate = entry.file_name().to_string_lossy().into_owned();
+        if !candidate.starts_with("card") || candidate.contains('-') {
+            continue;
+        }
+        let device = std::fs::canonicalize(entry.path().join("device")).ok();
+        if target.is_some() && device != target {
+            continue;
+        }
+        let path = format!("/dev/dri/{candidate}");
+        if std::fs::OpenOptions::new().read(true).write(true).open(&path).is_ok() {
+            return Ok(path);
+        }
+    }
+    bail!("没有可用的 DRM card 节点")
 }
 
 /// 驱动着显示器的那块 GPU 的 `card` 节点。dumb buffer 只能在 `cardN` 上分配

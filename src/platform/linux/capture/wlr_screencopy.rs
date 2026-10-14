@@ -706,8 +706,51 @@ mod tests {
 }
 
 #[cfg(test)]
-mod dmabuf_tests {
+pub(crate) mod dmabuf_tests {
     use super::*;
+    use crate::platform::linux::capture::dmabuf::Buffer;
+
+    /// 测试辅助：让合成器把 `screen` 的画面画进一块我们自己分配的 dma-buf。
+    /// 返回缓冲与仍然活着的 `Grab`（帧对象挂在它上面，别提前丢）。
+    pub(crate) fn capture_into_dmabuf(screen: &Screen) -> Result<Buffer, anyhow::Error> {
+        let mut grab = Grab::open(screen, false)?;
+        let size = grab.state.outputs[grab.output].size();
+        let Some(dmabuf) = grab.state.dmabuf.clone() else {
+            bail!("合成器没有 zwp_linux_dmabuf_v1");
+        };
+        let handle = grab.queue.handle();
+        let output = grab.state.outputs[grab.output].proxy.clone();
+        let manager = grab.state.manager.clone().context("采集已关闭")?;
+        grab.state.manual = true;
+        let frame = manager.capture_output(0, &output, &handle, ());
+        grab.state.frame = Some(frame.clone());
+        for _ in 0..10 {
+            grab.queue.roundtrip(&mut grab.state)?;
+            if grab.state.wanted.is_some() || grab.state.offer.is_some() {
+                break;
+            }
+        }
+        ensure!(grab.state.frame.is_some(), "帧已经被收走");
+        let format = grab
+            .state
+            .offer
+            .map(|(format, _)| format)
+            .unwrap_or(crate::platform::linux::capture::dmabuf::ARGB8888);
+        let buffer = Buffer::allocate_format(size.0, size.1, format)?;
+        let wl = buffer.wrap(&dmabuf, &handle);
+        frame.copy(&wl);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if grab.state.ready || grab.state.failed || grab.state.error.is_some() {
+                break;
+            }
+            grab.wait(std::time::Duration::from_millis(200))?;
+        }
+        ensure!(!grab.state.failed, "合成器拒绝了 dma-buf");
+        ensure!(grab.state.ready, "合成器没有在 5 秒内画进这块 dma-buf");
+        // 画面已经画完，连接可以放掉：内容在缓冲里，fd 的引用我们拿着。
+        Ok(buffer)
+    }
 
     /// 合成器收不收我们自己分配的 dma-buf —— 这是零拷贝的前提。
     /// `OPENUUYC_PROBE_OUTPUT=DP-1 cargo test --release --lib -- --ignored copies_into_a_dmabuf --nocapture`
@@ -721,64 +764,21 @@ mod dmabuf_tests {
             .find(|screen| screen.device_name == wanted)
             .unwrap_or(&screens[0])
             .clone();
-        let mut grab = Grab::open(&screen, false).unwrap();
-        let size = grab.state.outputs[grab.output].size();
-        println!("输出 {size:?}");
-        let Some(dmabuf) = grab.state.dmabuf.clone() else {
-            println!("合成器没有 zwp_linux_dmabuf_v1，零拷贝无从谈起");
-            return;
-        };
-        let handle = grab.queue.handle();
-        let output = grab.state.outputs[grab.output].proxy.clone();
-        let manager = grab.state.manager.clone().unwrap();
-        grab.state.manual = true;
-        // 先把帧要过来，读它给的那几个事件（格式报价 + buffer_done），再决定分配什么。
-        let frame = manager.capture_output(0, &output, &handle, ());
-        grab.state.frame = Some(frame.clone());
-        for _ in 0..10 {
-            grab.queue.roundtrip(&mut grab.state).unwrap();
-            if grab.state.wanted.is_some() || grab.state.offer.is_some() {
-                break;
-            }
-        }
+        let buffer = capture_into_dmabuf(&screen).expect("采集到 dma-buf 失败");
         println!(
-            "共享内存报价={:?} dma-buf 报价={:?}",
-            grab.state.wanted, grab.state.offer
+            "输出 {:?} 缓冲 {}x{} 行距 {} 尺寸 {} 格式 {:#x} modifier {:#x} ready={}",
+            (screen.width, screen.height),
+            buffer.width,
+            buffer.height,
+            buffer.stride,
+            buffer.size,
+            buffer.format,
+            buffer.modifier,
+            0
         );
-        let format = grab
-            .state
-            .offer
-            .map(|(format, _)| format)
-            .unwrap_or(crate::platform::linux::capture::dmabuf::ARGB8888);
-        let buffer = crate::platform::linux::capture::dmabuf::Buffer::allocate_format(
-            size.0,
-            size.1,
-            format,
-        )
-        .expect("分配显存缓冲失败");
-        println!(
-            "缓冲 {}x{} 行距 {} 尺寸 {} 格式 {:#x} modifier {:#x}",
-            buffer.width, buffer.height, buffer.stride, buffer.size, buffer.format, buffer.modifier
-        );
-        let wl = buffer.wrap(&dmabuf, &handle);
-        frame.copy(&wl);
-        // niri 只在真有变化时才画，所以这里要按时间等，而不是 roundtrip 几次。
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            if grab.state.ready || grab.state.failed || grab.state.error.is_some() {
-                break;
-            }
-            grab.wait(std::time::Duration::from_millis(200)).unwrap();
-        }
-        println!(
-            "ready={} failed={} error={:?} 合成器报价={:?}",
-            grab.state.ready, grab.state.failed, grab.state.error, grab.state.offer
-        );
-        if grab.state.ready {
-            let pixels = buffer.read_back().expect("读回显存缓冲失败");
-            std::fs::write("/tmp/openuuyc-dmabuf.bgra", &pixels).unwrap();
-            println!("已写出 /tmp/openuuyc-dmabuf.bgra（{} 字节）", pixels.len());
-        }
+        let pixels = buffer.read_back().expect("读回显存缓冲失败");
+        std::fs::write("/tmp/openuuyc-dmabuf.bgra", &pixels).unwrap();
+        println!("已写出 /tmp/openuuyc-dmabuf.bgra（{} 字节）", pixels.len());
     }
 }
 
