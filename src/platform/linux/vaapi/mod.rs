@@ -19,8 +19,10 @@ use crate::media::encoding::rate::Controller;
 use crate::media::encoding::{Backend, Codec, Color, Encoded, Format, Rate};
 use anyhow::{Context as _, Result, bail, ensure};
 use cros_libva::{
-    Context, Display, Image as VaImage, MappedCodedBuffer, Picture, Surface, UsageHint,
-    VA_RT_FORMAT_YUV420, VAConfigAttrib, VAConfigAttribType, VAEntrypoint,
+    BufferType, Context, Display, EncMiscParameter, EncMiscParameterFrameRate,
+    EncMiscParameterRateControl, Image as VaImage, MappedCodedBuffer, Picture, RcFlags, Surface,
+    UsageHint, VA_RT_FORMAT_YUV420, VA_RC_CBR, VA_RC_VBR, VAConfigAttrib, VAConfigAttribType,
+    VAEntrypoint,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -356,9 +358,42 @@ impl CodecState {
 }
 
 /// The frame QP for a quality setting. Quality rises with the value, so the QP
-/// falls.
+/// falls. It is the starting point and the fallback: with a rate control below
+/// the announced bit rate decides where a frame lands.
 fn qp(quality: i32) -> u8 {
     (51 - 4 * quality.clamp(0, 5)).clamp(1, 51) as u8
+}
+
+/// What the driver is asked to do with the bandwidth the transport has already
+/// reserved for this stream. Without one of these the stream is coded at the
+/// quality preset's QP alone: the announced bit rate never reaches the driver,
+/// so a picture that keeps moving is coded as coarsely as that one QP happens
+/// to be, however much of the reservation is standing idle.
+#[derive(Clone, Copy, PartialEq)]
+enum RateControl {
+    /// An average to keep and a peak to burst to, which is what NVENC is
+    /// configured with.
+    Vbr,
+    /// The one mode a driver that has no VBR offers; the peak becomes the rate.
+    Cbr,
+}
+
+impl RateControl {
+    /// The mode this driver supports, and the attribute's value for it. A
+    /// driver that offers neither keeps the QP-only behaviour rather than being
+    /// asked for a mode it does not have.
+    fn select(attribute: &mut VAConfigAttrib) -> Option<Self> {
+        let supported = attribute.value;
+        let chosen = if supported & VA_RC_VBR != 0 {
+            (Self::Vbr, VA_RC_VBR)
+        } else if supported & VA_RC_CBR != 0 {
+            (Self::Cbr, VA_RC_CBR)
+        } else {
+            return None;
+        };
+        attribute.value = chosen.1;
+        Some(chosen.0)
+    }
 }
 
 pub(crate) struct Encoder {
@@ -377,6 +412,8 @@ pub(crate) struct Encoder {
     format: Format,
     rate: Rate,
     frame_rate: Controller,
+    /// `None` when the driver offers no rate control at all.
+    rate_control: Option<RateControl>,
     /// Reused BGRA to planar conversion output: Y, then U, then V.
     planar: Vec<u8>,
     codec: CodecState,
@@ -394,13 +431,27 @@ impl Encoder {
         let (display, profile, entrypoint) =
             profile_entrypoint(format).context("VA-API 不支持该编码格式")?;
 
-        let mut attrs = vec![VAConfigAttrib {
-            type_: VAConfigAttribType::VAConfigAttribRTFormat,
-            value: 0,
-        }];
+        let mut attrs = vec![
+            VAConfigAttrib {
+                type_: VAConfigAttribType::VAConfigAttribRTFormat,
+                value: 0,
+            },
+            VAConfigAttrib {
+                type_: VAConfigAttribType::VAConfigAttribRateControl,
+                value: 0,
+            },
+        ];
         display
             .get_config_attributes(profile, entrypoint, &mut attrs)
             .context("查询编码配置属性失败")?;
+        // The query leaves the modes the driver supports in the value; the
+        // config wants the one mode that was picked, and an unsupported one is
+        // refused outright, so the attribute goes away when there is no mode.
+        let rate_control = RateControl::select(&mut attrs[1]);
+        if rate_control.is_none() {
+            attrs.pop();
+            tracing::warn!(profile, "VA-API 驱动没有码率控制，画面只由质量档位的 QP 决定");
+        }
         let config = display
             .create_config(attrs, profile, entrypoint)
             .context("创建编码配置失败")?;
@@ -446,6 +497,7 @@ impl Encoder {
             format,
             rate,
             frame_rate: Controller::new(rate),
+            rate_control,
             planar: vec![0; size.0 as usize * size.1 as usize * 3 / 2],
             codec,
             force_keyframe: true,
@@ -463,7 +515,9 @@ impl Encoder {
             return Ok(false);
         };
         let key = self.rate.quality != rate.quality;
-        self.rate = rate;
+        // The settled rate, not the request: the controller answers with the
+        // frame rate the input actually keeps, and the driver is told that one.
+        self.rate = update.rate;
         self.frame_rate.commit(update);
         Ok(key)
     }
@@ -531,7 +585,58 @@ impl Encoder {
         Ok(())
     }
 
+    /// The rate this picture is coded under. Both are per picture: the frame
+    /// rate is the one the input actually keeps, and the bit rate is what the
+    /// transport can carry right now, which congestion moves from frame to
+    /// frame. The sequence header carries neither — it is written once, from
+    /// the codec's own parameters, and a rate control that read it would fight
+    /// the transport instead of following it.
+    fn rate_control_buffers(&self) -> Result<Vec<cros_libva::Buffer>> {
+        let Some(mode) = self.rate_control else {
+            return Ok(Vec::new());
+        };
+        let target = self.rate.target.max(1);
+        let peak = self.rate.peak.max(target);
+        // VBR keeps the average and bursts to the peak; the mode without it can
+        // only spend the peak throughout.
+        let (bit_rate, percentage) = match mode {
+            RateControl::Vbr => (peak, (target * 100 / peak).clamp(1, 100)),
+            RateControl::Cbr => (peak, 100),
+        };
+        let framerate = EncMiscParameter::FrameRate(EncMiscParameterFrameRate::new(
+            self.rate.fps.max(1),
+            0,
+        ));
+        let control = EncMiscParameter::RateControl(EncMiscParameterRateControl::new(
+            bit_rate,
+            percentage,
+            // Zero asks the driver for its own sliding window.
+            0,
+            // Zero on the QP bounds leaves the choice to the driver: it starts
+            // where every other VA-API encoder starts one, instead of at this
+            // preset's QP, which the rate control is about to move anyway.
+            0,
+            0,
+            0,
+            RcFlags::new(0, 0, 0, 0, 0, 0, 0, 0, 0),
+            0,
+            0,
+            0,
+            0,
+        ));
+        Ok(vec![
+            self.context
+                .create_buffer(BufferType::EncMiscParameter(framerate))?,
+            self.context
+                .create_buffer(BufferType::EncMiscParameter(control))?,
+        ])
+    }
+
     fn encode_frame(&mut self, timestamp_100ns: i64, keyframe: bool) -> Result<Vec<Encoded>> {
+        // The controller sizes the frame rate it announces from the pictures
+        // that actually arrive, so it has to see them; every other backend
+        // feeds it here too.
+        self.frame_rate.input(timestamp_100ns);
         self.codec.reset(keyframe);
         let (width, height) = self.size;
         let size = (width, height);
@@ -555,6 +660,9 @@ impl Encoder {
             quality_qp,
             keyframe,
         )? {
+            picture.add_buffer(buffer);
+        }
+        for buffer in self.rate_control_buffers()? {
             picture.add_buffer(buffer);
         }
 
@@ -708,4 +816,145 @@ mod tests {
     fn encodes_h265_with_parseable_parameter_sets() {
         check(Codec::H265, crate::media::VideoCodec::H265, "h265");
     }
+
+    /// 用共享的软件解码器量一遍实际花掉的码率与还原质量：被控端的质量旋钮最终
+    /// 只体现为司机拿到的码率与 QP，所以要能看到「协商出来的带宽到底花没花出去」。
+    /// 画面是仿桌面的一块移动窗口——纯噪声或大面积细纹会把量出来的误差放大成
+    /// 假象（见 AGENTS_QA.md）。
+    /// `cargo test --release --lib -- --ignored reports_the_rate_it_spends --nocapture`
+    #[test]
+    #[ignore]
+    fn reports_the_rate_it_spends() {
+        let size = (1920u32, 1080u32);
+        let format = Format {
+            codec: Codec::H264,
+            chroma: 1,
+            depth: 8,
+        };
+        let mut rate = rate();
+        rate.target = 14_000_000;
+        rate.peak = 14_000_000;
+        rate.quality = 4;
+        rate.quality_target = QualityTarget {
+            bitrate: 14_000_000,
+            fps: 30,
+        };
+        for fps in [30u32, 60] {
+            rate.fps = fps;
+            let mut encoder = Encoder::new(size, format, rate).unwrap();
+            let mut decoder =
+                openuuyc_codec::decoder::Decoder::new(crate::media::VideoCodec::H264, &[]).unwrap();
+            let frames = 30;
+            let mut pending = std::collections::HashMap::new();
+            let mut stream = Vec::new();
+            let (mut bytes, mut squared, mut compared) = (0usize, 0f64, 0usize);
+            for index in 0..frames {
+                let timestamp = i64::from(index) * 10_000_000 / i64::from(fps);
+                let source = moving(size, index);
+                encoder.convert(&source).unwrap();
+                let luma = (size.0 * size.1) as usize;
+                pending.insert(timestamp, encoder.planar[..luma].to_vec());
+                let encoded = encoder.encode_frame(timestamp, index == 0).unwrap();
+                bytes += encoded[0].data.len();
+                stream.extend_from_slice(&encoded[0].data);
+                for frame in &decoder.push(&encoded[0].data, timestamp).unwrap() {
+                    let Some(reference) = pending.remove(&frame.pts) else {
+                        continue;
+                    };
+                    let width = frame.coded_width as usize;
+                    for row in 0..size.1 as usize {
+                        for column in 0..size.0 as usize {
+                            let difference = f64::from(
+                                frame.data[row * width + column]
+                                    .abs_diff(reference[row * width as usize + column]),
+                            );
+                            squared += difference * difference;
+                            compared += 1;
+                        }
+                    }
+                }
+            }
+            let seconds = f64::from(frames) / f64::from(fps);
+            println!(
+                "{fps} fps: {frames} frames, {bytes} bytes, {:.2} Mbps, luma RMSE {:.2} \
+                 over {compared} samples",
+                bytes as f64 * 8.0 / seconds / 1_000_000.0,
+                (squared / compared.max(1) as f64).sqrt()
+            );
+            std::fs::write(format!("/tmp/openuuyc-vaapi-rate-{fps}.h264"), &stream).unwrap();
+        }
+    }
+
+    /// 把编码路径拆开量一遍：CPU 色彩转换、上传+驱动编码各占多少。
+    /// `cargo test --release --lib -- --ignored profiles_the_encode_path --nocapture`
+    #[test]
+    #[ignore]
+    fn profiles_the_encode_path() {
+        for size in [(1920u32, 1080u32), (3840, 1620), (5120, 2160)] {
+            let format = Format {
+                codec: Codec::H264,
+                chroma: 1,
+                depth: 8,
+            };
+            let mut rate = rate();
+            rate.fps = 30;
+            rate.target = 20_000_000;
+            rate.peak = 20_000_000;
+            let mut encoder = Encoder::new(size, format, rate).unwrap();
+            let source = moving((size.0, size.1), 0);
+            let (mut convert, mut frame) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+            let rounds = 10;
+            for index in 0..rounds {
+                let at = std::time::Instant::now();
+                encoder.convert(&source).unwrap();
+                convert += at.elapsed();
+                let at = std::time::Instant::now();
+                let encoded = encoder
+                    .encode_frame(i64::from(index) * 333_333, index == 0)
+                    .unwrap();
+                frame += at.elapsed();
+                std::hint::black_box(encoded);
+            }
+            println!(
+                "{size:?}: convert {:?}, upload+encode {:?}",
+                convert / rounds,
+                frame / rounds
+            );
+        }
+    }
+
+    /// 仿桌面的一块移动窗口：大片平坦底子 + 若干硬边。窗口每帧平移一段距离，
+    /// 编码器不能靠帧间预测把它整块省掉，但也不需要去追像素级的噪声。
+    fn moving(size: (u32, u32), index: u32) -> Vec<u8> {
+        let (width, height) = size;
+        let mut bgra = vec![0u8; (width * height * 4) as usize];
+        let window_left = 120 + index * 11;
+        let window_top = 90 + index * 3;
+        for (position, pixel) in bgra.chunks_exact_mut(4).enumerate() {
+            let (x, y) = (position as u32 % width, position as u32 / width);
+            let inside_window = x >= window_left
+                && x < window_left + 480
+                && y >= window_top
+                && y < window_top + 320;
+            let value: u8 = if inside_window {
+                let border = x < window_left + 6 || y < window_top + 6;
+                // 窗口里是几行「文字」：平坦底子上的横向细线。
+                let text = (y - window_top) % 40 < 3 && x > window_left + 20;
+                if border {
+                    40
+                } else if text {
+                    90
+                } else {
+                    230
+                }
+            } else {
+                200
+            };
+            // 平坦区域带一点缓慢的横向渐变，和真实桌面的底色一样。
+            let value = value.saturating_sub((x / 64 % 4) as u8);
+            pixel.copy_from_slice(&[value, value, value, 0xff]);
+        }
+        bgra
+    }
+
 }
