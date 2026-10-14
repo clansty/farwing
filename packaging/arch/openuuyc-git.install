@@ -13,10 +13,20 @@ OpenUUYC 被远程控制时，键鼠经 /dev/uinput 注入，需要该设备的�
 NOTE
 }
 
+# 用户级单元不能由包替用户 enable（要在那个用户的会话里做），所以只提示。
+_openuuyc_service_note() {
+  cat <<'NOTE'
+登录后自动被控的服务已安装，用它开启：
+    systemctl --user enable openuuyc.service
+NOTE
+}
+
 post_install() {
   _openuuyc_uinput_note
+  _openuuyc_service_note
 }
 
 post_upgrade() {
   _openuuyc_uinput_note
+  _openuuyc_service_note
 }
