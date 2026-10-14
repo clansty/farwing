@@ -963,6 +963,9 @@ fn accept_files(state: &mut State, session: &Arc<Inner>, epoch: u64) -> Result<(
         files = descriptors.len(),
         first = %descriptors[0].file_name,
         size = descriptors[0].file_size,
+        // 改过的文件往往名字和大小都不变（改两个字长度一样），上面两项就分不出
+        // 「远端给的是新那一份」还是「还是旧的那份」。改动时间能分出来。
+        modified = descriptors[0].last_write_time,
         published = %paths.first().map(|path| path.display().to_string()).unwrap_or_default(),
         "已挂载远端剪贴板文件"
     );
