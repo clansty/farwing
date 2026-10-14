@@ -677,3 +677,85 @@ mod tests {
         assert_eq!(values(&pixels), vec![4, 5, 6, 1, 2, 3]);
     }
 }
+
+#[cfg(test)]
+mod session_tests {
+    use super::super::{output, scale, screens};
+    use super::{Grab, orient};
+    use std::time::{Duration, Instant};
+
+    /// 需要在图形会话里跑：
+    /// `cargo test --release --lib -- --ignored profiles_the_wlr_path --nocapture`
+    #[test]
+    #[ignore]
+    fn profiles_the_wlr_path() {
+        for screen in screens().unwrap() {
+            let mut grab = Grab::open(&screen, false).unwrap();
+            let transform = grab.state.outputs[grab.output].transform;
+            let mode = grab.state.outputs[grab.output].mode;
+            let synthetic = vec![7u8; mode.0 as usize * mode.1 as usize * 4];
+            let at = Instant::now();
+            let turned = orient(synthetic, mode.0, mode.1, transform);
+            let orient_ms = at.elapsed();
+            std::hint::black_box(turned);
+
+            let at = Instant::now();
+            let mut sampler = super::super::super::cursor_shape::Sampler::default();
+            let mut sampling = Duration::ZERO;
+            let mut rounds = 0;
+            while at.elapsed() < Duration::from_secs(1) {
+                let call = Instant::now();
+                let sampled = sampler.sample();
+                sampling += call.elapsed();
+                rounds += 1;
+                let _ = std::hint::black_box(sampled);
+            }
+            let refresh_at = Instant::now();
+            let refreshed = super::super::refresh(&screen);
+            println!(
+                "{} mode={mode:?} transform={transform:?} orient={orient_ms:?} \
+                 sample_avg={:?} ({rounds}) refresh={:?} ok={}",
+                screen.device_name,
+                sampling / rounds.max(1),
+                refresh_at.elapsed(),
+                refreshed.is_ok()
+            );
+
+            for quality in [1, 2, 4, 6] {
+                let started = Instant::now();
+                let (mut frames, mut empty) = (0u64, 0u64);
+                let (mut waited, mut scaling) = (Duration::ZERO, Duration::ZERO);
+                let mut size = (0, 0);
+                while started.elapsed() < Duration::from_secs(4) {
+                    let at = Instant::now();
+                    match grab.next(Duration::from_millis(33)) {
+                        Ok(Some(picture)) => {
+                            waited += at.elapsed();
+                            frames += 1;
+                            size = (picture.width, picture.height);
+                            let to = output(picture.width, picture.height, quality, (3840, 2160));
+                            let at = Instant::now();
+                            let scaled = scale(&picture.pixels, (picture.width, picture.height), to);
+                            scaling += at.elapsed();
+                            std::hint::black_box(scaled);
+                        }
+                        Ok(None) => empty += 1,
+                        Err(error) => {
+                            println!("{} error: {error}", screen.device_name);
+                            break;
+                        }
+                    }
+                }
+                let divisor = frames.max(1) as u32;
+                println!(
+                    "{} quality={quality} source={size:?} delivered={frames} empty={empty} \
+                     next_avg={:?} scale_avg={:?} target={:?}",
+                    screen.device_name,
+                    waited / divisor,
+                    scaling / divisor,
+                    output(size.0, size.1, quality, (3840, 2160))
+                );
+            }
+        }
+    }
+}

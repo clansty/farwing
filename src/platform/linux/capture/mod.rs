@@ -463,8 +463,29 @@ fn output(width: u32, height: u32, quality: i32, maximum: (u32, u32)) -> (u32, u
     crate::media::geometry::fit_size(size.0, size.1, maximum)
 }
 
+/// One output column: the two source pixels it reads and how much of the right
+/// one it takes. The mapping is the same for every row, so it is worked out
+/// once per frame rather than once per pixel.
+#[derive(Clone, Copy)]
+struct Column {
+    /// First source pixel, as an index into the row's channels.
+    left: usize,
+    right: usize,
+    /// 14-bit weight of the right pixel; the left one takes the rest.
+    weight: u32,
+}
+
 /// Bilinear BGRA scaling, or a crop to even dimensions when the size already
 /// fits. The encoder takes exactly the size it was opened with.
+///
+/// Each output row is built in two passes instead of one per pixel: the source
+/// rows are blended vertically into a 16-bit row (one weight for the whole row,
+/// read and written in order, so it stays in the cache), and that row is then
+/// blended horizontally. A single pass over the source would read four pixels
+/// per output pixel, each from a different place — on a 5K screen that is 44 MB
+/// read at random while the encoder waits, and it was the longest stage of the
+/// capture. Weights are fourteen-bit fixed point in both passes, which is
+/// finer than the eight-bit result can show.
 fn scale(source: &[u8], from: (u32, u32), to: (u32, u32)) -> Vec<u8> {
     let (source_width, source_height) = (from.0 as usize, from.1 as usize);
     let (width, height) = (to.0 as usize, to.1 as usize);
@@ -481,37 +502,164 @@ fn scale(source: &[u8], from: (u32, u32), to: (u32, u32)) -> Vec<u8> {
         }
         return out;
     }
-    // 16.16 fixed point, sampling pixel centres.
     let step_x = ((source_width as u64) << 16) / width as u64;
     let step_y = ((source_height as u64) << 16) / height as u64;
-    let max_x = source_width - 1;
-    let max_y = source_height - 1;
+    let mut columns = Vec::with_capacity(width);
+    for x in 0..width {
+        // 16.16 fixed point, sampling pixel centres.
+        let sx = ((x as u64 * step_x) + (step_x >> 1)).saturating_sub(1 << 15);
+        let left = ((sx >> 16) as usize).min(source_width - 1);
+        columns.push(Column {
+            left: left * 4,
+            right: (left + 1).min(source_width - 1) * 4,
+            weight: ((sx & 0xffff) as u32) >> 2,
+        });
+    }
+    let mut row = vec![0u16; source_width * 4];
     for y in 0..height {
         let sy = ((y as u64 * step_y) + (step_y >> 1)).saturating_sub(1 << 15);
-        let y0 = ((sy >> 16) as usize).min(max_y);
-        let y1 = (y0 + 1).min(max_y);
-        let fy = (sy & 0xffff) as u32;
-        for x in 0..width {
-            let sx = ((x as u64 * step_x) + (step_x >> 1)).saturating_sub(1 << 15);
-            let x0 = ((sx >> 16) as usize).min(max_x);
-            let x1 = (x0 + 1).min(max_x);
-            let fx = (sx & 0xffff) as u32;
-            let at = |px: usize, py: usize| (py * source_width + px) * 4;
-            let (a, b, c, d) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
-            let o = (y * width + x) * 4;
-            for channel in 0..4 {
-                let top = u32::from(source[a + channel]) * (0x10000 - fx)
-                    + u32::from(source[b + channel]) * fx;
-                let bottom = u32::from(source[c + channel]) * (0x10000 - fx)
-                    + u32::from(source[d + channel]) * fx;
-                let value = ((u64::from(top >> 8) * u64::from(0x10000 - fy)
-                    + u64::from(bottom >> 8) * u64::from(fy))
-                    >> 24) as u32;
-                out[o + channel] = value.min(255) as u8;
-            }
-        }
+        let top = ((sy >> 16) as usize).min(source_height - 1);
+        let bottom = (top + 1).min(source_height - 1);
+        blend_rows(
+            &source[top * source_width * 4..(top + 1) * source_width * 4],
+            &source[bottom * source_width * 4..(bottom + 1) * source_width * 4],
+            ((sy & 0xffff) as u32) >> 2,
+            &mut row,
+        );
+        blend_columns(&row, &columns, &mut out[y * width * 4..(y + 1) * width * 4]);
     }
     out
+}
+
+/// One channel of the vertical blend, seven fractional bits in the result: the
+/// horizontal pass expects the fraction to still be there.
+fn blend_pair(top: u8, bottom: u8, weight: u32) -> u16 {
+    (u32::from(top) * (16384 - weight) + u32::from(bottom) * weight + 64).wrapping_shr(7) as u16
+}
+
+/// Two source rows into one, four channels each. The weight of the bottom row
+/// is 0..=16384, and `blend_pair` keeps the fraction of what it does not move.
+fn blend_rows(top: &[u8], bottom: &[u8], weight: u32, row: &mut [u16]) {
+    let weight = weight.min(16384);
+    #[cfg(target_arch = "x86_64")]
+    {
+        blend_rows_simd(top, bottom, weight, row);
+        return;
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    for (index, slot) in row.iter_mut().enumerate() {
+        *slot = blend_pair(top[index], bottom[index], weight);
+    }
+}
+
+/// The same eight lanes at a time: two pixels of the row per iteration.
+///
+/// The blend is written as the top row plus the weighted difference to the
+/// bottom one, because every weight can then be seven bits wide: the driver
+/// multiplies pairs of sixteen-bit lanes, whose high half is the product of the
+/// two seven-bit halves. A weight kept as one sixteen-bit number would need its
+/// own multiplication and a wider lane.
+#[cfg(target_arch = "x86_64")]
+fn blend_rows_simd(top: &[u8], bottom: &[u8], weight: u32, row: &mut [u16]) {
+    use std::arch::x86_64::*;
+    let high = (weight >> 7) as i16;
+    let low = (weight & 0x7f) as i16;
+    // Safe because the three slices are the same length, which the loops keep
+    // within, and both sources are four-channel rows.
+    unsafe {
+        let zero = _mm_setzero_si128();
+        let high = _mm_set1_epi16(high);
+        let low = _mm_set1_epi16(low);
+        let rounding = _mm_set1_epi16(64);
+        let mut index = 0;
+        while index + 8 <= row.len() {
+            let top_bytes = _mm_unpacklo_epi8(_mm_loadl_epi64(top.as_ptr().add(index).cast()), zero);
+            let bottom_bytes =
+                _mm_unpacklo_epi8(_mm_loadl_epi64(bottom.as_ptr().add(index).cast()), zero);
+            // The difference of two eight-bit samples is at most a signed
+            // sixteen-bit number, and each half of the weight keeps the product
+            // inside one, so nothing here wraps.
+            let difference = _mm_sub_epi16(bottom_bytes, top_bytes);
+            let value = _mm_add_epi16(
+                _mm_slli_epi16(top_bytes, 7),
+                _mm_mullo_epi16(difference, high),
+            );
+            let correction = _mm_srai_epi16(
+                _mm_add_epi16(_mm_mullo_epi16(difference, low), rounding),
+                7,
+            );
+            _mm_storeu_si128(
+                row.as_mut_ptr().add(index).cast(),
+                _mm_add_epi16(value, correction),
+            );
+            index += 8;
+        }
+        for index in index..row.len() {
+            row[index] = blend_pair(top[index], bottom[index], weight);
+        }
+    }
+}
+
+/// One row of the sixteen-bit intermediate into one output row.
+fn blend_columns(row: &[u16], columns: &[Column], out: &mut [u8]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Safe because every column names two pixels of a row of this length,
+        // which is where the table came from.
+        unsafe { blend_columns_simd(row, columns, out) };
+        return;
+    }
+    blend_columns_one_by_one(row, columns, out);
+}
+
+fn blend_columns_one_by_one(row: &[u16], columns: &[Column], out: &mut [u8]) {
+    for (x, column) in columns.iter().enumerate() {
+        let inverse = 16384 - column.weight;
+        for channel in 0..4 {
+            let a = u32::from(row[column.left + channel]) * inverse;
+            let b = u32::from(row[column.right + channel]) * column.weight;
+            out[x * 4 + channel] = ((a + b + (1 << 20)) >> 21) as u8;
+        }
+    }
+}
+
+/// The same, two columns at a time. The intermediate carries seven fractional
+/// bits, so fourteen bits of weight and a shift of twenty-one give the eight
+/// bits that are stored.
+#[cfg(target_arch = "x86_64")]
+unsafe fn blend_columns_simd(row: &[u16], columns: &[Column], out: &mut [u8]) {
+    use std::arch::x86_64::*;
+    // Safe because every column names two pixels of a row of this length, which
+    // is where the table came from.
+    unsafe {
+        // `madd` adds neighbouring pairs of sixteen-bit lanes, so a column is
+        // unpacked into (left channel, right channel) pairs and takes the
+        // weights in that order.
+        let weights = |weight: u32| {
+            _mm_set1_epi32((((weight as i32) << 16) | (16384 - weight) as i32) as i32)
+        };
+        let mut x = 0;
+        while x + 2 <= columns.len() {
+            let (first, second) = (columns[x], columns[x + 1]);
+            let a = _mm_loadl_epi64(row.as_ptr().add(first.left).cast());
+            let b = _mm_loadl_epi64(row.as_ptr().add(first.right).cast());
+            let c = _mm_loadl_epi64(row.as_ptr().add(second.left).cast());
+            let d = _mm_loadl_epi64(row.as_ptr().add(second.right).cast());
+            let first = _mm_madd_epi16(_mm_unpacklo_epi16(a, b), weights(first.weight));
+            let second = _mm_madd_epi16(_mm_unpacklo_epi16(c, d), weights(second.weight));
+            let rounding = _mm_set1_epi32(1 << 20);
+            let both = _mm_packs_epi32(
+                _mm_srai_epi32(_mm_add_epi32(first, rounding), 21),
+                _mm_srai_epi32(_mm_add_epi32(second, rounding), 21),
+            );
+            _mm_storel_epi64(
+                out.as_mut_ptr().add(x * 4).cast(),
+                _mm_packus_epi16(both, both),
+            );
+            x += 2;
+        }
+        blend_columns_one_by_one(row, &columns[x..], &mut out[x * 4..]);
+    }
 }
 
 #[cfg(test)]
@@ -524,6 +672,90 @@ mod tests {
         let out = scale(&source, (3, 3), (2, 2));
         assert_eq!(&out[..8], &source[..8]);
         assert_eq!(&out[8..16], &source[12..20]);
+    }
+
+    /// 与一个独立的 f64 双线性实现对照：采样位置、朝向、通道都必须一致，
+    /// 定点权重的误差也不能超过一个色阶。
+    #[test]
+    fn matches_an_independent_bilinear() {
+        for (from, to) in [
+            ((64u32, 48u32), (32u32, 24u32)),
+            ((37, 23), (16, 9)),
+            ((33, 17), (12, 8)),
+            ((16, 16), (24, 24)),
+            ((5, 3), (10, 7)),
+        ] {
+            let source: Vec<u8> = (0..(from.0 as usize * from.1 as usize * 4))
+                .map(|v| (v % 251) as u8)
+                .collect();
+            let ours = scale(&source, from, to);
+            let reference = bilinear_reference(&source, from, to);
+            let worst = ours
+                .iter()
+                .zip(&reference)
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap();
+            assert!(
+                worst <= 1,
+                "{from:?} -> {to:?} 与参考实现相差 {worst} 个色阶"
+            );
+        }
+    }
+
+    /// 逐像素的 f64 双线性，采样点与 `scale` 相同。
+    fn bilinear_reference(source: &[u8], from: (u32, u32), to: (u32, u32)) -> Vec<u8> {
+        let (sw, sh) = (from.0 as usize, from.1 as usize);
+        let (w, h) = (to.0 as usize, to.1 as usize);
+        let step_x = ((sw as u64) << 16) / w as u64;
+        let step_y = ((sh as u64) << 16) / h as u64;
+        let mut out = vec![0u8; w * h * 4];
+        for y in 0..h {
+            let sy = ((y as u64 * step_y) + (step_y >> 1)).saturating_sub(1 << 15);
+            let y0 = ((sy >> 16) as usize).min(sh - 1);
+            let y1 = (y0 + 1).min(sh - 1);
+            let fy = (sy & 0xffff) as f64 / 65536.0;
+            for x in 0..w {
+                let sx = ((x as u64 * step_x) + (step_x >> 1)).saturating_sub(1 << 15);
+                let x0 = ((sx >> 16) as usize).min(sw - 1);
+                let x1 = (x0 + 1).min(sw - 1);
+                let fx = (sx & 0xffff) as f64 / 65536.0;
+                for channel in 0..4 {
+                    let at = |px: usize, py: usize| {
+                        f64::from(source[(py * sw + px) * 4 + channel])
+                    };
+                    let top = at(x0, y0) * (1.0 - fx) + at(x1, y0) * fx;
+                    let bottom = at(x0, y1) * (1.0 - fx) + at(x1, y1) * fx;
+                    out[(y * w + x) * 4 + channel] =
+                        (top * (1.0 - fy) + bottom * fy).round() as u8;
+                }
+            }
+        }
+        out
+    }
+
+    /// `cargo test --release --lib -- --ignored profiles_the_scalers --nocapture`
+    #[test]
+    #[ignore]
+    fn profiles_the_scalers() {
+        for (from, to) in [
+            ((5120u32, 2160u32), (3840u32, 1620u32)),
+            ((1600, 2560), (1350, 2160)),
+            ((2560, 1600), (1350, 2160)),
+        ] {
+            let source: Vec<u8> = (0..(from.0 as usize * from.1 as usize * 4))
+                .map(|v| v as u8)
+                .collect();
+            let rounds = 10;
+            let at = std::time::Instant::now();
+            let mut out = Vec::new();
+            for _ in 0..rounds {
+                out = scale(&source, from, to);
+            }
+            let elapsed = at.elapsed() / rounds;
+            std::hint::black_box(&out);
+            println!("{from:?} -> {to:?}: {elapsed:?}");
+        }
     }
 
     #[test]
