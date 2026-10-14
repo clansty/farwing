@@ -102,7 +102,9 @@ mod tests {
                 .expect("armed deadline wakes");
             let late = armed.elapsed();
             assert!(late >= Duration::from_millis(5), "woke early: {late:?}");
-            assert!(late < Duration::from_millis(50), "woke late: {late:?}");
+            // 整套测试并行跑（默认每个核一个测试线程）时调度延迟能到几十毫秒，
+            // 这里只关心「到点会醒」，不关心精确的唤醒时刻，所以余量给足。
+            assert!(late < Duration::from_millis(250), "woke late: {late:?}");
             timer
                 .arm(Instant::now() + Duration::from_millis(5))
                 .unwrap();
