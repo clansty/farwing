@@ -1,0 +1,140 @@
+# Maintainer: Clansty <i@clansty.com>
+#
+# OpenUUYC 的 -git 包，默认跟随 GitHub 上 clansty 开发分支。
+#
+# 从远程分支构建：
+#   cd packaging/arch && makepkg -f
+#
+# 从本地工作树构建（开发时推荐：直接在工作树上 cargo build，不拷贝源码、不重新拉依赖）：
+#   mkdir -p /tmp/openuuyc-arch /tmp/openuuyc-target
+#   BUILDDIR=/tmp/openuuyc-arch \
+#   CARGO_TARGET_DIR=/tmp/openuuyc-target \
+#   OPENUUYC_LOCAL_SRC=/home/clansty/Projects/thirdparty/farwing \
+#   makepkg -f
+#
+# 本地构建时 BUILDDIR 必须指向仓库之外：makepkg 会在其中建 src/ 与 pkg/，
+# 而 pkg/ 被 makepkg 设成 0111，摆在仓库里会让 cargo 扫描包目录时报
+# "Permission denied (os error 13)"，把整个构建打断。
+# CARGO_TARGET_DIR 另指一处，是为了不和主仓库里正在跑的 cargo 抢 target/ 的锁；
+# 不设就复用工作树自己的 target/，那样更快，但会和别的 cargo 构建互相阻塞。
+
+_pkgname=openuuyc
+pkgname=$_pkgname-git
+# 基准版本必须与 Cargo.toml 的 [package].version 一致，pkgver() 会再读一次并追加 .r<rev>.g<hash>
+pkgver=1.0.0
+pkgrel=1
+pkgdesc='UU 远程（UU Remote）协议的第三方 Rust 客户端：远控别人，或被本机远控'
+arch=('x86_64')
+url='https://github.com/clansty/farwing'
+# 仓库整体不是 SPDX 标准许可，而是自定义的「版权与许可声明」（见 LICENSE）。
+# 按 SPDX 的说法用 LicenseRef- 前缀；既然不是常见许可，原文必须装到
+# /usr/share/licenses/$pkgname/ 下（namcap 会检查，装 custom 它会报 E）。
+license=('LicenseRef-OpenUUYC')
+
+# 直接链接（readelf -d 的 NEEDED）或运行时 dlopen 的库，逐条注明来源。
+depends=(
+  # readelf -d 的直接 NEEDED
+  'alsa-lib'          # libasound.so.2，cpal 走 ALSA
+  'ffmpeg'            # libavcodec.so.63 / libavutil.so.61 / libavfilter.so.12（系统 FFmpeg，不是内建）
+  'gcc-libs'          # libstdc++.so.6（NetEq 的 C++ 部分）、libgcc_s.so.1
+  'glibc'             # libc.so.6 / libm.so.6
+  'libva'             # libva.so.2 / libva-drm.so.2，VA-API 硬件解码
+  'libxcb'            # libxcb.so.1
+  # 运行时 dlopen
+  'fuse3'             # fusermount3，剪贴板/拖放粘贴远端文件时的只读 FUSE 挂载
+  'libglvnd'          # libEGL.so.1（及 libGLESv2），Vulkan 不可用时的 OpenGL 渲染回退
+  'libx11'            # libX11.so.6 / libX11-xcb.so.1，winit 的 X11 后端
+  'libxcursor'        # libXcursor.so.1，X11 下加载鼠标指针主题
+  'libxi'             # libXi.so.6，winit 的 XInput2（绝对坐标/多屏）
+  'libxkbcommon'      # libxkbcommon.so.0，键盘布局与按键映射
+  'libxkbcommon-x11'  # libxkbcommon-x11.so.0，X11 下的 xkbcommon
+  'noto-fonts-cjk'    # /usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc，界面中文靠它（内置字体无 CJK 字形）
+  'wayland'           # libwayland-client.so.0 / libwayland-egl.so.1，Wayland 会话
+)
+
+makedepends=(
+  'clang'    # libclang：ffmpeg-sys-next 与 vendored cros-libva 用 bindgen 生成绑定
+  'cmake'    # opusic-sys 用 cmake 从源码构建 libopus
+  'git'      # VCS 源（openuuyc-git 的 source 是 git+https）
+  'nasm'     # AV1 软解与 H.264 的 x86 SIMD 汇编（nasm-rs）
+  'pkgconf'  # alsa-sys / cros-libva / ffmpeg-sys-next / khronos-egl / wayland-sys / x11-dl 都靠它找库
+  'rust'     # 同时提供 cargo（repo 里没有单独的 cargo 包）
+)
+
+# 只影响部分功能，缺了也能跑，但缺哪一项就少哪一块，因此都写清楚用途。
+optdepends=(
+  'vulkan-icd-loader: 首选渲染后端（Vulkan）；缺失时回退 libglvnd 的 OpenGL'
+  'mesa: Intel/AMD/软件 Vulkan 驱动（VA-API 硬解与渲染都需要厂商驱动）'
+  'nvidia-utils: NVIDIA 驱动；NVENC 硬编、NvFBC 采集与 Vulkan 都靠它'
+  'libpulse: 被控端用 PulseAudio 客户端接口采集桌面声音（PipeWire 的音源也可）'
+  'libpipewire: Wayland/XDG 门户画面采集（wlroots screencopy 与 X11 采集不需要）'
+  'gnome-keyring: 用 Secret Service 保存登录态（与 kwallet 二选一，缺了两者无法保存登录）'
+  'kwallet: 用 Secret Service 保存登录态（与 gnome-keyring 二选一）'
+  'ethtool: 远程开机时检查网卡的魔术包唤醒状态'
+  'hwdata: 用 pci.ids 给上报的显卡取名（/usr/share/hwdata/pci.ids）'
+  'gnome-shell-extension-appindicator: GNOME 下显示托盘图标（KDE/Xfce 等自带托盘）'
+)
+
+provides=("$_pkgname=$pkgver")
+conflicts=("$_pkgname")
+install="$pkgname.install"
+# 关闭 makepkg 的 LTO：Cargo.toml 的 release profile 已经调好 lto/codegen-units，
+# 混入 makepkg 的 -flto 只会让 NetEq 的 C++ 对象与 rustc 链接参数打起来。
+options=('!lto')
+
+if [[ -n ${OPENUUYC_LOCAL_SRC:-} ]]; then
+  source=()
+  sha256sums=()
+else
+  source=("$pkgname::git+https://github.com/clansty/farwing.git#branch=clansty")
+  sha256sums=('SKIP')
+fi
+
+# 远程构建时源码在 $srcdir/$pkgname；本地构建时直接用工作树本身。
+_src_dir() {
+  if [[ -n ${OPENUUYC_LOCAL_SRC:-} ]]; then
+    printf '%s' "${OPENUUYC_LOCAL_SRC%/}"
+  else
+    printf '%s' "$srcdir/$pkgname"
+  fi
+}
+
+pkgver() {
+  cd "$(_src_dir)"
+  local base rev hash
+  base=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+  rev=$(git rev-list --count HEAD 2>/dev/null || echo 0)
+  hash=$(git rev-parse --short=7 HEAD 2>/dev/null || echo nogit)
+  printf '%s.r%s.g%s' "$base" "$rev" "$hash"
+}
+
+build() {
+  cd "$(_src_dir)"
+  # 与 .github/workflows/linux-deb.yml 一致；CARGO_TARGET_DIR 由调用方决定，
+  # 不在这里写死，本地构建才能复用工作树自己的 target/。
+  cargo build --release --locked --bin OpenUUYC
+}
+
+package() {
+  cd "$(_src_dir)"
+  local target_dir=${CARGO_TARGET_DIR:-target}
+
+  install -Dm755 "$target_dir/release/OpenUUYC" "$pkgdir/usr/bin/OpenUUYC"
+
+  # 桌面入口：Exec=OpenUUYC 与上面的 /usr/bin/OpenUUYC 大小写一致，
+  # Icon=openuuyc 与下面的 hicolor 文件名一致，因此原文件不用改。
+  install -Dm644 packaging/linux/openuuyc.desktop \
+    "$pkgdir/usr/share/applications/openuuyc.desktop"
+  install -Dm644 assets/icon-256.png \
+    "$pkgdir/usr/share/icons/hicolor/256x256/apps/openuuyc.png"
+
+  # 被控端键鼠经 /dev/uinput 注入，规则本身只做 uaccess 授权（见 openuuyc-git.install）。
+  install -Dm644 packaging/linux/70-openuuyc-uinput.rules \
+    "$pkgdir/usr/lib/udev/rules.d/70-openuuyc-uinput.rules"
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 THIRD_PARTY_NOTICES "$pkgdir/usr/share/licenses/$pkgname/THIRD_PARTY_NOTICES"
+  install -d "$pkgdir/usr/share/licenses/$pkgname/third-party"
+  install -m644 assets/licenses/*.txt licenses/openh264-algorithms.txt \
+    "$pkgdir/usr/share/licenses/$pkgname/third-party/"
+}

@@ -1,0 +1,22 @@
+# uinput 的权限靠 udev 规则授予，规则本身不会自动作用到已经存在的 /dev/uinput，
+# 而且 uaccess ACL 是 systemd-logind 在会话激活时下发的，所以光重载规则还不够。
+_openuuyc_uinput_note() {
+  cat <<'NOTE'
+OpenUUYC 被远程控制时，键鼠经 /dev/uinput 注入，需要该设备的写权限。
+已安装的 udev 规则：/usr/lib/udev/rules.d/70-openuuyc-uinput.rules（uaccess + input 组）
+
+让它对当前系统生效：
+    sudo udevadm control --reload-rules && sudo udevadm trigger
+
+当前桌面会话的权限（uaccess ACL）由此后重新登录（或重启）才会下发；
+不重新登录时，OpenUUYC 会自动回退到 X11 XTest（仅 Xorg 会话有效，Wayland 下需重新登录）。
+NOTE
+}
+
+post_install() {
+  _openuuyc_uinput_note
+}
+
+post_upgrade() {
+  _openuuyc_uinput_note
+}

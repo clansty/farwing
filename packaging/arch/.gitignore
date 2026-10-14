@@ -1,0 +1,4 @@
+# makepkg 的构建目录（只有默认 BUILDDIR 时会落在 PKGBUILD 旁边）
+/src/
+/pkg/
+*.pkg.tar.zst
