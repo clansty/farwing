@@ -399,6 +399,12 @@ impl LocalSnapshot {
                 "FileGroupDescriptorW".into(),
             ));
             ids.push((formats::register("FileContents"), "FileContents".into()));
+            // Shell 靠这条判断粘过来是复制还是移动；不给的话官方客户端会一直
+            // 停在试探阶段（它也会先要 FileGroupDescriptorW，见 `data`）。
+            ids.push((
+                formats::register("Preferred DropEffect"),
+                "Preferred DropEffect".into(),
+            ));
             return ids;
         }
         if self.text.is_some() {
@@ -428,7 +434,22 @@ impl LocalSnapshot {
                 })
                 .context("本地剪贴板没有文本"),
             8 => self.image.clone().context("本地剪贴板没有图片"),
-            _ => bail!("不支持的本地剪贴板格式"),
+            // 官方 Windows 客户端不走 `FileDescListRequest`：它先按名字来问这个
+            // 二进制块（DWORD 个数 + N × 592 字节的 FILEDESCRIPTORW），答不上就
+            // 不再往下问 FileContents，粘贴永远不动。我们自己两个客户端之间看不出
+            // 这件事——我们走的是 FileDescList。
+            _ if format.wire.name == "FileGroupDescriptorW" => {
+                ensure!(!self.sources.is_empty(), "本地剪贴板没有文件");
+                let files = collect_files(&self.sources)?;
+                let descriptors: Vec<_> = files.items.iter().map(|f| f.desc.clone()).collect();
+                formats::descriptor_bytes(&descriptors)
+            }
+            // 只做复制（DROPEFFECT_COPY = 1）。答成移动会让文件管理器把被控端
+            // 的原文件搬走——这条不是可选的礼貌，是安全线。
+            _ if format.wire.name.eq_ignore_ascii_case("Preferred DropEffect") => {
+                Ok(1u32.to_le_bytes().to_vec())
+            }
+            _ => bail!("不支持的本地剪贴板格式 {}", format.wire.name),
         }
     }
 }
@@ -1259,7 +1280,16 @@ fn serve(
                             && (ask.format_name.is_empty() || ask.format_name == format.wire.name)
                     })
                     .context("未发布该剪贴板格式")?;
-                let data = state.local.data(format)?;
+                let data = state.local.data(format).inspect_err(|error| {
+                    // 官方客户端是逐个格式来问的，答不上哪一条只在这里看得出来；
+                    // 之前这里一声不吭，「粘贴不动」在日志里什么都没有。
+                    tracing::info!(
+                        format = %format.wire.name,
+                        format_id = format.wire.id,
+                        %error,
+                        "剪贴板格式答不上"
+                    );
+                })?;
                 formats::convert(data, format, session.platform.load(Ordering::Acquire), true)
             })();
             match result {

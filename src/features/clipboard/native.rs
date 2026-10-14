@@ -646,6 +646,7 @@ fn set_offer(
         async_done: AtomicBool::new(false),
         async_result: AtomicI32::new(0),
         bytes_read: AtomicU64::new(0),
+        diagnostics: AtomicU32::new(0),
     });
     if let Some(text) = text {
         lock(&offer.cached).insert(13, text);
@@ -1440,26 +1441,6 @@ fn parse_descriptors(bytes: &[u8]) -> Result<Vec<ClipboardFileDescriptor>> {
     }
     Ok(out)
 }
-fn descriptor_bytes(items: &[ClipboardFileDescriptor]) -> Result<Vec<u8>> {
-    ensure!(items.len() <= MAX_FILES, "文件数量过多");
-    let mut bytes = vec![0; 4 + items.len() * 592];
-    bytes[..4].copy_from_slice(&(items.len() as u32).to_le_bytes());
-    for (b, f) in bytes[4..].chunks_exact_mut(592).zip(items) {
-        ensure!(safe_name(&f.file_name), "不安全的远端文件名称");
-        b[..4].copy_from_slice(&0x4064u32.to_le_bytes());
-        b[36..40].copy_from_slice(&f.file_attributes.to_le_bytes());
-        b[56..64].copy_from_slice(&f.last_write_time.to_le_bytes());
-        b[64..68].copy_from_slice(&((f.file_size >> 32) as u32).to_le_bytes());
-        b[68..72].copy_from_slice(&(f.file_size as u32).to_le_bytes());
-        for (out, c) in b[72..]
-            .chunks_exact_mut(2)
-            .zip(f.file_name.replace('/', "\\").encode_utf16())
-        {
-            out.copy_from_slice(&c.to_le_bytes());
-        }
-    }
-    Ok(bytes)
-}
 pub(super) struct RemoteOffer {
     file_operation: bool,
     failure: Mutex<Option<String>>,
@@ -1479,6 +1460,8 @@ pub(super) struct RemoteOffer {
     async_done: AtomicBool,
     async_result: AtomicI32,
     bytes_read: AtomicU64,
+    /// 「对面读完没有」的判断卡住时留下的计数行数，最多十条，见 `status`。
+    diagnostics: AtomicU32,
 }
 #[derive(Clone)]
 pub(crate) struct FileOffer(pub(super) Arc<RemoteOffer>);
@@ -1525,20 +1508,41 @@ impl FileOffer {
         } else {
             lock(&self.0.session.error).clone()
         };
+        // 对面把数据对象和流都放掉了，它这一轮就读不下去了：要么它自己说了
+        // 「做完了」（`EndOperation`，上一支），要么它压根不吭声。以前这里还
+        // 要求「没进异步模式」——Shell 的文件复制会先进异步模式，收尾却不总是
+        // 调 `EndOperation`，于是主控那边的「正在复制文件」永远挂着不走（数据
+        // 其实早就拷完了）。
+        let released = self.0.had_object.load(Ordering::Acquire)
+            && self.0.objects.load(Ordering::Acquire) == 0
+            && self.0.streams.load(Ordering::Acquire) == 0;
         let completed = if let Some(error) = error {
             Some(Err(error))
         } else if self.0.async_done.load(Ordering::Acquire) {
             let result = HRESULT(self.0.async_result.load(Ordering::Acquire));
             Some(result.ok().map_err(|e| e.to_string()))
-        } else if !self.0.async_started.load(Ordering::Acquire)
-            && self.0.had_object.load(Ordering::Acquire)
-            && self.0.objects.load(Ordering::Acquire) == 0
-            && self.0.streams.load(Ordering::Acquire) == 0
-        {
+        } else if released {
             Some(Ok(()))
         } else {
             None
         };
+        // 拖放已经收场却还停在「没读完」上：把那一刻的计数留下来（最多十条），
+        // 现象再复现时看一眼就知道是哪个数没归零——这条路径没法在本机复现。
+        if self.0.file_operation
+            && !self.0.dragging.load(Ordering::Acquire)
+            && completed.is_none()
+            && self.0.diagnostics.fetch_add(1, Ordering::AcqRel) < 10
+        {
+            tracing::info!(
+                objects = self.0.objects.load(Ordering::Acquire),
+                streams = self.0.streams.load(Ordering::Acquire),
+                had_object = self.0.had_object.load(Ordering::Acquire),
+                async_started = self.0.async_started.load(Ordering::Acquire),
+                async_done = self.0.async_done.load(Ordering::Acquire),
+                bytes_read = self.0.bytes_read.load(Ordering::Acquire),
+                "拖放文件复制还在等对面收尾"
+            );
+        }
         FileOfferStatus {
             bytes_read: self.0.bytes_read.load(Ordering::Acquire),
             completed,
@@ -1740,7 +1744,8 @@ impl IDataObject_Impl for RemoteData_Impl {
             });
         }
         let data = if id == formats::register("FileGroupDescriptorW") {
-            descriptor_bytes(&self.offer.list().map_err(com_error)?).map_err(com_error)?
+            formats::descriptor_bytes(&self.offer.list().map_err(com_error)?)
+                .map_err(com_error)?
         } else {
             let cache = lock(&self.offer.cached).get(&id).cloned();
             if let Some(v) = cache {
