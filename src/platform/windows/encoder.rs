@@ -279,7 +279,7 @@ impl Encoder {
         format: super::format::Format,
         rate: super::format::Rate,
         color: super::format::Color,
-        _image: &super::capture::Frame,
+        _image: &ID3D11Texture2D,
     ) -> Result<Self> {
         Self::hardware_format(backend, device, size, format, rate, color)
     }
