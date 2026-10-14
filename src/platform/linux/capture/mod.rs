@@ -16,6 +16,7 @@
 //! order.
 //!
 //! Frames are BGRA, in system memory or, from NvFBC, in CUDA device memory.
+mod dmabuf;
 mod nvfbc;
 mod pipewire;
 mod portal;

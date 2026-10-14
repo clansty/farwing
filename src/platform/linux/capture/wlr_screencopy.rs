@@ -33,6 +33,9 @@ use wayland_client::backend::WaylandError;
 use wayland_client::protocol::wl_output::Transform;
 use wayland_client::protocol::{wl_buffer, wl_output, wl_registry, wl_shm, wl_shm_pool};
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
+use wayland_protocols::wp::linux_dmabuf::zv1::client::{
+    zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1,
+};
 use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_frame_v1, zwlr_screencopy_manager_v1,
 };
@@ -132,6 +135,12 @@ struct State {
     connection: Option<Connection>,
     manager: Option<zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1>,
     shm: Option<wl_shm::WlShm>,
+    /// 合成器愿意把画面画进显存时用的那个协议。
+    dmabuf: Option<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1>,
+    /// 它给这一帧开的格式与 modifier（`linux_dmabuf` 事件）。
+    offer: Option<(u32, u64)>,
+    /// 探针自己接管这一次拷贝时置上，免得状态机先把帧用掉。
+    manual: bool,
     outputs: Vec<Output>,
     frame: Option<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1>,
     /// What the frame in flight says its buffer must look like.
@@ -399,6 +408,14 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                         (),
                     ));
                 }
+                "zwp_linux_dmabuf_v1" => {
+                    state.dmabuf = Some(registry.bind::<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, _, _>(
+                        name,
+                        version.min(3),
+                        handle,
+                        (),
+                    ));
+                }
                 "wl_output" => state.outputs.push(Output {
                     proxy: registry.bind::<wl_output::WlOutput, _, _>(
                         name,
@@ -480,9 +497,17 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for State {
                 state.wanted = Some((format as u32, width, height, stride));
             }
             zwlr_screencopy_frame_v1::Event::BufferDone => {
+                if state.manual {
+                    return;
+                }
                 if let Some(error) = state.copy(handle).err() {
                     state.error = Some(format!("{error:#}"));
                 }
+            }
+            // 这一版的协议只说格式和尺寸，不说 modifier：合成器把缓冲导入进来
+            // 会用我们自己声明的那一个，所以线性排布是可以直接试的。
+            zwlr_screencopy_frame_v1::Event::LinuxDmabuf { format, .. } => {
+                state.offer = Some((format, 0));
             }
             zwlr_screencopy_frame_v1::Event::Ready { .. } => state.ready = true,
             zwlr_screencopy_frame_v1::Event::Failed => state.failed = true,
@@ -495,6 +520,8 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for State {
 wayland_client::delegate_noop!(State: ignore wl_shm_pool::WlShmPool);
 wayland_client::delegate_noop!(State: ignore wl_buffer::WlBuffer);
 wayland_client::delegate_noop!(State: ignore wl_shm::WlShm);
+wayland_client::delegate_noop!(State: ignore zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1);
+wayland_client::delegate_noop!(State: ignore zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1);
 wayland_client::delegate_noop!(State: ignore zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1);
 
 impl State {
@@ -675,6 +702,83 @@ mod tests {
         assert_eq!(values(&pixels), vec![3, 2, 1, 6, 5, 4]);
         let (pixels, _, _) = orient(numbered(3, 2), 3, 2, Transform::Flipped180);
         assert_eq!(values(&pixels), vec![4, 5, 6, 1, 2, 3]);
+    }
+}
+
+#[cfg(test)]
+mod dmabuf_tests {
+    use super::*;
+
+    /// 合成器收不收我们自己分配的 dma-buf —— 这是零拷贝的前提。
+    /// `OPENUUYC_PROBE_OUTPUT=DP-1 cargo test --release --lib -- --ignored copies_into_a_dmabuf --nocapture`
+    #[test]
+    #[ignore]
+    fn copies_into_a_dmabuf() {
+        let screens = super::super::screens().unwrap();
+        let wanted = std::env::var("OPENUUYC_PROBE_OUTPUT").unwrap_or_default();
+        let screen = screens
+            .iter()
+            .find(|screen| screen.device_name == wanted)
+            .unwrap_or(&screens[0])
+            .clone();
+        let mut grab = Grab::open(&screen, false).unwrap();
+        let size = grab.state.outputs[grab.output].size();
+        println!("输出 {size:?}");
+        let Some(dmabuf) = grab.state.dmabuf.clone() else {
+            println!("合成器没有 zwp_linux_dmabuf_v1，零拷贝无从谈起");
+            return;
+        };
+        let handle = grab.queue.handle();
+        let output = grab.state.outputs[grab.output].proxy.clone();
+        let manager = grab.state.manager.clone().unwrap();
+        grab.state.manual = true;
+        // 先把帧要过来，读它给的那几个事件（格式报价 + buffer_done），再决定分配什么。
+        let frame = manager.capture_output(0, &output, &handle, ());
+        grab.state.frame = Some(frame.clone());
+        for _ in 0..10 {
+            grab.queue.roundtrip(&mut grab.state).unwrap();
+            if grab.state.wanted.is_some() || grab.state.offer.is_some() {
+                break;
+            }
+        }
+        println!(
+            "共享内存报价={:?} dma-buf 报价={:?}",
+            grab.state.wanted, grab.state.offer
+        );
+        let format = grab
+            .state
+            .offer
+            .map(|(format, _)| format)
+            .unwrap_or(crate::platform::linux::capture::dmabuf::ARGB8888);
+        let buffer = crate::platform::linux::capture::dmabuf::Buffer::allocate_format(
+            size.0,
+            size.1,
+            format,
+        )
+        .expect("分配显存缓冲失败");
+        println!(
+            "缓冲 {}x{} 行距 {} 尺寸 {} 格式 {:#x} modifier {:#x}",
+            buffer.width, buffer.height, buffer.stride, buffer.size, buffer.format, buffer.modifier
+        );
+        let wl = buffer.wrap(&dmabuf, &handle);
+        frame.copy(&wl);
+        // niri 只在真有变化时才画，所以这里要按时间等，而不是 roundtrip 几次。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if grab.state.ready || grab.state.failed || grab.state.error.is_some() {
+                break;
+            }
+            grab.wait(std::time::Duration::from_millis(200)).unwrap();
+        }
+        println!(
+            "ready={} failed={} error={:?} 合成器报价={:?}",
+            grab.state.ready, grab.state.failed, grab.state.error, grab.state.offer
+        );
+        if grab.state.ready {
+            let pixels = buffer.read_back().expect("读回显存缓冲失败");
+            std::fs::write("/tmp/openuuyc-dmabuf.bgra", &pixels).unwrap();
+            println!("已写出 /tmp/openuuyc-dmabuf.bgra（{} 字节）", pixels.len());
+        }
     }
 }
 
