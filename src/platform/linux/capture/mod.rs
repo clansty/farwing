@@ -81,20 +81,74 @@ pub(crate) enum Image {
     },
     /// A pitched CUDA allocation on the GPU driving the display.
     Cuda(Arc<super::cuda::Buffer>),
+    /// 合成器直接画进去的显存缓冲：内容不在系统内存里，编码器自己导入 GPU。
+    /// `width`/`height` 是这块屏「看到」的尺寸，缓冲自己的排布（旋转过的屏上是
+    /// 另一个方向）由 `transform` 描述。
+    DmaBuf {
+        buffer: Arc<dmabuf::Buffer>,
+        width: u32,
+        height: u32,
+        transform: wayland_client::protocol::wl_output::Transform,
+    },
 }
 impl Image {
     pub fn size(&self) -> (u32, u32) {
         match self {
             Self::Cpu { width, height, .. } => (*width, *height),
             Self::Cuda(buffer) => (buffer.width, buffer.height),
+            Self::DmaBuf { width, height, .. } => (*width, *height),
         }
     }
     /// The pixels in system memory, read back from the GPU if need be.
+    ///
+    /// 显存帧的读回很慢（一帧几十毫秒），它只是给「零拷贝那条路走不通了」兜底
+    /// 用的后备，正常路径下编码器直接吃显存。
     pub fn pixels(&self) -> Result<std::borrow::Cow<'_, [u8]>> {
         Ok(match self {
             Self::Cpu { pixels, .. } => std::borrow::Cow::Borrowed(pixels.as_slice()),
             Self::Cuda(buffer) => std::borrow::Cow::Owned(buffer.download()?),
+            Self::DmaBuf {
+                buffer, transform, ..
+            } => {
+                let raw = buffer.read_back()?;
+                let row = buffer.width as usize * 4;
+                let mut tight = Vec::with_capacity(row * buffer.height as usize);
+                for line in raw.chunks_exact(buffer.stride as usize).take(buffer.height as usize) {
+                    tight.extend_from_slice(&line[..row]);
+                }
+                let (pixels, _, _) =
+                    wlr_screencopy::orient(tight, buffer.width, buffer.height, *transform);
+                std::borrow::Cow::Owned(pixels)
+            }
         })
+    }
+    /// 这一帧是不是合成器画的显存缓冲。
+    pub fn dmabuf(&self) -> Option<&Arc<dmabuf::Buffer>> {
+        match self {
+            Self::DmaBuf { buffer, .. } => Some(buffer),
+            _ => None,
+        }
+    }
+}
+
+/// 输出自己的旋转里能交给 GPU 还原的那几种。`None` 表示这种旋转得回 CPU 做
+/// （180° 和带翻转的变换没有现成的 VA-API 滤镜），这条路就干脆别开。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Rotation {
+    None,
+    Clockwise,
+    CounterClockwise,
+}
+
+pub(crate) fn rotation_of(
+    transform: wayland_client::protocol::wl_output::Transform,
+) -> Option<Rotation> {
+    use wayland_client::protocol::wl_output::Transform;
+    match transform {
+        Transform::Normal => Some(Rotation::None),
+        Transform::_90 => Some(Rotation::Clockwise),
+        Transform::_270 => Some(Rotation::CounterClockwise),
+        _ => None,
     }
 }
 
@@ -114,6 +168,13 @@ pub(crate) struct Frame {
     pub captured: Instant,
     pub is_new: bool,
     pub hdr_metadata: Option<crate::media::video_color::HdrMetadata>,
+}
+impl Frame {
+    /// 这一帧的像素是不是留在显存里。编码器照着它决定用哪条路——它是帧自己的
+    /// 属性，所以走「上一帧原样再发一次」那条路时也不会说错。
+    pub fn hardware_image(&self) -> bool {
+        matches!(self.image, Image::DmaBuf { .. })
+    }
 }
 
 /// The active RandR outputs, in the protocol's terms. The identity is the
@@ -279,6 +340,9 @@ pub(crate) struct Desktop {
     last: Option<Arc<Vec<u8>>>,
     last_size: (u32, u32),
     refreshed: Instant,
+    /// 调用方想让画面留在显存里。后端换了（换屏、换光标设置）要按它再切回来：
+    /// 编码器是照着显存帧建起来的，采集这边不能悄悄换回系统内存。
+    hardware: bool,
 }
 
 impl Desktop {
@@ -297,6 +361,7 @@ impl Desktop {
             last: None,
             last_size: (0, 0),
             refreshed: Instant::now(),
+            hardware: false,
         })
     }
 
@@ -307,6 +372,34 @@ impl Desktop {
     /// Neither backend captures HDR.
     pub fn hdr_available(&self) -> bool {
         false
+    }
+
+    /// 零拷贝：让采集把画面留在显存里，缩放与色彩转换都交给 GPU。
+    ///
+    /// 返回是否真的切了过去；切不过去（不是 wlr-screencopy、合成器没有
+    /// `zwp_linux_dmabuf_v1`、这块屏的旋转 GPU 还原不了）调用方照旧走系统内存。
+    /// 切换之后 `next` 给的是 [`Image::DmaBuf`]，尺寸是这块屏看到的尺寸。
+    pub fn hardware_images(&mut self, enabled: bool) -> bool {
+        self.hardware = enabled;
+        self.apply_hardware()
+    }
+
+    /// 采集现在是不是真的把画面留在显存里。切不过去、或者后端重建之后没切回来，
+    /// 都会是 `false`——调用方得照这个来决定编码器怎么建。
+    pub fn hardware_active(&self) -> bool {
+        matches!(&self.backend, Backend::Wlr(grab) if grab.hardware())
+    }
+
+    fn apply_hardware(&mut self) -> bool {
+        let active = self.hardware
+            && match &mut self.backend {
+                Backend::Wlr(grab) => grab.set_hardware(true),
+                _ => false,
+            };
+        if !active {
+            self.hardware = false;
+        }
+        active
     }
 
     /// The next picture, or `None` when nothing changed before `timeout` ms.
@@ -330,6 +423,7 @@ impl Desktop {
                 self.screen = current;
                 self.generation = self.generation.wrapping_add(1);
                 self.last = None;
+                self.apply_hardware();
             }
         }
         // The portal and wlr-screencopy draw the cursor or leave it out for the
@@ -346,6 +440,7 @@ impl Desktop {
         {
             self.backend = Backend::Wlr(wlr_screencopy::Grab::open(&self.screen, cursor)?);
             self.last = None;
+            self.apply_hardware();
         }
         // NvFBC scales and draws the cursor as it captures; both are fixed
         // per session, so a different request opens a new one.
@@ -363,6 +458,44 @@ impl Desktop {
             }
         };
         let deadline = Instant::now() + Duration::from_millis(u64::from(timeout));
+        // 零拷贝那条路：不缩放、也不在 CPU 上解旋转，画面原样留在显存里，
+        // 剩下的都在 GPU 上做（见 `ffmpeg::drm`）。
+        if let Backend::Wlr(grab) = &mut self.backend
+            && grab.hardware()
+        {
+            let waiting = deadline.saturating_duration_since(Instant::now());
+            let result = grab.next_hardware(waiting);
+            let (transform, displayed) = match &self.backend {
+                Backend::Wlr(grab) => (grab.transform(), grab.displayed_size()),
+                _ => unreachable!(),
+            };
+            return match result {
+                Ok(Some(hardware)) => {
+                    self.available = true;
+                    Ok(Some(Frame {
+                        width: displayed.0,
+                        height: displayed.1,
+                        image: Image::DmaBuf {
+                            buffer: hardware.buffer,
+                            width: displayed.0,
+                            height: displayed.1,
+                            transform,
+                        },
+                        captured: Instant::now(),
+                        is_new: true,
+                        hdr_metadata: None,
+                    }))
+                }
+                Ok(None) => {
+                    self.available = true;
+                    Ok(None)
+                }
+                Err(error) => {
+                    self.available = false;
+                    Err(error)
+                }
+            };
+        }
         let result = match &mut self.backend {
             // The driver waits for a new frame and delivers it on the GPU.
             Backend::NvFbc(grab) => {

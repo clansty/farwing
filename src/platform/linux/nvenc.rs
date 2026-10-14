@@ -83,6 +83,10 @@ impl Encoder {
         match image {
             Image::Cpu { pixels, .. } => self.input.upload(pixels)?,
             Image::Cuda(buffer) => self.input.copy_from_device(buffer.ptr, buffer.pitch)?,
+            // 显存帧只有 VA-API 那条路能直接吃：NVENC 的输入是 CUDA 缓冲，
+            // 这里只能读回来再上传。选后端时就不会选到这条路（见
+            // `encoder::Encoder::hardware_images`），这只是一个兜底。
+            Image::DmaBuf { .. } => self.input.upload(&image.pixels()?)?,
         }
         let _current = self.context.enter()?;
         let registered = self.registered.as_ref().expect("registered until drop");

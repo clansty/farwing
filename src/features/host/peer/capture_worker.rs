@@ -55,6 +55,8 @@ pub(super) fn capture_loop(
     let mut transfer = None::<crate::features::host::transfer::Transfer>;
     let mut frame_metadata = std::collections::BTreeMap::new();
     let mut last_diagnostics = None;
+    // 零拷贝这条路还值不值得试（建过一次失败就不再试）。
+    let mut zero_copy_allowed = true;
     let mut metrics = metrics::Metrics::default();
 
     while !cancel.is_cancelled() && handle.requested() {
@@ -261,6 +263,23 @@ pub(super) fn capture_loop(
             desktop = Some(capture::Desktop::open_selected(&screen)?);
             generation = desktop.as_ref().unwrap().generation;
         }
+        // 零拷贝：编码器能直接吃显存里的帧时，让采集把画面留在显存里，缩放与
+        // 色彩转换都交给 GPU。采集那边切不过去（不是 wlr-screencopy、这块屏的
+        // 旋转 GPU 还原不了）就照旧走系统内存，两条路给出来的尺寸是一样的。
+        // 试过一次不行就不再试，免得每帧都在建滤镜图上失败一遍。
+        let want_zero_copy = hardware
+            && zero_copy_allowed
+            && encoder::Encoder::hardware_images(candidate.capability.backend);
+        {
+            let desktop = desktop.as_mut().context("缺少采集源")?;
+            if want_zero_copy != desktop.hardware_active() {
+                desktop.hardware_images(want_zero_copy);
+            }
+            // 说做不到就别每帧再问一遍。
+            if want_zero_copy && !desktop.hardware_active() {
+                zero_copy_allowed = false;
+            }
+        }
         let wait_ms = ((1000.0 / f64::from(wanted.fps)).round() as u32).max(1);
         let capture_started = Instant::now();
         // Advance the planned deadline, not the (usually late) wake-up time.
@@ -346,6 +365,9 @@ pub(super) fn capture_loop(
                 frame
             }
         };
+        // 以帧自己为准：后端重建（换屏、换光标设置）之后可能没切回来，也可能这一帧
+        // 走的是「上一帧原样再发」，编码器要跟着它走，不然一个喂显存帧、一个等系统内存帧。
+        let zero_copy = frame.hardware_image();
         let size = output_size(frame.width, frame.height, wanted.quality);
         let source_device = &desktop.as_ref().context("缺少采集源")?.device;
         // NVENC owns a separate D3D11 context even on the capture adapter.
@@ -380,40 +402,51 @@ pub(super) fn capture_loop(
                 }
                 encoding_device.as_ref().unwrap().1.clone()
             };
-        if current.is_none_or(|(old_size, old_candidate)| {
-            old_size != size || old_candidate != (candidate_id, wanted.color)
+        if current.is_none_or(|(old_size, old_candidate, old_zero_copy)| {
+            old_size != size || old_candidate != (candidate_id, wanted.color) || old_zero_copy != zero_copy
         }) {
             // Release before replacement to avoid consuming a second driver
             // session solely for a size/candidate transition (T C2D840).
             drop(encoder.take());
+            let rate = crate::features::host::format::Rate {
+                target: bounds.initial.max(300_000),
+                peak: bounds.initial.max(300_000),
+                fps: wanted.fps,
+                quality: wanted.quality,
+                quality_target,
+            };
             let created = if hardware {
-                encoder::Encoder::hardware_format(
+                encoder::Encoder::hardware_format_from_frame(
                     candidate.capability.backend,
                     &device,
                     size,
                     wanted.format,
-                    crate::features::host::format::Rate {
-                        target: bounds.initial.max(300_000),
-                        peak: bounds.initial.max(300_000),
-                        fps: wanted.fps,
-                        quality: wanted.quality,
-                        quality_target,
-                    },
+                    rate,
                     wanted.color,
+                    &frame.image,
                 )
             } else {
-                encoder::Encoder::software_format(
-                    &device,
-                    size,
-                    wanted.format,
-                    crate::features::host::format::Rate {
-                        target: bounds.initial.max(300_000),
-                        peak: bounds.initial.max(300_000),
-                        fps: wanted.fps,
-                        quality: wanted.quality,
-                        quality_target,
-                    },
-                )
+                encoder::Encoder::software_format(&device, size, wanted.format, rate)
+            };
+            // 零拷贝这条链路建不起来（VPP 转不动、滤镜图出错）不算致命：关掉它，
+            // 让采集退回系统内存，这一次按普通那条再建一次。下一轮开头会把
+            // 采集也切回去，`current` 认得这个变化，编码器会跟着重建。
+            let created = match created {
+                Err(error) if zero_copy && hardware => {
+                    tracing::warn!(%error, "零拷贝链路建立失败，退回系统内存");
+                    // 这里只把「不再试」记下来：`zero_copy` 留着，下一轮开头才会
+                    // 真的去让采集切回系统内存，`current` 也才认得出这个变化。
+                    zero_copy_allowed = false;
+                    encoder::Encoder::hardware_format(
+                        candidate.capability.backend,
+                        &device,
+                        size,
+                        wanted.format,
+                        rate,
+                        wanted.color,
+                    )
+                }
+                other => other,
             };
             encoder = match created {
                 Ok(created) => {
@@ -434,7 +467,7 @@ pub(super) fn capture_loop(
                     continue;
                 }
             };
-            current = Some((size, (candidate_id, wanted.color)));
+            current = Some((size, (candidate_id, wanted.color), zero_copy));
             frame_metadata.clear();
             encode_errors = 0;
             keyframe.store(true, Ordering::Release);
@@ -599,9 +632,10 @@ pub(super) fn capture_loop(
                 size,
                 fps: wanted.fps,
                 target_bps: media_rate,
+                path: active_encoder.path().to_owned(),
             };
-            if last_diagnostics != Some(diagnostics) {
-                handle.video(Some(diagnostics));
+            if last_diagnostics.as_ref() != Some(&diagnostics) {
+                handle.video(Some(diagnostics.clone()));
                 last_diagnostics = Some(diagnostics);
             }
             let mut active = lock(&config);

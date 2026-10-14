@@ -345,6 +345,13 @@ pub(crate) struct Frame {
     pub hdr_metadata: Option<crate::media::video_color::HdrMetadata>,
     pub(crate) _storage: Option<std::sync::Arc<()>>,
 }
+impl Frame {
+    /// DXGI 交出来的帧本来就躺在显存里，但 Windows 的编码器一直直接吃它，
+    /// 没有「要不要走显存」这个选择，所以对上层而言这条永远是关的。
+    pub fn hardware_image(&self) -> bool {
+        false
+    }
+}
 
 enum Backend {
     Session(Box<session::Session>),
@@ -478,6 +485,14 @@ impl Desktop {
         };
         self.backend = backend;
         self.generation = self.generation.wrapping_add(1);
+    }
+    /// 零拷贝在 Windows 上是采集的常态：DXGI 交出来的帧本来就躺在显存里，
+    /// 编码器直接吃。所以这里没有可切的东西，调用方照旧走同一条路。
+    pub fn hardware_images(&mut self, _enabled: bool) -> bool {
+        false
+    }
+    pub fn hardware_active(&self) -> bool {
+        false
     }
     pub fn next(
         &mut self,

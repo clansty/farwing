@@ -199,7 +199,8 @@ impl Buffer {
         Ok(())
     }
 
-    #[cfg(test)]
+    /// 把内容读回系统内存。只给「显存那条路走不通了」的后备路径用：一帧几十
+    /// 毫秒，正常编解码不会走到这里。
     pub(crate) fn read_back(&self) -> Result<Vec<u8>> {
         let mut map = MapDumb {
             handle: self.handle,

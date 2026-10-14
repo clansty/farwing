@@ -392,6 +392,18 @@ fn rate_control(context: *mut ff::AVCodecContext, rate: Rate) {
     }
 }
 
+/// 本进程到目前为止烧掉的总 CPU 时间（秒）。
+fn burned_cpu() -> f64 {
+    // Safe because getrusage only writes into the struct it is given.
+    let usage = unsafe {
+        let mut usage: libc::rusage = std::mem::zeroed();
+        libc::getrusage(libc::RUSAGE_SELF, &mut usage);
+        usage
+    };
+    let seconds = |value: &libc::timeval| value.tv_sec as f64 + value.tv_usec as f64 / 1e6;
+    seconds(&usage.ru_utime) + seconds(&usage.ru_stime)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,5 +504,164 @@ mod tests {
         println!("前 8 帧 {:?}", sizes.iter().take(8).collect::<Vec<_>>());
         std::fs::write("/tmp/openuuyc-ffmpeg.h264", &stream).unwrap();
         std::fs::write("/tmp/openuuyc-ffmpeg-luma.raw", &luma).unwrap();
+    }
+
+    /// 被控端真正要走的那条路：采集把画面留在显存里，编码器直接吃。
+    /// 采一段码流下来交给 ffmpeg 解，画面方向、色彩、有没有撕裂都看得见。
+    /// `OPENUUYC_PROBE_OUTPUT=DP-3 cargo test --release --lib -- --ignored reports_the_zerocopy_path --nocapture`
+    #[test]
+    #[ignore]
+    fn reports_the_zerocopy_path() {
+        use crate::media::encoding::{Codec, QualityTarget};
+        let screens = crate::platform::linux::capture::screens().unwrap();
+        let wanted = std::env::var("OPENUUYC_PROBE_OUTPUT").unwrap_or_default();
+        let screen = screens
+            .iter()
+            .find(|screen| screen.device_name == wanted)
+            .unwrap_or(&screens[0])
+            .clone();
+        let (quality, maximum) = (4, (3840, 2160));
+        let hard = !std::env::var("OPENUUYC_PROBE_HARDWARE").is_ok_and(|v| v == "0");
+        let mut desktop =
+            crate::platform::linux::capture::Desktop::open_selected(&screen).unwrap();
+        if hard {
+            assert!(
+                desktop.hardware_images(true),
+                "{} 切不到显存那条路",
+                screen.device_name
+            );
+        }
+        let format = Format {
+            codec: Codec::H264,
+            chroma: 1,
+            depth: 8,
+        };
+        let rate = Rate {
+            target: 24_000_000,
+            peak: 24_000_000,
+            fps: 30,
+            quality,
+            quality_target: QualityTarget {
+                bitrate: 24_000_000,
+                fps: 30,
+            },
+        };
+        let mut encoder = None;
+        let mut stream = Vec::new();
+        let mut sizes = Vec::new();
+        let mut luma = Vec::new();
+        let (mut frames, mut keyframes, mut bytes) = (0u32, 0u32, 0usize);
+        let mut worked = 0u32;
+        let mut capture = std::time::Duration::ZERO;
+        let mut encode = std::time::Duration::ZERO;
+        // 每帧真正烧掉的 CPU 时间：零拷贝那条路的价值全在这里。
+        let before = burned_cpu();
+        let started = std::time::Instant::now();
+        while started.elapsed() < std::time::Duration::from_secs(15) {
+            let at = std::time::Instant::now();
+            let Ok(Some(frame)) = desktop.next(33, quality, false, false, maximum) else {
+                continue;
+            };
+            // 只统计真的拿到画面那几次：等合成器出帧（画面没动就没有）不算工作。
+            capture += at.elapsed();
+            worked += 1;
+            let size =
+                crate::features::host::output_size(frame.width, frame.height, quality);
+            if encoder.is_none() {
+                encoder = Some(
+                    crate::platform::linux::encoder::Encoder::hardware_format_from_frame(
+                        crate::media::encoding::Backend::Amd,
+                        &desktop.device,
+                        size,
+                        format,
+                        rate,
+                        Color::Sdr,
+                        &frame.image,
+                    )
+                    .unwrap(),
+                );
+                println!("采集 {:?} 编码 {size:?}", (frame.width, frame.height));
+            }
+            let at = std::time::Instant::now();
+            let encoded = encoder
+                .as_mut()
+                .unwrap()
+                .encode(&frame.image, i64::from(frames) * 333_333, frames == 0)
+                .unwrap();
+            encode += at.elapsed();
+            for output in &encoded {
+                stream.extend_from_slice(&output.data);
+                bytes += output.data.len();
+                sizes.push((output.data.len(), output.keyframe));
+                if output.keyframe {
+                    keyframes += 1;
+                }
+            }
+            if frames == 30 {
+                // 编码器看到的画面，抽样留一份给 ffmpeg 对。
+                let pixels = frame.image.pixels().unwrap();
+                luma.extend_from_slice(&pixels[..pixels.len().min(4096)]);
+            }
+            frames += 1;
+        }
+        println!(
+            "{}{frames} 帧，{keyframes} 个关键帧，{bytes} 字节（{} KiB/帧），编码 {:.2} ms/帧",
+            if hard { "零拷贝：" } else { "CPU： " },
+            bytes / 1024 / frames.max(1) as usize,
+            encode.as_secs_f64() * 1000.0 / f64::from(frames.max(1)),
+        );
+        let burned = burned_cpu() - before;
+        println!(
+            "      采集（只算真的采到画面的 {worked} 次）{:.2} ms/次，本进程 CPU 一共 {:.0} ms/帧",
+            capture.as_secs_f64() * 1000.0 / f64::from(worked.max(1)),
+            burned * 1000.0 / f64::from(frames.max(1)),
+        );
+        println!("前 6 帧 {:?}", &sizes[..sizes.len().min(6)]);
+        let name = format!("/tmp/openuuyc-zerocopy-{}.h264", screen.device_name);
+        std::fs::write(&name, &stream).unwrap();
+        println!("已写出 {name}");
+    }
+
+    /// 抓两个屏各一张真实画面，拼成一段「大切换」素材：前一半是 A、后一半是 B。
+    /// 切屏或全屏切换时编码器看到的就是这种硬切。拿它喂 ffmpeg 命令行，在不同的
+    /// 码率与 VBV 下编码、逐帧比 PSNR，就能分清「糊」是编码器的码率控制造成的、
+    /// 还是带宽不够——两者的修法完全不同。
+    /// `cargo test --release --lib -- --ignored dumps_switch_content --nocapture`
+    #[test]
+    #[ignore]
+    fn dumps_switch_content() {
+        let directory = std::env::var("OPENUUYC_PROBE_DIR")
+            .unwrap_or_else(|_| "/tmp/openuuyc-switch".to_owned());
+        std::fs::create_dir_all(&directory).unwrap();
+        let screens = crate::platform::linux::capture::screens().unwrap();
+        let mut dumped = 0;
+        for screen in screens.iter().take(2) {
+            let mut desktop =
+                crate::platform::linux::capture::Desktop::open_selected(screen).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            // niri 只在有 damage 的时候才提交一帧，静止的屏幕得等到下一次变化。
+            while std::time::Instant::now() < deadline {
+                let Ok(Some(frame)) = desktop.next(200, 4, false, false, (3840, 2160)) else {
+                    continue;
+                };
+                let pixels = frame.image.pixels().unwrap();
+                std::fs::write(format!("{directory}/screen{dumped}.bgra"), &pixels).unwrap();
+                std::fs::write(
+                    format!("{directory}/screen{dumped}.size"),
+                    format!("{}x{}", frame.width, frame.height),
+                )
+                .unwrap();
+                println!(
+                    "screen{dumped} = {} {}x{} 字节 {}",
+                    screen.device_name,
+                    frame.width,
+                    frame.height,
+                    pixels.len()
+                );
+                dumped += 1;
+                break;
+            }
+        }
+        assert_eq!(dumped, 2, "两个屏都要抓到画面");
     }
 }

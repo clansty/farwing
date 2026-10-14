@@ -87,10 +87,10 @@ fn update_media_summary(status: &mut Status) {
     status.encoder = current.and_then(|s| s.encoder);
     status.capture = current.and_then(|s| s.capture.clone());
     status.screen = current.and_then(|s| s.screen.clone());
-    status.video = current.and_then(|s| s.video);
+    status.video = current.and_then(|s| s.video.clone());
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ActiveEncoding {
     #[serde(default)]
     pub preferred_gpu: Option<crate::media::selection::GpuId>,
@@ -104,6 +104,10 @@ pub(crate) struct ActiveEncoding {
     pub size: (u32, u32),
     pub fps: u32,
     pub target_bps: u32,
+    /// 编码走的是哪条路。同一个后端里有几版实现（手写与库各一版 VA-API），
+    /// 还有零拷贝与走系统内存之分，`backend` 说不出来这些。
+    #[serde(default)]
+    pub path: String,
 }
 
 #[derive(Clone)]

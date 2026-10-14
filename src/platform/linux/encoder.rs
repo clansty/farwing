@@ -6,6 +6,7 @@ use super::capture::{Desktop, Device, Image};
 use super::cuda;
 use crate::media::encoding::{Backend, Capability, Codec, Color, Format, QualityTarget, Rate};
 use anyhow::{Context, Result, bail, ensure};
+use std::os::fd::AsFd;
 
 pub(crate) use crate::media::encoding::{Encoded, FrameTiming};
 
@@ -152,6 +153,9 @@ pub(crate) enum Encoder {
     Libavcodec {
         backend: Backend,
         encoder: super::ffmpeg::Encoder,
+        /// 零拷贝：dma-buf 的导入、旋转、缩放与转 NV12 全在这一幕里做，它的
+        /// 帧上下文就是 `encoder` 的输入。走系统内存那条路时是 `None`。
+        scaler: Option<Box<super::ffmpeg::drm::Scaler>>,
     },
     Software(Box<super::software_encoder::Encoder>),
 }
@@ -170,6 +174,7 @@ impl Encoder {
             Backend::Amd | Backend::Intel if libavcodec() => Ok(Self::Libavcodec {
                 backend,
                 encoder: super::ffmpeg::Encoder::new(size, format, rate)?,
+                scaler: None,
             }),
             Backend::Amd | Backend::Intel => Ok(Self::Vaapi {
                 backend,
@@ -188,6 +193,63 @@ impl Encoder {
             Backend::Software => bail!("软件编码请走 software_format"),
         }
     }
+    /// 这个后端能不能直接吃采集留在显存里的帧（零拷贝）。只有 libavcodec 那版
+    /// VA-API 把 dma-buf 导进 GPU 过：手写那版、NVENC（CUDA 输入）与软件编码
+    /// 都得先把像素拿到系统内存里。
+    pub(crate) fn hardware_images(backend: Backend) -> bool {
+        matches!(backend, Backend::Amd | Backend::Intel) && libavcodec()
+    }
+
+    /// 零拷贝：用采集留在显存里的那一帧建编码器。滤镜图的输出帧上下文直接交给
+    /// 编码器，于是从合成器的画布到码流之间没有一次 CPU 拷贝。
+    ///
+    /// 给的帧不是显存帧时说不上零拷贝，直接按普通那条建。
+    pub(crate) fn hardware_format_from_frame(
+        backend: Backend,
+        device: &Device,
+        size: (u32, u32),
+        format: Format,
+        rate: Rate,
+        color: Color,
+        image: &Image,
+    ) -> Result<Self> {
+        let Some(buffer) = image.dmabuf() else {
+            return Self::hardware_format(backend, device, size, format, rate, color);
+        };
+        ensure!(!color.is_hdr(), "Linux 版暂不支持 HDR 采集");
+        ensure!(
+            matches!(backend, Backend::Amd | Backend::Intel) && libavcodec(),
+            "这个编码后端吃不了显存帧"
+        );
+        let transform = match image {
+            Image::DmaBuf { transform, .. } => *transform,
+            _ => unreachable!(),
+        };
+        let rotation = super::capture::rotation_of(transform)
+            .context("这块屏的旋转没法在 GPU 上还原")?;
+        let node = super::capture::dmabuf::card_path()?;
+        let scaler = super::ffmpeg::drm::Scaler::new(
+            &node,
+            &super::ffmpeg::drm::Frame {
+                fd: buffer.prime.as_fd(),
+                // 滤镜图的输入是合成器自己的画布，尺寸得按缓冲自己的来，
+                // 「这块屏看到的尺寸」是旋转之后的事。
+                width: buffer.width,
+                height: buffer.height,
+                stride: buffer.stride,
+                format: buffer.format,
+            },
+            rotation,
+            size,
+        )?;
+        let encoder = super::ffmpeg::Encoder::with_frames(scaler.frames(), size, format, rate)?;
+        Ok(Self::Libavcodec {
+            backend,
+            encoder,
+            scaler: Some(Box::new(scaler)),
+        })
+    }
+
     pub(crate) fn software_format(
         _device: &Device,
         size: (u32, u32),
@@ -197,6 +259,19 @@ impl Encoder {
         Ok(Self::Software(Box::new(
             super::software_encoder::Encoder::new(size, format, rate)?,
         )))
+    }
+    /// 这条编码路径的人话说明，给诊断面板看：同一块 GPU 上有两版 VA-API 编码器，
+    /// 还有走不走显存之分，光看后端名字分不出来。
+    pub(crate) fn path(&self) -> &'static str {
+        match self {
+            Self::Nvidia(_) => "NVENC",
+            Self::Vaapi { .. } => "VA-API（手写）",
+            Self::Libavcodec {
+                scaler: Some(_), ..
+            } => "VA-API · libavcodec · 零拷贝",
+            Self::Libavcodec { .. } => "VA-API · libavcodec",
+            Self::Software(_) => "软件编码",
+        }
     }
     pub(crate) fn implementation(&self) -> i32 {
         match self {
@@ -254,6 +329,30 @@ impl Encoder {
         match self {
             Self::Nvidia(encoder) => encoder.encode(image, timestamp, keyframe),
             Self::Vaapi { encoder, .. } => encoder.encode(image, timestamp, keyframe),
+            Self::Libavcodec {
+                encoder,
+                scaler: Some(scaler),
+                ..
+            } => {
+                // 零拷贝：先把这块 dma-buf 摆正、缩放、转成 NV12，都在 GPU 上，
+                // 再把那张硬件帧直接递给编码器。
+                let buffer = match image {
+                    Image::DmaBuf { buffer, .. } => buffer,
+                    // 滤镜图是按显存帧建起来的，别的帧到这里就是调用方搞错了。
+                    _ => bail!("零拷贝编码器只吃显存帧"),
+                };
+                let scaled = scaler.scale(
+                    &super::ffmpeg::drm::Frame {
+                        fd: buffer.prime.as_fd(),
+                        width: buffer.width,
+                        height: buffer.height,
+                        stride: buffer.stride,
+                        format: buffer.format,
+                    },
+                    timestamp,
+                )?;
+                encoder.encode_hardware(scaled, timestamp, keyframe)
+            }
             Self::Libavcodec { encoder, .. } => encoder.encode(image, timestamp, keyframe),
             Self::Software(encoder) => encoder.encode(image, timestamp, keyframe, cancel),
         }

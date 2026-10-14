@@ -264,6 +264,26 @@ impl Encoder {
             }
         }
     }
+    /// 采集在 Windows 上本来就把画面留在显存里（DXGI 交出来的就是纹理），
+    /// 编码器一直直接吃它，所以这里没有需要额外开的东西。
+    pub(crate) fn hardware_images(_backend: super::format::Backend) -> bool {
+        false
+    }
+
+    /// 与 [`Self::hardware_format`] 是同一个东西：Windows 的采集帧始终在显存里，
+    /// 不存在「要不要把画面留在显存」这个选择。
+    pub(crate) fn hardware_format_from_frame(
+        backend: super::format::Backend,
+        device: &ID3D11Device,
+        size: (u32, u32),
+        format: super::format::Format,
+        rate: super::format::Rate,
+        color: super::format::Color,
+        _image: &super::capture::Frame,
+    ) -> Result<Self> {
+        Self::hardware_format(backend, device, size, format, rate, color)
+    }
+
     pub(crate) fn software_format(
         device: &ID3D11Device,
         size: (u32, u32),
@@ -273,6 +293,15 @@ impl Encoder {
         Ok(Self::Software(Box::new(
             super::software_encoder::Encoder::new(device, size, format, rate)?,
         )))
+    }
+    /// 这条编码路径的人话说明，给诊断面板看。
+    pub(crate) fn path(&self) -> &'static str {
+        match self {
+            Self::Nvidia(_) => "NVENC",
+            Self::Amd(_) => "AMF",
+            Self::Intel(_) => "oneVPL",
+            Self::Software(_) => "软件编码",
+        }
     }
     pub(crate) fn implementation(&self) -> i32 {
         match self {

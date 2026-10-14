@@ -3,13 +3,11 @@
 //! asks the local user for nothing, and it needs no permission the session does
 //! not already have.
 //!
-//! Frames come back in shared memory. The protocol's other half — a dma-buf the
-//! compositor draws into — would keep the picture on the GPU, but the pixels
-//! still have to be read here for the encoder's own conversion, and a device
-//! buffer mapped into a process on the discrete GPU of this machine reads at
-//! about 85 MB/s: a 16 MB frame took 195 ms, against 1.4 ms for the same frame
-//! through shared memory. dma-buf pays off only once the conversion moves onto
-//! the GPU too, which the encoder does not do yet.
+//! 画面有两条路回来。默认走共享内存：合成器拷进来，这里再读出来交给编码器。
+//! 另一条是让合成器直接画进我们分配的 dma-buf（`hardware` 打开时），像素全程
+//! 留在显存里——这条路只有在编码器也直接在显存上干活时才划算，否则光是把它
+//! 映射回来读一遍就比共享内存那条整条还慢（离散显卡上实测 195 ms 对 1.4 ms）。
+//! 谁来开、怎么退回去见 `capture::Desktop::hardware_images`。
 //!
 //! The compositor copies its own framebuffer, not the picture the monitor
 //! shows: a rotated or flipped output arrives sideways, and the transform
@@ -128,6 +126,26 @@ pub(super) struct Grab {
     state: State,
     cursor: bool,
     output: usize,
+    /// 零拷贝：让合成器直接画进我们分配的 dma-buf，而不是共享内存。
+    hardware: bool,
+    /// 那块缓冲。格式要等合成器报出来才知道，所以第一次用的时候才分配。
+    target: Option<Hardware>,
+}
+
+/// 合成器画进去的显存缓冲，以及引用它的 `wl_buffer`。
+///
+/// 两块轮着用：合成器往一块里画的时候，编码器正在读另一块。只有一块的话，
+/// 要么等编码器读完才敢让合成器动手（平白丢一帧的重叠），要么让两边抢同一块内存。
+struct Hardware {
+    buffers: [std::sync::Arc<super::dmabuf::Buffer>; 2],
+    wl: [wl_buffer::WlBuffer; 2],
+    /// 已经请求、还没兑现的那一块。
+    pending: usize,
+}
+
+/// 一块画好的显存缓冲。
+pub(super) struct Captured {
+    pub buffer: std::sync::Arc<super::dmabuf::Buffer>,
 }
 
 #[derive(Default)]
@@ -137,10 +155,12 @@ struct State {
     shm: Option<wl_shm::WlShm>,
     /// 合成器愿意把画面画进显存时用的那个协议。
     dmabuf: Option<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1>,
-    /// 它给这一帧开的格式与 modifier（`linux_dmabuf` 事件）。
-    offer: Option<(u32, u64)>,
+    /// 它给这一帧开的格式与尺寸（`linux_dmabuf` 事件）。
+    offer: Option<(u32, u32, u32)>,
     /// 探针自己接管这一次拷贝时置上，免得状态机先把帧用掉。
     manual: bool,
+    /// 零拷贝：这一帧要画进去的那块显存缓冲。
+    dmabuf_target: Option<wl_buffer::WlBuffer>,
     outputs: Vec<Output>,
     frame: Option<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1>,
     /// What the frame in flight says its buffer must look like.
@@ -189,11 +209,55 @@ impl Grab {
             state,
             cursor,
             output,
+            hardware: false,
+            target: None,
         })
     }
 
     pub fn name(&self) -> &'static str {
         "wlroots screencopy"
+    }
+
+    /// 零拷贝那条路现在是不是开着。
+    pub fn hardware(&self) -> bool {
+        self.hardware
+    }
+
+    /// 合成器认不认我们自己分配的 dma-buf。
+    pub fn supports_hardware(&self) -> bool {
+        self.state.dmabuf.is_some()
+    }
+
+    /// 输出自己的旋转，原样给出去（`orient` 是它的 CPU 版本）。
+    pub fn transform(&self) -> Transform {
+        self.state
+            .outputs
+            .get(self.output)
+            .map_or(Transform::Normal, |output| output.transform)
+    }
+
+    /// 这块屏「看到」的尺寸，也就是解过旋转之后的画面尺寸。
+    pub fn displayed_size(&self) -> (u32, u32) {
+        self.state.outputs[self.output].size()
+    }
+
+    /// 能不能在 GPU 上把画面摆正。摆不正就不开这条路，别送出一张躺着的画面。
+    pub fn hardware_rotation(&self) -> Option<super::Rotation> {
+        super::rotation_of(self.transform())
+    }
+
+    /// 切开零拷贝。等到真的用不了（合成器没报格式、分配失败）再退回去。
+    pub fn set_hardware(&mut self, enabled: bool) -> bool {
+        if enabled && (!self.supports_hardware() || self.hardware_rotation().is_none()) {
+            return false;
+        }
+        if !enabled {
+            self.state.dmabuf_target = None;
+            self.target = None;
+        }
+        self.hardware = enabled;
+        // 返回的是「现在是不是显存模式」，关掉的时候就是 false。
+        enabled
     }
 
     /// Whether the compositor draws the cursor into the pictures.
@@ -202,6 +266,7 @@ impl Grab {
     }
 
     pub fn next(&mut self, timeout: Duration) -> Result<Option<Picture>> {
+        self.state.dmabuf_target = None;
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(error) = self.state.error.take() {
@@ -238,6 +303,109 @@ impl Grab {
             }
             self.wait(deadline - now)?;
         }
+    }
+
+    /// 零拷贝：让合成器把这一帧画进我们自己分配的显存缓冲。
+    ///
+    /// 回来之前就把下一帧要好了——画进另一块缓冲——于是调用方编码这一块的时候
+    /// 合成器正在画那一块。两块轮换，谁也不会读到别人正在写的那一份。
+    pub fn next_hardware(&mut self, timeout: Duration) -> Result<Option<Captured>> {
+        let deadline = Instant::now() + timeout;
+        if !self.ensure_targets(deadline)? {
+            return Ok(None);
+        }
+        let mut ready = false;
+        loop {
+            if let Some(error) = self.state.error.take() {
+                bail!("{error}");
+            }
+            if std::mem::take(&mut self.state.ready) {
+                ready = true;
+                break;
+            }
+            if std::mem::take(&mut self.state.failed) {
+                bail!("合成器拒绝了显存复制");
+            }
+            if self.state.frame.is_none() {
+                let pending = self.target.as_ref().context("没有显存缓冲")?.pending;
+                self.request_into(pending)?;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            self.wait(deadline - now)?;
+        }
+        if !ready {
+            return Ok(None);
+        }
+        let hardware = self.target.as_mut().context("没有显存缓冲")?;
+        let done = hardware.pending;
+        let buffer = hardware.buffers[done].clone();
+        // 先把下一帧要上：它画进另一块，和调用方接下来对这一块的编码并行。
+        hardware.pending = 1 - done;
+        let next = hardware.pending;
+        self.request_into(next)?;
+        Ok(Some(Captured { buffer }))
+    }
+
+    /// 要一帧，并且说明它要画进哪一块缓冲。
+    fn request_into(&mut self, index: usize) -> Result<()> {
+        let target = self.target.as_ref().context("没有显存缓冲")?;
+        self.state.dmabuf_target = Some(target.wl[index].clone());
+        self.request()
+    }
+
+    /// 分配那两块显存缓冲。格式是合成器在 `linux_dmabuf` 事件里报的，所以得先
+    /// 要一帧只为听它说一句；那一帧不会兑现。
+    ///
+    /// 说不上来（静止的屏上合成器不到下一次上屏就不会处理这个请求）就返回
+    /// `false` 让调用方当「这一帧没有画面」处理，等下一次再来问，别把一次没赶上
+    /// 当成采集坏掉。
+    fn ensure_targets(&mut self, deadline: Instant) -> Result<bool> {
+        if self.target.is_some() {
+            return Ok(true);
+        }
+        let dmabuf = self
+            .state
+            .dmabuf
+            .clone()
+            .context("合成器没有 zwp_linux_dmabuf_v1")?;
+        self.state.dmabuf_target = None;
+        self.request()?;
+        while self.state.offer.is_none() {
+            if let Some(error) = self.state.error.take() {
+                bail!("{error}");
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(false);
+            }
+            self.wait(deadline - now)?;
+        }
+        if let Some(frame) = self.state.frame.take() {
+            frame.destroy();
+        }
+        self.state.failed = false;
+        let (format, width, height) = self.state.offer.context("合成器没有说明 dma-buf")?;
+        let handle = self.queue.handle();
+        let mut buffers = Vec::with_capacity(2);
+        let mut wl = Vec::with_capacity(2);
+        for _ in 0..2 {
+            let buffer = std::sync::Arc::new(super::dmabuf::Buffer::allocate_format(
+                width, height, format,
+            )?);
+            wl.push(buffer.wrap(&dmabuf, &handle));
+            buffers.push(buffer);
+        }
+        let [b0, b1] = <[_; 2]>::try_from(buffers).ok().context("缓冲数量不对")?;
+        let [w0, w1] = <[_; 2]>::try_from(wl).ok().context("缓冲数量不对")?;
+        self.target = Some(Hardware {
+            buffers: [b0, b1],
+            wl: [w0, w1],
+            pending: 0,
+        });
+        Ok(true)
     }
 
     /// Starts one frame; the frame object is single-use, so every copy needs a
@@ -303,7 +471,7 @@ impl Grab {
 /// in it lying down. The mapping is `wl_output`'s own, read as "the framebuffer
 /// pixel this picture pixel is", and `Normal` — the one case that needs no work
 /// — passes the rows straight through.
-fn orient(source: Vec<u8>, width: u32, height: u32, transform: Transform) -> (Vec<u8>, u32, u32) {
+pub(super) fn orient(source: Vec<u8>, width: u32, height: u32, transform: Transform) -> (Vec<u8>, u32, u32) {
     if transform == Transform::Normal {
         return (source, width, height);
     }
@@ -506,8 +674,12 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for State {
             }
             // 这一版的协议只说格式和尺寸，不说 modifier：合成器把缓冲导入进来
             // 会用我们自己声明的那一个，所以线性排布是可以直接试的。
-            zwlr_screencopy_frame_v1::Event::LinuxDmabuf { format, .. } => {
-                state.offer = Some((format, 0));
+            zwlr_screencopy_frame_v1::Event::LinuxDmabuf {
+                format,
+                width,
+                height,
+            } => {
+                state.offer = Some((format, width, height));
             }
             zwlr_screencopy_frame_v1::Event::Ready { .. } => state.ready = true,
             zwlr_screencopy_frame_v1::Event::Failed => state.failed = true,
@@ -528,6 +700,12 @@ impl State {
     /// Points the compositor at the shared buffer for this frame, allocating it
     /// on the first frame and whenever the output's shape changes.
     fn copy(&mut self, handle: &QueueHandle<Self>) -> Result<()> {
+        if let Some(target) = self.dmabuf_target.clone() {
+            if let Some(frame) = &self.frame {
+                frame.copy_with_damage(&target);
+            }
+            return Ok(());
+        }
         let (format, width, height, stride) = self.wanted.context("帧没有说明缓冲格式")?;
         ensure!(width > 0 && height > 0 && stride > 0, "帧的缓冲尺寸无效");
         let stale = self
@@ -714,7 +892,9 @@ pub(crate) mod dmabuf_tests {
     /// 返回缓冲与仍然活着的 `Grab`（帧对象挂在它上面，别提前丢）。
     pub(crate) fn capture_into_dmabuf(screen: &Screen) -> Result<Buffer, anyhow::Error> {
         let mut grab = Grab::open(screen, false)?;
-        let size = grab.state.outputs[grab.output].size();
+        // 合成器要的是它自己画布的尺寸，不是这块屏「看到」的尺寸：竖屏的输出
+        // 画布是横的，尺寸报错就会被判成 invalid dmabuf parameters。
+        let size = grab.state.outputs[grab.output].mode;
         let Some(dmabuf) = grab.state.dmabuf.clone() else {
             bail!("合成器没有 zwp_linux_dmabuf_v1");
         };
@@ -734,7 +914,7 @@ pub(crate) mod dmabuf_tests {
         let format = grab
             .state
             .offer
-            .map(|(format, _)| format)
+            .map(|(format, _, _)| format)
             .unwrap_or(crate::platform::linux::capture::dmabuf::ARGB8888);
         let buffer = Buffer::allocate_format(size.0, size.1, format)?;
         let wl = buffer.wrap(&dmabuf, &handle);
@@ -759,26 +939,76 @@ pub(crate) mod dmabuf_tests {
     fn copies_into_a_dmabuf() {
         let screens = super::super::screens().unwrap();
         let wanted = std::env::var("OPENUUYC_PROBE_OUTPUT").unwrap_or_default();
-        let screen = screens
-            .iter()
-            .find(|screen| screen.device_name == wanted)
-            .unwrap_or(&screens[0])
-            .clone();
-        let buffer = capture_into_dmabuf(&screen).expect("采集到 dma-buf 失败");
-        println!(
-            "输出 {:?} 缓冲 {}x{} 行距 {} 尺寸 {} 格式 {:#x} modifier {:#x} ready={}",
-            (screen.width, screen.height),
-            buffer.width,
-            buffer.height,
-            buffer.stride,
-            buffer.size,
-            buffer.format,
-            buffer.modifier,
-            0
-        );
-        let pixels = buffer.read_back().expect("读回显存缓冲失败");
-        std::fs::write("/tmp/openuuyc-dmabuf.bgra", &pixels).unwrap();
-        println!("已写出 /tmp/openuuyc-dmabuf.bgra（{} 字节）", pixels.len());
+        for screen in &screens {
+            if !wanted.is_empty() && screen.device_name != wanted {
+                continue;
+            }
+            let buffer = capture_into_dmabuf(screen).expect("采集到 dma-buf 失败");
+            println!(
+                "{} 输出 {:?} 缓冲 {}x{} 行距 {} 尺寸 {} 格式 {:#x}",
+                screen.device_name,
+                (screen.width, screen.height),
+                buffer.width,
+                buffer.height,
+                buffer.stride,
+                buffer.size,
+                buffer.format,
+            );
+            let pixels = buffer.read_back().expect("读回显存缓冲失败");
+            let name = format!("/tmp/openuuyc-dmabuf-{}.bgra", screen.device_name);
+            std::fs::write(&name, &pixels).unwrap();
+            println!("  已写出 {name}（{} 字节）", pixels.len());
+        }
+    }
+
+    /// dma-buf 那条路和共享内存那条路画出来的画面要一致，包括旋转。旋转的屏上
+    /// 合成器给的缓冲尺寸和「屏幕看到的尺寸」是两回事，回到 CPU 比对才看得出来。
+    /// `OPENUUYC_PROBE_OUTPUT=DP-3 cargo test --release --lib -- --ignored compares_dmabuf_with_shm --nocapture`
+    #[test]
+    #[ignore]
+    fn compares_dmabuf_with_shm() {
+        let screens = super::super::screens().unwrap();
+        let wanted = std::env::var("OPENUUYC_PROBE_OUTPUT").unwrap_or_default();
+        for screen in &screens {
+            if !wanted.is_empty() && screen.device_name != wanted {
+                continue;
+            }
+            let mut grab = Grab::open(screen, false).unwrap();
+            let transform = grab.state.outputs[grab.output].transform;
+            let mode = grab.state.outputs[grab.output].mode;
+            let mut picture = None;
+            for _ in 0..20 {
+                if let Some(captured) = grab.next(std::time::Duration::from_millis(500)).unwrap() {
+                    picture = Some(captured);
+                    break;
+                }
+            }
+            let picture = picture.expect("共享内存那条路没有采到画面");
+            println!(
+                "{} mode={mode:?} transform={transform:?} 共享内存 {}x{}",
+                screen.device_name, picture.width, picture.height
+            );
+            std::fs::write(
+                format!("/tmp/openuuyc-shm-{}.bgra", screen.device_name),
+                &picture.pixels,
+            )
+            .unwrap();
+            let buffer = capture_into_dmabuf(screen).expect("采集到 dma-buf 失败");
+            println!("  dma-buf {}x{}", buffer.width, buffer.height);
+            let raw = buffer.read_back().unwrap();
+            // dma-buf 里是合成器的原始画布：先按输出自己的尺寸裁掉行距，再解旋转。
+            let mut tight = Vec::with_capacity(buffer.width as usize * buffer.height as usize * 4);
+            for line in raw.chunks_exact(buffer.stride as usize).take(buffer.height as usize) {
+                tight.extend_from_slice(&line[..buffer.width as usize * 4]);
+            }
+            let (pixels, width, height) = orient(tight, buffer.width, buffer.height, transform);
+            println!("  解旋转后 {width}x{height}");
+            std::fs::write(
+                format!("/tmp/openuuyc-dmabuf-{}.bgra", screen.device_name),
+                &pixels,
+            )
+            .unwrap();
+        }
     }
 }
 
