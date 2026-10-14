@@ -115,3 +115,79 @@ fn apply_list_modification(
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rps(before: &[usize], after: &[usize], lt: &[usize]) -> ResolvedRps {
+        ResolvedRps {
+            st_curr_before: before.iter().copied().map(Some).collect(),
+            st_curr_after: after.iter().copied().map(Some).collect(),
+            lt_curr: lt.iter().copied().map(Some).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn p_slice_list0_is_cur_before_then_after() {
+        let params = RefPicListParams {
+            num_ref_idx_l0_active_minus1: 2,
+            num_pic_total_curr: 3,
+            ..Default::default()
+        };
+        let lists = build_ref_pic_lists(&rps(&[1, 2], &[3], &[]), &params);
+        assert_eq!(lists.list0, vec![Some(1), Some(2), Some(3)]);
+        assert_eq!(lists.list1, None);
+    }
+
+    #[test]
+    fn short_rps_cycles_until_the_active_count_is_filled() {
+        // 公式 8-8：活动参考数比 NumPicTotalCurr 大时从头循环取用。
+        let params = RefPicListParams {
+            num_ref_idx_l0_active_minus1: 3,
+            num_pic_total_curr: 2,
+            ..Default::default()
+        };
+        let lists = build_ref_pic_lists(&rps(&[1], &[2], &[]), &params);
+        assert_eq!(lists.list0, vec![Some(1), Some(2), Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn b_slice_list1_puts_the_following_pictures_first() {
+        // 公式 8-10：RefPicListTemp1 是 Cur 之后、Cur 之前、长期，长期垫尾。
+        let params = RefPicListParams {
+            num_ref_idx_l0_active_minus1: 1,
+            num_ref_idx_l1_active_minus1: 2,
+            num_pic_total_curr: 3,
+            is_b: true,
+            ..Default::default()
+        };
+        let lists = build_ref_pic_lists(&rps(&[1], &[2], &[3]), &params);
+        assert_eq!(lists.list0, vec![Some(1), Some(2)]);
+        assert_eq!(lists.list1, Some(vec![Some(2), Some(1), Some(3)]));
+    }
+
+    #[test]
+    fn list_entry_modification_reorders_ref_pic_list0() {
+        let entries = [2u32, 0, 1];
+        let params = RefPicListParams {
+            num_ref_idx_l0_active_minus1: 2,
+            num_pic_total_curr: 3,
+            list_entry_l0: Some(&entries),
+            ..Default::default()
+        };
+        let lists = build_ref_pic_lists(&rps(&[1], &[2], &[3]), &params);
+        assert_eq!(lists.list0, vec![Some(3), Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn empty_rps_keeps_the_slots_empty() {
+        let params = RefPicListParams {
+            num_ref_idx_l0_active_minus1: 2,
+            ..Default::default()
+        };
+        let lists = build_ref_pic_lists(&ResolvedRps::default(), &params);
+        assert_eq!(lists.list0, vec![None, None, None]);
+    }
+}
