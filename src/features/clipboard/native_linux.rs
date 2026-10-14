@@ -954,14 +954,18 @@ fn accept_files(state: &mut State, session: &Arc<Inner>, epoch: u64) -> Result<(
     };
     let mount = super::fuse::Mount::new(&parent, super::fuse::generation(), tree, reader)?;
     let paths = mount.paths();
-    // 每次远端复制都会走到这里，而且只此一次：这条是「主控复制的那份到底有没有
-    // 落到本地剪贴板上」唯一的直接证据，所以留在 info。
+    write_files(state, &paths)?;
+    // 每次远端复制都走到这里，而且只此一次。这条把两个关键事实分开记：「清单里是
+    // 什么名字」说明远端给的目录是不是新那一份，「发布到了哪里」说明本地剪贴板有
+    // 没有跟着换过去。两件事坏掉的样子完全不同（内容还是旧的 / 粘贴根本不动），
+    // 光看现象分不出来。
     tracing::info!(
         files = descriptors.len(),
-        root = %mount.root().display(),
+        first = %descriptors[0].file_name,
+        size = descriptors[0].file_size,
+        published = %paths.first().map(|path| path.display().to_string()).unwrap_or_default(),
         "已挂载远端剪贴板文件"
     );
-    write_files(state, &paths)?;
     // Held until the next copy replaces it: the clipboard still points here,
     // and the paste may be minutes away.
     state.mounted = Some(mount);
