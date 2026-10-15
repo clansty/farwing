@@ -166,6 +166,12 @@ impl Session {
     }
 
     /// The shared monitor that is `screen`, matched by its desktop rectangle.
+    ///
+    /// 门户报的是**合成器布局里的矩形**（xdg_output 的逻辑位置与尺寸）：分数缩放
+    /// 下它与屏幕自己的像素矩形差一个缩放（5120x2160 的屏、1.35 缩放，门户报的
+    /// 是 3792x1600），拿像素矩形去比永远对不上，采集会直接打不开。所以先按像素
+    /// 矩形比（缩放为 1 的会话与 X11 就是这种），对不上再借合成器布局把门户的
+    /// 矩形翻成输出名、按名字认屏。
     fn source(&self, screen: &Screen) -> Result<&Source> {
         let rectangle = (
             (screen.left, screen.top),
@@ -178,11 +184,61 @@ impl Session {
         {
             return Ok(source);
         }
+        if let Some(source) = self.source_by_output_name(screen) {
+            return Ok(source);
+        }
+        if let Some(source) = self.source_by_geometry(screen) {
+            return Ok(source);
+        }
         match self.sources.as_slice() {
             // A single shared monitor without geometry can only be this one.
             [only] if only.position.is_none() => Ok(only),
             _ => bail!("所选显示器不在本机授权共享的屏幕中"),
         }
+    }
+
+    /// 按「同一个逻辑位置 + 同一宽高比」认屏。
+    ///
+    /// 门户报的是合成器布局里的矩形，而屏幕的 `left`/`top` 也正是那个空间里的
+    /// （XWayland 按输出自己的像素给尺寸、却按合成器的逻辑位置摆放），所以位置
+    /// 可以直接比。尺寸则差一个该输出的缩放（转过 90° 的屏还多一次旋转），用宽高
+    /// 比来认：缩放是等比缩放，旋转只是把宽高对调。
+    fn source_by_geometry(&self, screen: &Screen) -> Option<&Source> {
+        if screen.width == 0 || screen.height == 0 {
+            return None;
+        }
+        self.sources.iter().find(|source| {
+            let (Some((left, top)), Some((width, height))) = (source.position, source.size) else {
+                return false;
+            };
+            if (left, top) != (screen.left, screen.top) || width <= 0 || height <= 0 {
+                return false;
+            }
+            let portal = f64::from(width) / f64::from(height);
+            let straight = f64::from(screen.width) / f64::from(screen.height);
+            (portal - straight).abs() < 0.01 || (portal - 1.0 / straight).abs() < 0.01
+        })
+    }
+
+    /// 把门户报的矩形翻成输出名，再按名字认屏。
+    ///
+    /// 合成器布局里的矩形用的就是 `xdg_output` 的逻辑位置与尺寸，与门户报的是同
+    /// 一套坐标；而输出名（`wl_output` 的 name）与这边屏幕的 `device_name`
+    /// （RandR 的连接器名）是同一个字符串。
+    fn source_by_output_name(&self, screen: &Screen) -> Option<&Source> {
+        let layout = crate::platform::display::compositor_layout()?;
+        self.sources.iter().find(|source| {
+            let (Some((left, top)), Some((width, height))) = (source.position, source.size) else {
+                return false;
+            };
+            layout.outputs.iter().any(|output| {
+                output.name.as_deref() == Some(screen.device_name.as_str())
+                    && output.left == left
+                    && output.top == top
+                    && output.width as i32 == width
+                    && output.height as i32 == height
+            })
+        })
     }
 }
 
