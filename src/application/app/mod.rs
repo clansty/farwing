@@ -181,7 +181,6 @@ struct DeviceCenterApp {
     presence: PresenceState,
     host: Option<crate::features::host::Handle>,
     /// 登录自启（Linux 的 systemd 用户单元）的界面状态，见 `view::host_settings`。
-    #[cfg(target_os = "linux")]
     notifications: notifications::Center,
     status: StatusMessage,
     refreshed_at: Option<Instant>,
@@ -238,7 +237,6 @@ impl DeviceCenterApp {
             media,
             media_inventory: media_preferences::Inventory::new(),
             presence: PresenceState::Connecting,
-            #[cfg(target_os = "linux")]
             host: None,
             notifications: notifications::Center::new(ctx),
             status: display_warning.map_or_else(
