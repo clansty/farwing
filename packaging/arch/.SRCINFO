@@ -1,9 +1,9 @@
-pkgbase = openuuyc-git
+pkgbase = openuuyc-clansty
 	pkgdesc = UU 远程（UU Remote）协议的第三方 Rust 客户端：远控别人，或被本机远控
-	pkgver = 1.0.0
+	pkgver = 1.0.2.beta.3.clansty
 	pkgrel = 1
 	url = https://github.com/clansty/farwing
-	install = openuuyc-git.install
+	install = openuuyc-clansty.install
 	arch = x86_64
 	license = LicenseRef-OpenUUYC
 	makedepends = clang
@@ -37,8 +37,12 @@ pkgbase = openuuyc-git
 	optdepends = ethtool: 远程开机时检查网卡的魔术包唤醒状态
 	optdepends = hwdata: 用 pci.ids 给上报的显卡取名（/usr/share/hwdata/pci.ids）
 	optdepends = gnome-shell-extension-appindicator: GNOME 下显示托盘图标（KDE/Xfce 等自带托盘）
-	provides = openuuyc=1.0.0
+	provides = openuuyc=1.0.2.beta.3.clansty
 	conflicts = openuuyc
+	conflicts = openuuyc-bin
+	conflicts = openuuyc-git
 	options = !lto
+	source = openuuyc-clansty::git+https://github.com/clansty/farwing.git#branch=clansty
+	sha256sums = SKIP
 
-pkgname = openuuyc-git
+pkgname = openuuyc-clansty

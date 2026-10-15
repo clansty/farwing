@@ -1,6 +1,6 @@
 # Maintainer: Clansty <i@clansty.com>
 #
-# OpenUUYC 的 -git 包，默认跟随 GitHub 上 clansty 开发分支。
+# OpenUUYC 的 Arch 包（openuuyc-clansty），默认跟随 GitHub 上 clansty 开发分支。
 #
 # 从远程分支构建：
 #   cd packaging/arch && makepkg -f
@@ -12,8 +12,10 @@
 # 而 pkg/ 被 makepkg 设成 0111，摆在仓库里会让 cargo 扫描包目录时报
 # "Permission denied (os error 13)"，把整个构建打断。
 
+# 能力名。上游 DoyoDia/openuuyc-linux 的 AUR 包（openuuyc-bin / openuuyc-git）装的
+# 是同一套文件，和本包不能共存，因此三者 provides 同一个名字、再互相 conflicts。
 _pkgname=openuuyc
-pkgname=$_pkgname-git
+pkgname=$_pkgname-clansty
 # 基准版本来自 Cargo.toml 的 [package].version，pkgver() 会再读一次并追加 .r<rev>.g<hash>。
 # 版本号里的 `-`（-clansty 这种预发布后缀）要换成 `.`：pacman 的 pkgver 里不能有连字符。
 pkgver=1.0.2.beta.3.clansty
@@ -50,7 +52,7 @@ depends=(
 makedepends=(
   'clang'    # libclang：ffmpeg-sys-next 与 vendored cros-libva 用 bindgen 生成绑定
   'cmake'    # opusic-sys 用 cmake 从源码构建 libopus
-  'git'      # VCS 源（openuuyc-git 的 source 是 git+https）
+  'git'      # VCS 源（$pkgname 的 source 是 git+https）
   'nasm'     # AV1 软解与 H.264 的 x86 SIMD 汇编（nasm-rs）
   'pkgconf'  # alsa-sys / cros-libva / ffmpeg-sys-next / khronos-egl / wayland-sys / x11-dl 都靠它找库
   'rust'     # 同时提供 cargo（repo 里没有单独的 cargo 包）
@@ -70,8 +72,12 @@ optdepends=(
   'gnome-shell-extension-appindicator: GNOME 下显示托盘图标（KDE/Xfce 等自带托盘）'
 )
 
+# 带上版本是为了让「依赖 openuuyc>=x」的包能对上；不带也不影响互斥。
 provides=("$_pkgname=$pkgver")
-conflicts=("$_pkgname")
+# 自己的 provides 名也列进 conflicts：pacman 只拿 conflicts 去比对「别的」包，
+# 所以这不会自冲突，却正好把上游那两个 provides openuuyc 的包一并挡掉。
+# 显式点名是因为它们有可能被改得不 provides 这个名字（pacman -Si 也看得更明白）。
+conflicts=("$_pkgname" "${_pkgname}-bin" "${_pkgname}-git")
 install="$pkgname.install"
 # 关闭 makepkg 的 LTO：Cargo.toml 的 release profile 已经调好 lto/codegen-units，
 # 混入 makepkg 的 -flto 只会让 NetEq 的 C++ 对象与 rustc 链接参数打起来。
@@ -130,7 +136,7 @@ package() {
   install -Dm644 assets/icon-256.png \
     "$pkgdir/usr/share/icons/hicolor/256x256/apps/openuuyc.png"
 
-  # 被控端键鼠经 /dev/uinput 注入，规则本身只做 uaccess 授权（见 openuuyc-git.install）。
+  # 被控端键鼠经 /dev/uinput 注入，规则本身只做 uaccess 授权（见 openuuyc-clansty.install）。
   install -Dm644 packaging/linux/70-openuuyc-uinput.rules \
     "$pkgdir/usr/lib/udev/rules.d/70-openuuyc-uinput.rules"
 
@@ -140,7 +146,7 @@ package() {
     "$pkgdir/usr/lib/systemd/user/openuuyc.service"
 
   # 虚拟显示器辅助程序：凭空多一块显示器要写 configfs，只有 root 能写，所以它是个
-  # 独立的系统服务，平时不跑，第一次用到时由套接字拉起（见 openuuyc-git.install）。
+  # 独立的系统服务，平时不跑，第一次用到时由套接字拉起（见 openuuyc-clansty.install）。
   install -Dm755 "$target_dir/release/openuuyc-vkms" \
     "$pkgdir/usr/bin/openuuyc-vkms"
   install -Dm644 packaging/linux/openuuyc-vkms.socket \

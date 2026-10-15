@@ -132,6 +132,11 @@ sudo apt install ./target/debian/openuuyc_*.deb
 ./packaging/arch/build.sh -i    # 顺手 sudo pacman -U 装上
 ```
 
+包名是 `openuuyc-clansty`：它 provides `openuuyc`，并与上游
+[DoyoDia/openuuyc-linux](https://github.com/DoyoDia/openuuyc-linux) 的 AUR 包
+`openuuyc-bin` / `openuuyc-git` 互相 conflicts——三者装的是同一套文件，装重了会互相顶掉，
+所以装本包前要先卸掉那两个（反过来也一样）。
+
 需要 `base-devel`；选项与环境变量见 `./packaging/arch/build.sh --help`。
 
 安装后从应用菜单启动，或运行 `OpenUUYC`。

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 从当前工作树一键打出 openuuyc-git 的 Arch 包（.pkg.tar.zst）。
+# 从当前工作树一键打出 openuuyc-clansty 的 Arch 包（.pkg.tar.zst）。
 #
 # 干的事就是替你把 PKGBUILD 需要的环境变量摆好再调 makepkg：源码直接用工作树
 # （不 clone、不重新拉依赖），默认复用工作树的 target/ 增量编译。
@@ -100,7 +100,7 @@ makepkg --force "${makepkg_flags[@]}"
 
 # 产物名里的 .r<提交数>.g<hash> 要等 makepkg 建好 $srcdir 才对得出 pkgver()，
 # 所以事前算不准，直接取刚写进去的那个（mtime 最新）。
-pkg="$(ls -t "$PKGDEST"/openuuyc-git-*.pkg.tar.zst 2>/dev/null | head -n1 || true)"
+pkg="$(ls -t "$PKGDEST"/openuuyc-clansty-*.pkg.tar.zst 2>/dev/null | head -n1 || true)"
 [[ -n $pkg && -f $pkg ]] || die "makepkg 跑完了，却没在 ${PKGDEST} 里找到包"
 
 # makepkg 会把 pkgver() 算出的版本写回 PKGBUILD（VCS 源的既定行为，--holdver 也拦不住），
