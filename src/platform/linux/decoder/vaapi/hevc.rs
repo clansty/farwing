@@ -29,6 +29,7 @@ use openuuyc_codec::syntax::hevc::{
 use super::avc::Frame;
 use super::display::{self, Pool};
 use super::hevc_ref_list::{RefPicListParams, ResolvedRps, build_ref_pic_lists};
+use super::output;
 use crate::media::decode_api::DecodeError;
 
 const PICTURE_INVALID: u32 = cros_libva::VA_PICTURE_HEVC_INVALID;
@@ -229,9 +230,16 @@ impl Hevc {
         {
             return Err(DecodeError::InvalidInput);
         }
-        let visible_w = width - crop_unit * (crop.left_offset + crop.right_offset);
-        let visible_h = height - crop_unit * (crop.top_offset + crop.bottom_offset);
-        if visible_w == 0 || visible_h == 0 {
+        // 与 avc 一致：4:2:0 的 CropUnit 两个方向都是 2，换算成像素后再减；
+        // 并且保留左边/上边的原点，只减宽高不还原点的话，画面会从 coded 原点
+        // 而不是可见原点起读。
+        let visible = output::VisibleRect {
+            x: crop.left_offset * crop_unit,
+            y: crop.top_offset * crop_unit,
+            width: width - crop_unit * (crop.left_offset + crop.right_offset),
+            height: height - crop_unit * (crop.top_offset + crop.bottom_offset),
+        };
+        if visible.width == 0 || visible.height == 0 {
             return Err(DecodeError::InvalidInput);
         }
         let capacity = s.sub_layer_ordering_info[s.max_sub_layers_minus1 as usize]
@@ -413,7 +421,7 @@ impl Hevc {
             self.timestamp,
             pool.nv12,
             (pool.width, pool.height),
-            (visible_w, visible_h),
+            visible,
         );
         let (frame, surface) = match decoded {
             Ok(decoded) => decoded,
@@ -1005,7 +1013,7 @@ fn submit_hevc(
     timestamp: u64,
     format: cros_libva::VAImageFormat,
     coded: (u32, u32),
-    visible: (u32, u32),
+    visible: output::VisibleRect,
 ) -> Result<(Frame, Surface), DecodeError> {
     let backend = |stage: &'static str| {
         move |error: cros_libva::VaError| {
@@ -1030,11 +1038,13 @@ fn submit_hevc(
     let picture = picture
         .sync()
         .map_err(|(error, _)| backend("sync")(error))?;
-    let (width, height) = visible;
+    // 读回整幅 coded surface，裁剪交给 pack_nv12 按原点取，这样左边/上边的
+    // 裁剪也能还原；vaCreateImage 表达不了原点。
+    let output::VisibleRect { width, height, .. } = visible;
     let frame = picture
-        .create_image(format, coded, visible)
+        .create_image(format, coded, coded)
         .map_err(backend("create_image"))
-        .and_then(|image| super::output::pack_nv12(&image, width, height))?;
+        .and_then(|image| output::pack_nv12(&image, visible))?;
     let surface = picture
         .take_surface()
         .unwrap_or_else(|_| unreachable!("the picture owns its surface alone"));
