@@ -25,7 +25,14 @@
 //! On a Wayland session that gap is closed by `zwp_virtual_keyboard_v1`
 //! (`virtual_keyboard`), which carries a keymap of our own making. This table
 //! stays as the fallback for sessions whose compositor does not serve it.
-use super::{Lock, Touch, evdev, virtual_keyboard};
+//!
+//! That protocol has a blind spot of its own: the keymap it carries means
+//! nothing to an X client (XWayland), which resolves key codes against the X
+//! server's keymap — the text arrives as whatever that map makes of those
+//! codes, the first character as Escape. Text for a focused X client goes
+//! through X Test instead, which is the one reason this backend keeps an X
+//! connection.
+use super::{Lock, Touch, evdev, virtual_keyboard, xtest};
 use crate::platform::Rotation;
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::{BTreeMap, BTreeSet};
@@ -714,6 +721,9 @@ pub(super) struct Injector {
     leds: u32,
     /// Text with a keymap of our own, where the compositor offers it.
     virtual_keyboard: Option<virtual_keyboard::Keyboard>,
+    /// 前台是 XWayland 客户端时的文字输入，见 [`Self::x_client_focused`]。
+    /// 没有 XWayland（纯 Wayland 会话、或 X 在别处）就是 None。
+    xtest: Option<xtest::Injector>,
     /// 多点触摸屏，拿不到就没有：触摸退回单指模拟。
     touchscreen: Option<Touchscreen>,
 }
@@ -784,6 +794,18 @@ impl Injector {
                 None
             }
         };
+        // XTest 在这里只为一件合成器做不到的事留着：把文字送进 XWayland 客户端
+        // （虚拟键盘自带的 keymap 对它没用，见 `x_client_focused`）。
+        //
+        // 只认本地 Wayland 会话的那台 XWayland。真正的 Xorg 没有 `XWAYLAND` 扩展，
+        // 用不到它；DISPLAY 指到别处时连都不连，见 `local_display`。
+        let xtest = if local_display() {
+            xtest::Injector::open()
+                .ok()
+                .filter(|injector| injector.is_xwayland().unwrap_or(false))
+        } else {
+            None
+        };
         Ok(Self {
             keyboard,
             relative,
@@ -791,6 +813,7 @@ impl Injector {
             position: (0, 0),
             leds: 0,
             virtual_keyboard,
+            xtest,
             touchscreen,
         })
     }
@@ -959,10 +982,12 @@ impl Injector {
     /// duration — a held Ctrl would otherwise turn every character into a
     /// control code.
     ///
-    /// Two mappings can do it. The virtual keyboard carries a keymap of our
-    /// own, so any character goes through; the local layout is the fallback,
-    /// and can only produce what that layout has. A Windows line break (CR LF)
-    /// is one Enter either way.
+    /// Three mappings can do it, picked by who has focus (see
+    /// [`Self::type_text`]): the virtual keyboard carries a keymap of our own,
+    /// so any character goes through; X Test reaches an X client, which that
+    /// keymap never would; the local layout is the fallback, and can only
+    /// produce what that layout has. A Windows line break (CR LF) is one Enter
+    /// either way.
     pub(super) fn text(
         &mut self,
         text: &str,
@@ -970,25 +995,58 @@ impl Injector {
         permitted: impl Fn() -> bool,
     ) -> Result<()> {
         let lifted = self.lift(held)?;
-        let typed = self
-            .virtual_keyboard
-            .as_mut()
-            .map(|keyboard| keyboard.text(text, &permitted));
-        let result = match typed {
-            Some(Ok(())) => Ok(()),
-            other => {
-                if let Some(Err(error)) = other {
-                    // Half a text may already be through; typing it again from
-                    // the top beats dropping the rest of it.
-                    tracing::warn!(%error, "虚拟键盘输入失败，改用本地布局");
-                }
-                self.type_locally(text, &permitted)
-            }
-        };
+        let result = self.type_text(text, &permitted);
         for code in lifted {
             let _ = self.keyboard.send(&[(EV_KEY, code, 1)]);
         }
         result
+    }
+
+    /// 按前台窗口是谁来选一条打字的路。
+    ///
+    /// 虚拟键盘自带的那份 keymap 只在合成器内部生效；前台是 X 客户端时，X 按自己
+    /// 的键位表解 keycode，会打出一串乱码（第一个字符还常常变成 Esc），这种情况
+    /// 交给 XTest。前台是原生 Wayland 客户端（或没有 X）时才用虚拟键盘。
+    fn type_text(&mut self, text: &str, permitted: &impl Fn() -> bool) -> Result<()> {
+        if self.x_client_focused() {
+            // 前台是 X 客户端，虚拟键盘对它无效；没有 XTest 时只剩本地布局。
+            if let Some(xtest) = &self.xtest {
+                return xtest.text(text, permitted);
+            }
+        } else {
+            let typed = self
+                .virtual_keyboard
+                .as_mut()
+                .map(|keyboard| keyboard.text(text, permitted));
+            match typed {
+                Some(Ok(())) => return Ok(()),
+                other => {
+                    if let Some(Err(error)) = other {
+                        // Half a text may already be through; typing it again
+                        // from the top beats dropping the rest of it.
+                        tracing::warn!(%error, "虚拟键盘输入失败，改用本地布局");
+                    }
+                }
+            }
+        }
+        self.type_locally(text, permitted)
+    }
+
+    /// 前台窗口是不是跑在 XWayland 里（也就是一个 X 客户端）。
+    ///
+    /// 虚拟键盘自带的那份 keymap 只在合成器内部生效，X 客户端拿自己那份键位表解
+    /// keycode，于是打出来是乱码（第一个字符就变成 Esc）。XWayland 在前台是原生
+    /// Wayland 窗口时，把自己的输入焦点设成 `None`（或者 `PointerRoot`），有 X
+    /// 窗口拿到焦点时才是那块窗口——问一次 X 就够，不必依赖某个合成器的 IPC
+    /// （niri、sway 都没有 Hyprland 那套）。
+    ///
+    /// 问不出来时按原生客户端处理。本机的 X 连接上这个查询不会平白失败，失败只
+    /// 说明连接已经没了（XWayland 崩溃或重启），那时 XTest 也够不着任何 X 客户端，
+    /// 退回设备这条路反而能让原生窗口继续打字，而不是次次都报错。
+    fn x_client_focused(&self) -> bool {
+        self.xtest
+            .as_ref()
+            .is_some_and(|xtest| xtest.x_client_focused().unwrap_or(false))
     }
 
     /// Releases the keys the controller still holds, and reports them so they
@@ -1074,6 +1132,15 @@ fn led_bit(lock: Lock) -> u32 {
         Lock::Num => LED_NUML,
         Lock::Scroll => LED_SCROLLL,
     }
+}
+
+/// `DISPLAY` 指的是本机的 X 服务器（Unix socket）才去连它。
+///
+/// `x11rb::connect` 走 TCP 时没有超时，一个连不上的远端 DISPLAY（ssh 转发那种）
+/// 会把输入引擎的启动卡住两分钟；XWayland 一定在本机。
+fn local_display() -> bool {
+    std::env::var("DISPLAY")
+        .is_ok_and(|display| matches!(display.split(':').next(), Some("") | Some("unix")))
 }
 
 /// Whether the layout the compositor will read these codes with is the US one.

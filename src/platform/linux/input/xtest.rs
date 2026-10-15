@@ -21,6 +21,10 @@ const MOTION_NOTIFY: u8 = 6;
 const NO_SYMBOL: Keysym = 0;
 /// The pause after each typed character.
 const TEXT_PACE: Duration = Duration::from_millis(3);
+/// XWayland 注册的扩展名，用来认出这台 X 是不是本地 Wayland 会话的那一份。
+const XWAYLAND: &[u8] = b"XWAYLAND";
+/// `XCB_POINTER_ROOT`：焦点跟着指针时 X 报的这个值，它不是某一块窗口。
+const POINTER_ROOT: u32 = 1;
 
 pub(super) struct Injector {
     connection: RustConnection,
@@ -52,6 +56,24 @@ impl Injector {
             min_keycode,
             max_keycode,
         })
+    }
+
+    /// 这台 X 服务器是不是随本地 Wayland 会话跑的 XWayland。
+    ///
+    /// XWayland 注册了同名扩展；真正的 Xorg、以及 ssh 转发来的远端 X 都没有。
+    /// 用它确认这台 X 和本地合成器属于同一套会话，才不会把文字发到别处的 X 上。
+    pub(super) fn is_xwayland(&self) -> Result<bool> {
+        Ok(self.connection.query_extension(XWAYLAND)?.reply()?.present)
+    }
+
+    /// 焦点现在是不是落在某个 X 客户端上。
+    ///
+    /// XWayland 在前台是原生 Wayland 窗口时，把自己的输入焦点设成 `None`（有时
+    /// 是 `PointerRoot`）；有 X 窗口拿到焦点时才是那块窗口。所以问一次 X 就能分清
+    /// 前台属于谁，不必依赖某个合成器的 IPC。
+    pub(super) fn x_client_focused(&self) -> Result<bool> {
+        let focus = self.connection.get_input_focus()?.reply()?.focus;
+        Ok(focus != x11rb::NONE && focus != POINTER_ROOT)
     }
 
     fn fake(&self, kind: u8, detail: u8, x: i16, y: i16) -> Result<()> {
