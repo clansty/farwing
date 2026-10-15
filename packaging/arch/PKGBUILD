@@ -5,18 +5,12 @@
 # 从远程分支构建：
 #   cd packaging/arch && makepkg -f
 #
-# 从本地工作树构建（开发时推荐：直接在工作树上 cargo build，不拷贝源码、不重新拉依赖）：
-#   mkdir -p /tmp/openuuyc-arch /tmp/openuuyc-target
-#   BUILDDIR=/tmp/openuuyc-arch \
-#   CARGO_TARGET_DIR=/tmp/openuuyc-target \
-#   OPENUUYC_LOCAL_SRC=/home/clansty/Projects/thirdparty/farwing \
-#   makepkg -f
-#
-# 本地构建时 BUILDDIR 必须指向仓库之外：makepkg 会在其中建 src/ 与 pkg/，
+# 从本地工作树构建（开发时推荐：直接在工作树上增量编译，不拷贝源码、不重新拉依赖）：
+#   ./packaging/arch/build.sh
+# OPENUUYC_LOCAL_SRC / BUILDDIR / CARGO_TARGET_DIR / PKGDEST 由那个脚本摆好，见其 --help。
+# 手动调用时留意 BUILDDIR 必须在仓库之外：makepkg 会在其中建 src/ 与 pkg/，
 # 而 pkg/ 被 makepkg 设成 0111，摆在仓库里会让 cargo 扫描包目录时报
 # "Permission denied (os error 13)"，把整个构建打断。
-# CARGO_TARGET_DIR 另指一处，是为了不和主仓库里正在跑的 cargo 抢 target/ 的锁；
-# 不设就复用工作树自己的 target/，那样更快，但会和别的 cargo 构建互相阻塞。
 
 _pkgname=openuuyc
 pkgname=$_pkgname-git

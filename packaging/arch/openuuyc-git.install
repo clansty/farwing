@@ -25,8 +25,7 @@ NOTE
 # 时才由套接字拉起。装完不开启也一切照旧，只是诊断页里那一行会显示「服务未启用」。
 _openuuyc_virtual_display_note() {
   cat <<'NOTE'
-被控端给主控添加虚拟显示器，需要一个小程序以 root 身份去建内核的 VKMS 输出
-（凭空多一块显示器只能这么来：/sys/kernel/config/vkms 只允许 root 写）。
+被控端给主控添加虚拟显示器，需要一个小程序以 root 身份去建内核的 VKMS 输出。
 它由套接字按需启动，不会常驻。用它开启：
     sudo systemctl enable --now openuuyc-vkms.socket
 

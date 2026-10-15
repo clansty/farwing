@@ -125,6 +125,15 @@ cargo deb --no-build
 sudo apt install ./target/debian/openuuyc_*.deb
 ```
 
+打包为 Arch 包（`packaging/arch/PKGBUILD`，用 makepkg 从当前工作树增量编译，不重新拉依赖）：
+
+```bash
+./packaging/arch/build.sh       # 产物在 target/arch/，附一个 .sha256
+./packaging/arch/build.sh -i    # 顺手 sudo pacman -U 装上
+```
+
+需要 `base-devel`；选项与环境变量见 `./packaging/arch/build.sh --help`。
+
 安装后从应用菜单启动，或运行 `OpenUUYC`。
 
 ## 命令行更新
