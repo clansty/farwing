@@ -41,7 +41,7 @@ fn open_display() -> Result<Rc<Display>, DecodeError> {
     }
     for index in 128..136u32 {
         let path = format!("/dev/dri/renderD{index}");
-        let Ok(display) = Display::open_drm_display(&path) else {
+        let Some(display) = open_render_node(&path) else {
             continue;
         };
         if decode_profiles(&display).is_empty() {
@@ -52,6 +52,28 @@ fn open_display() -> Result<Rc<Display>, DecodeError> {
         return Ok(display);
     }
     Err(DecodeError::Unsupported)
+}
+
+/// 打开一个 render node。libva 2.15 以前不把 `nvidia-drm` 内核驱动映射到
+/// nvidia-vaapi-driver，NVIDIA 节点上的 `vaInitialize` 因此失败；这时点名驱动
+/// 再试一次，等价于用户自己设 `LIBVA_DRIVER_NAME=nvidia`。
+fn open_render_node(path: &str) -> Option<Rc<Display>> {
+    match Display::open_drm_display(path) {
+        Ok(display) => Some(display),
+        Err(cros_libva::OpenDrmDisplayError::VaInitialize(_)) if nvidia_node(path) => {
+            let display = Display::open_drm_display_with_driver(path, Some(c"nvidia")).ok()?;
+            tracing::debug!(path, "VA-API 按 NVIDIA 驱动名重试成功");
+            Some(display)
+        }
+        Err(_) => None,
+    }
+}
+
+/// `/sys/class/drm/renderD128/device/vendor` 为 0x10de 即 NVIDIA。
+fn nvidia_node(path: &str) -> bool {
+    let node = path.rsplit('/').next().unwrap_or_default();
+    std::fs::read_to_string(format!("/sys/class/drm/{node}/device/vendor"))
+        .is_ok_and(|vendor| vendor.trim() == "0x10de")
 }
 
 fn log_vendor(display: &Rc<Display>) {

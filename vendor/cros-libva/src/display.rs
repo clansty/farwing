@@ -93,6 +93,16 @@ impl Display {
     ///
     /// `path` is the path to a DRM device that supports VAAPI, e.g. `/dev/dri/renderD128`.
     pub fn open_drm_display<P: AsRef<Path>>(path: P) -> Result<Rc<Self>, OpenDrmDisplayError> {
+        Self::open_drm_display_with_driver(path, None)
+    }
+
+    /// 同 [`Display::open_drm_display`]，但 `driver` 非空时先 `vaSetDriverName`
+    /// 点名驱动，而不是由 libva 从内核驱动推断。libva 2.15 以前不认识某些内核
+    /// 驱动对应的 VA 驱动，调用方只能自己指定。
+    pub fn open_drm_display_with_driver<P: AsRef<Path>>(
+        path: P,
+        driver: Option<&CStr>,
+    ) -> Result<Rc<Self>, OpenDrmDisplayError> {
         let file = std::fs::File::options()
             .read(true)
             .write(true)
@@ -104,6 +114,16 @@ impl Display {
         let display = unsafe { bindings::vaGetDisplayDRM(file.as_raw_fd()) };
         if display.is_null() {
             return Err(OpenDrmDisplayError::VaGetDisplayDrm);
+        }
+
+        if let Some(driver) = driver {
+            // 显示句柄确认过非空，且 libva 会复制驱动名，指针生命周期无虞
+            va_check(unsafe { bindings::vaSetDriverName(display, driver.as_ptr().cast_mut()) })
+                .map_err(|error| {
+                    // 显示还没初始化、也没交出去，失败路径上直接终止
+                    unsafe { bindings::vaTerminate(display) };
+                    OpenDrmDisplayError::VaInitialize(error)
+                })?;
         }
 
         let mut major = 0i32;

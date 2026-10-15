@@ -33,6 +33,8 @@ const MB: u32 = 16;
 /// `Amd` and `Intel`. Any other vendor stays unclaimed rather than mislabelled.
 const PCI_VENDOR_AMD: u16 = 0x1002;
 const PCI_VENDOR_INTEL: u16 = 0x8086;
+/// NVIDIA 的 VA 驱动不由 libva 从内核驱动推断出来，需要显式点名（见 `open_display`）。
+const PCI_VENDOR_NVIDIA: u16 = 0x10de;
 
 /// Bit-level writer for the RBSP of a parameter set, shared by the codec
 /// modules.
@@ -185,9 +187,21 @@ pub(crate) fn display_node() -> Option<(String, u16)> {
 }
 
 fn open_display() -> Option<Rc<Display>> {
-    display_node()
-        .and_then(|(path, _)| Display::open_drm_display(path).ok())
-        .or_else(Display::open)
+    if let Some((path, vendor)) = display_node() {
+        if let Ok(display) = Display::open_drm_display(&path) {
+            return Some(display);
+        }
+        // libva 2.15 以前不把 `nvidia-drm` 内核驱动映射到 nvidia-vaapi-driver，
+        // 于是这个节点的 `vaInitialize` 失败；点名驱动再试一次，等价于用户
+        // 自己设 `LIBVA_DRIVER_NAME=nvidia`。
+        if vendor == PCI_VENDOR_NVIDIA
+            && let Ok(named) = Display::open_drm_display_with_driver(&path, Some(c"nvidia"))
+        {
+            tracing::debug!(path, "VA-API 按 NVIDIA 驱动名重试成功");
+            return Some(named);
+        }
+    }
+    Display::open()
 }
 
 fn device() -> Result<(Rc<Display>, u16)> {
