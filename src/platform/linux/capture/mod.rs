@@ -113,7 +113,10 @@ impl Image {
                 let raw = buffer.read_back()?;
                 let row = buffer.width as usize * 4;
                 let mut tight = Vec::with_capacity(row * buffer.height as usize);
-                for line in raw.chunks_exact(buffer.stride as usize).take(buffer.height as usize) {
+                for line in raw
+                    .chunks_exact(buffer.stride as usize)
+                    .take(buffer.height as usize)
+                {
                     tight.extend_from_slice(&line[..row]);
                 }
                 let (pixels, _, _) =
@@ -343,10 +346,19 @@ pub(crate) struct Desktop {
     /// 调用方想让画面留在显存里。后端换了（换屏、换光标设置）要按它再切回来：
     /// 编码器是照着显存帧建起来的，采集这边不能悄悄换回系统内存。
     hardware: bool,
+    /// 采集期间点亮屏幕、挡住自动息屏与空闲休眠。放最后，让它比采集资源活得久，
+    /// 与 Windows 侧一致。
+    _power: Option<super::power_request::Request>,
 }
 
 impl Desktop {
     pub fn open_selected(selected: &Screen) -> Result<Self> {
+        // 桌面不提供抑制接口时不拦住采集：会话照常，只是屏幕可能按空闲策略熄灭。
+        let power = super::power_request::Request::capture()
+            .inspect_err(|error| {
+                tracing::warn!(error = %format!("{error:#}"), "熄灭屏幕的唤醒与息屏抑制不可用")
+            })
+            .ok();
         let screen = refresh(selected)?;
         let size = (screen.width & !1, screen.height & !1);
         let backend = Backend::select(&screen, false, size)?;
@@ -362,6 +374,7 @@ impl Desktop {
             last_size: (0, 0),
             refreshed: Instant::now(),
             hardware: false,
+            _power: power,
         })
     }
 
@@ -707,7 +720,8 @@ fn blend_rows_simd(top: &[u8], bottom: &[u8], weight: u32, row: &mut [u16]) {
         let rounding = _mm_set1_epi16(64);
         let mut index = 0;
         while index + 8 <= row.len() {
-            let top_bytes = _mm_unpacklo_epi8(_mm_loadl_epi64(top.as_ptr().add(index).cast()), zero);
+            let top_bytes =
+                _mm_unpacklo_epi8(_mm_loadl_epi64(top.as_ptr().add(index).cast()), zero);
             let bottom_bytes =
                 _mm_unpacklo_epi8(_mm_loadl_epi64(bottom.as_ptr().add(index).cast()), zero);
             // The difference of two eight-bit samples is at most a signed
@@ -718,10 +732,8 @@ fn blend_rows_simd(top: &[u8], bottom: &[u8], weight: u32, row: &mut [u16]) {
                 _mm_slli_epi16(top_bytes, 7),
                 _mm_mullo_epi16(difference, high),
             );
-            let correction = _mm_srai_epi16(
-                _mm_add_epi16(_mm_mullo_epi16(difference, low), rounding),
-                7,
-            );
+            let correction =
+                _mm_srai_epi16(_mm_add_epi16(_mm_mullo_epi16(difference, low), rounding), 7);
             _mm_storeu_si128(
                 row.as_mut_ptr().add(index).cast(),
                 _mm_add_epi16(value, correction),
@@ -797,11 +809,7 @@ unsafe fn blend_columns_simd(row: &[u16], columns: &[Column], out: &mut [u8]) {
 }
 
 #[cfg(test)]
-pub(crate) fn scale_for_probe(
-    source: &[u8],
-    from: (u32, u32),
-    to: (u32, u32),
-) -> Vec<u8> {
+pub(crate) fn scale_for_probe(source: &[u8], from: (u32, u32), to: (u32, u32)) -> Vec<u8> {
     scale(source, from, to)
 }
 
@@ -864,13 +872,10 @@ mod tests {
                 let x1 = (x0 + 1).min(sw - 1);
                 let fx = (sx & 0xffff) as f64 / 65536.0;
                 for channel in 0..4 {
-                    let at = |px: usize, py: usize| {
-                        f64::from(source[(py * sw + px) * 4 + channel])
-                    };
+                    let at = |px: usize, py: usize| f64::from(source[(py * sw + px) * 4 + channel]);
                     let top = at(x0, y0) * (1.0 - fx) + at(x1, y0) * fx;
                     let bottom = at(x0, y1) * (1.0 - fx) + at(x1, y1) * fx;
-                    out[(y * w + x) * 4 + channel] =
-                        (top * (1.0 - fy) + bottom * fy).round() as u8;
+                    out[(y * w + x) * 4 + channel] = (top * (1.0 - fy) + bottom * fy).round() as u8;
                 }
             }
         }
@@ -956,7 +961,10 @@ mod stream_tests {
             let encoder = match encoder.as_mut() {
                 Some(encoder) => encoder,
                 None => {
-                    println!("编码尺寸 {size:?}（源 {:?}）", (screen.width, screen.height));
+                    println!(
+                        "编码尺寸 {size:?}（源 {:?}）",
+                        (screen.width, screen.height)
+                    );
                     encoder = Some(
                         crate::platform::linux::vaapi::Encoder::new(size, format, rate).unwrap(),
                     );
@@ -1007,8 +1015,14 @@ mod stream_tests {
             index += 1;
         }
         println!("{frames} 帧，{keyframes} 个关键帧，{bytes} 字节");
-        println!("前 10 帧字节数 {:?}", sizes.iter().take(10).collect::<Vec<_>>());
-        println!("后 10 帧字节数 {:?}", sizes.iter().rev().take(10).collect::<Vec<_>>());
+        println!(
+            "前 10 帧字节数 {:?}",
+            sizes.iter().take(10).collect::<Vec<_>>()
+        );
+        println!(
+            "后 10 帧字节数 {:?}",
+            sizes.iter().rev().take(10).collect::<Vec<_>>()
+        );
         std::fs::write("/tmp/openuuyc-real.h264", &stream).unwrap();
         std::fs::write("/tmp/openuuyc-real-luma.raw", &luma).unwrap();
     }
