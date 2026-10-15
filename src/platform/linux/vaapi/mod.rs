@@ -373,6 +373,16 @@ fn qp(quality: i32) -> u8 {
     (51 - 4 * quality.clamp(0, 5)).clamp(1, 51) as u8
 }
 
+/// The average as a share of the peak, which is the form the driver wants the
+/// two rates in. It is the whole of the rate control's arithmetic: the driver
+/// multiplies the peak back by this percentage, so a percentage that comes out
+/// wrong is a bit rate that comes out wrong. `target * 100` runs out of 32 bits
+/// at 42.9 Mbps, and a picture coded at whatever fraction it wrapped to is the
+/// coarseness this control exists to prevent.
+fn percentage_of_peak(target: u32, peak: u32) -> u32 {
+    ((u64::from(target) * 100 / u64::from(peak)).clamp(1, 100)) as u32
+}
+
 /// What the driver is asked to do with the bandwidth the transport has already
 /// reserved for this stream. Without one of these the stream is coded at the
 /// quality preset's QP alone: the announced bit rate never reaches the driver,
@@ -609,7 +619,7 @@ impl Encoder {
         // VBR keeps the average and bursts to the peak; the mode without it can
         // only spend the peak throughout.
         let (bit_rate, percentage) = match mode {
-            RateControl::Vbr => (peak, (target * 100 / peak).clamp(1, 100)),
+            RateControl::Vbr => (peak, percentage_of_peak(target, peak)),
             RateControl::Cbr => (peak, 100),
         };
         let framerate = EncMiscParameter::FrameRate(EncMiscParameterFrameRate::new(
@@ -752,6 +762,29 @@ mod tests {
         }
     }
 
+    /// 目标码率一过 42.9 Mbps，`target * 100` 就溢出 u32，回绕出来的百分比让驱动
+    /// 只花掉协商带宽的百分之几——「动起来就糊」就是这么来的。
+    #[test]
+    fn percentage_of_peak_survives_large_targets() {
+        for target in [
+            1_000_000,
+            8_000_000,
+            42_949_672,
+            42_949_673,
+            45_000_000,
+            90_000_000,
+            1_000_000_000,
+        ] {
+            assert_eq!(
+                percentage_of_peak(target, target),
+                100,
+                "target={target} 时平均应当就是峰值"
+            );
+        }
+        assert_eq!(percentage_of_peak(30_000_000, 60_000_000), 50);
+        assert_eq!(percentage_of_peak(1, 1_000_000_000), 1);
+    }
+
     fn frame(width: u32, height: u32) -> Captured {
         let mut bgra = vec![0u8; width as usize * height as usize * 4];
         for (index, pixel) in bgra.chunks_exact_mut(4).enumerate() {
@@ -844,14 +877,21 @@ mod tests {
             depth: 8,
         };
         let mut rate = rate();
-        rate.target = 14_000_000;
-        rate.peak = 14_000_000;
         rate.quality = 4;
-        rate.quality_target = QualityTarget {
-            bitrate: 14_000_000,
-            fps: 30,
-        };
-        for fps in [30u32, 60] {
+        // 42.9 Mbps 是那个百分比换算的溢出点。只试它下面的码率，就正好漏掉一半的
+        // 码率范围——这条探针原本只试 14 Mbps，于是漏掉了。
+        for (target, fps) in [
+            (14_000_000u32, 30u32),
+            (14_000_000, 60),
+            (60_000_000, 30),
+            (60_000_000, 60),
+        ] {
+            rate.target = target;
+            rate.peak = target;
+            rate.quality_target = QualityTarget {
+                bitrate: target,
+                fps: 30,
+            };
             rate.fps = fps;
             let mut encoder = Encoder::new(size, format, rate).unwrap();
             let mut decoder =
@@ -888,12 +928,13 @@ mod tests {
             }
             let seconds = f64::from(frames) / f64::from(fps);
             println!(
-                "{fps} fps: {frames} frames, {bytes} bytes, {:.2} Mbps, luma RMSE {:.2} \
+                "target {:.0} Mbps, {fps} fps: {frames} frames, {bytes} bytes, {:.2} Mbps, luma RMSE {:.2} \
                  over {compared} samples",
+                f64::from(target) / 1e6,
                 bytes as f64 * 8.0 / seconds / 1_000_000.0,
                 (squared / compared.max(1) as f64).sqrt()
             );
-            std::fs::write(format!("/tmp/openuuyc-vaapi-rate-{fps}.h264"), &stream).unwrap();
+            std::fs::write(format!("/tmp/openuuyc-vaapi-rate-{target}.h264"), &stream).unwrap();
         }
     }
 
