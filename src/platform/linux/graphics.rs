@@ -85,10 +85,28 @@ pub(crate) fn create_device() -> Result<Graphics> {
 
 fn create_graphics() -> Result<Graphics> {
     // Vulkan first, GL as the fallback for drivers or VMs without it.
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+    let mut desc = wgpu::InstanceDescriptor {
         backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
         ..wgpu::InstanceDescriptor::new_without_display_handle_from_env()
-    });
+    };
+    // Haswell/Broadwell 的 HasVK 驱动上报 conformance_version.major == 0（未通过
+    // Vulkan 认证），wgpu 会据此把整个适配器藏起来，request_adapter 便静默回落到
+    // llvmpipe 软渲染：Haswell 上空闲就烧掉一整个核心，8 个 llvmpipe 线程。除非
+    // 显式要求恢复 wgpu 默认行为，否则允许使用未认证的适配器，优先走硬件。
+    // 这里逐位改 flags，而不是给 flags 赋一个新值：基础描述符已经按环境变量
+    // 派生出 WGPU_DEBUG / WGPU_VALIDATION 等位，整段替换会把它们丢掉。
+    match std::env::var("WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER").as_deref() {
+        // with_env 只把 "0" 当假，"false" 会被它认成真并置位，所以这里要主动清掉。
+        Ok("0") | Ok("false") => {
+            desc.flags
+                .remove(wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER);
+        }
+        _ => {
+            desc.flags
+                .insert(wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER);
+        }
+    }
+    let instance = wgpu::Instance::new(desc);
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         ..Default::default()
