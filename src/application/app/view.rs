@@ -620,6 +620,8 @@ impl DeviceCenterApp {
         self.reconcile_device_details();
         let previous_page = self.center_ui.page;
         self.draw_navigation(ui);
+        #[cfg(target_os = "linux")]
+        self.file_transfer_fuse_bar(ui);
         if self.center_ui.page != previous_page
             && matches!(self.center_ui.page, Page::Assist | Page::Favorites)
         {
@@ -661,6 +663,54 @@ impl DeviceCenterApp {
                 } else {
                     self.devices_page(ui);
                 }
+            });
+    }
+
+    /// 主界面顶部的一条 FUSE 状态栏：显示挂载点，并提供一个非模态的「结束」。
+    #[cfg(target_os = "linux")]
+    fn file_transfer_fuse_bar(&mut self, ui: &mut egui::Ui) {
+        let mounted = crate::features::file_transfer::fuse::mounted_path();
+        if mounted.is_none() && !self.fuse_busy {
+            return;
+        }
+        egui::Panel::top("file-transfer-fuse-bar")
+            .resizable(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::SURFACE)
+                    .inner_margin(egui::Margin::symmetric(16, 8)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if self.fuse_busy {
+                        ui.add(egui::Spinner::new().size(14.0));
+                        ui.label(
+                            RichText::new(if mounted.is_some() {
+                                "正在结束挂载…"
+                            } else {
+                                "正在挂载远端文件…"
+                            })
+                            .size(theme::SMALL)
+                            .color(MUTED),
+                        );
+                        return;
+                    }
+                    let Some(path) = mounted else { return };
+                    ui.label(RichText::new("远端文件已挂载").strong().size(theme::SMALL));
+                    ui.add_space(8.0);
+                    let shown = path.display().to_string();
+                    ui.add(
+                        egui::Label::new(RichText::new(&shown).size(theme::SMALL).color(MUTED))
+                            .truncate(),
+                    )
+                    .on_hover_text(&shown);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // 非模态：不弹确认框，点了直接卸载。
+                        if ui.add(crate::ui::controls::secondary("结束")).clicked() {
+                            self.unmount_file_transfer_fuse();
+                        }
+                    });
+                });
             });
     }
 

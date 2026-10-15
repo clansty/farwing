@@ -39,6 +39,18 @@ pub(super) enum GuiCommand {
         device: DeviceInfo,
         options: ConnectionMediaOptions,
     },
+    /// 把 `device` 的远端文件系统按需挂到本地临时目录（仅 Linux 有 FUSE）。
+    #[cfg(target_os = "linux")]
+    FuseMount {
+        generation: u64,
+        device: DeviceInfo,
+        options: ConnectionMediaOptions,
+    },
+    /// 卸载当前的 FUSE 挂载（仅 Linux）。
+    #[cfg(target_os = "linux")]
+    FuseUnmount {
+        generation: u64,
+    },
     Diagnostics {
         generation: u64,
         device: DeviceInfo,
@@ -111,6 +123,12 @@ pub(super) enum GuiEvent {
     },
     ExitReady(std::result::Result<(), String>),
     Host(u64, crate::features::host::Handle),
+    /// 后台的 FUSE 挂载结束；成功不代表一定挂上，界面以 `fuse::mounted_path()` 为准。
+    #[cfg(target_os = "linux")]
+    FuseMounted(u64, std::result::Result<(), String>),
+    /// 后台的 FUSE 卸载结束。
+    #[cfg(target_os = "linux")]
+    FuseUnmounted(u64, std::result::Result<(), String>),
     Viewer(
         u64,
         super::viewing::Key,

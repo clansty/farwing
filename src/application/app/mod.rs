@@ -183,6 +183,9 @@ struct DeviceCenterApp {
     /// 登录自启（Linux 的 systemd 用户单元）的界面状态，见 `view::host_settings`。
     notifications: notifications::Center,
     status: StatusMessage,
+    /// FUSE 挂载/卸载正在进行中；主界面据此显示「正在挂载…」而不是结束按钮。
+    #[cfg(target_os = "linux")]
+    fuse_busy: bool,
     refreshed_at: Option<Instant>,
     refresh_pending: bool,
     viewers: viewing::Registry,
@@ -243,6 +246,8 @@ impl DeviceCenterApp {
                 || StatusMessage::info("正在读取设备并建立本机在线状态"),
                 StatusMessage::warning,
             ),
+            #[cfg(target_os = "linux")]
+            fuse_busy: false,
             refreshed_at: None,
             refresh_pending: true,
             exit_requested: false,
@@ -330,6 +335,31 @@ impl DeviceCenterApp {
                 GuiEvent::Host(generation, host) => {
                     if generation == self.login_generation {
                         self.host = Some(host);
+                    }
+                }
+                #[cfg(target_os = "linux")]
+                GuiEvent::FuseMounted(generation, result) => {
+                    // 无论代次都清掉忙碌态，免得换设备/重登之后卡在「正在挂载…」。
+                    self.fuse_busy = false;
+                    if generation == self.login_generation {
+                        match result {
+                            Ok(()) => {
+                                self.status =
+                                    StatusMessage::success("远端文件已挂载，可在文件管理器中打开")
+                            }
+                            Err(error) => {
+                                self.status = StatusMessage::error(format!("挂载失败：{error}"))
+                            }
+                        }
+                    }
+                }
+                #[cfg(target_os = "linux")]
+                GuiEvent::FuseUnmounted(generation, result) => {
+                    self.fuse_busy = false;
+                    if generation == self.login_generation
+                        && let Err(error) = result
+                    {
+                        self.status = StatusMessage::error(format!("结束挂载失败：{error}"));
                     }
                 }
                 GuiEvent::PowerDispatched(generation, id, action) => {
@@ -1232,6 +1262,14 @@ impl crate::ui::App for DeviceCenterApp {
     fn on_exit(&mut self) {
         for session in &self.viewers.active {
             session.handle.request_close();
+        }
+        // 退出前把 FUSE 挂载卸干净。Mount 存在模块静态里，Drop 不一定跑到；
+        // 交给 worker 阻塞线程处理，别让 UI 线程卡在卸载上。
+        #[cfg(target_os = "linux")]
+        if crate::features::file_transfer::fuse::mounted_path().is_some() {
+            let _ = self.worker.commands.send(GuiCommand::FuseUnmount {
+                generation: self.login_generation,
+            });
         }
         if self.logout_pending && !self.logout_sent {
             let _ = self.worker.commands.send(GuiCommand::Logout);

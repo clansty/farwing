@@ -10,6 +10,9 @@ pub(crate) use storage::Store;
 pub(crate) mod service;
 mod tasks;
 pub(crate) mod ui;
+/// 把远端文件系统挂成本地卷（FUSE），只有 Linux 有实现，Windows 目标不编译。
+#[cfg(target_os = "linux")]
+pub(crate) mod fuse;
 
 use anyhow::{Context, Result, ensure};
 use bytes::Bytes;

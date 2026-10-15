@@ -390,6 +390,9 @@ impl DeviceCenterApp {
         let mut refresh = false;
         let mut ports = false;
         let mut files = false;
+        // 只有 Linux 才有 FUSE 这一路；Windows 上这个旗标和菜单项都不存在。
+        #[cfg(target_os = "linux")]
+        let mut fuse_mount = false;
         let mut diagnostics = false;
         let controller_id = self
             .devices
@@ -723,7 +726,7 @@ impl DeviceCenterApp {
                     )
                 });
                 let mut file_ui = ui.new_child(egui::UiBuilder::new().max_rect(file_rect));
-                files = detail_button(
+                let file_button = detail_button(
                     &mut file_ui,
                     "文件传输",
                     Glyph::Files,
@@ -737,8 +740,22 @@ impl DeviceCenterApp {
                     } else {
                         ButtonTone::Normal
                     },
-                )
-                .clicked();
+                );
+                // 点按钮弹下拉：传统传输窗口，或（Linux）挂到临时目录的 FUSE。
+                egui::Popup::from_toggle_button_response(&file_button)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .show(|ui| {
+                        ui.set_min_width(160.0);
+                        if ui.button("传统传输窗口").clicked() {
+                            files = true;
+                            ui.close();
+                        }
+                        #[cfg(target_os = "linux")]
+                        if ui.button("FUSE 挂载").clicked() {
+                            fuse_mount = true;
+                            ui.close();
+                        }
+                    });
                 let rect = egui::Rect::from_min_size(
                     at(pad + power_count as f32 * (button_w + gap), power_y),
                     vec2(button_w, theme::CONTROL_HEIGHT),
@@ -977,6 +994,10 @@ impl DeviceCenterApp {
         }
         if files {
             self.open_file_transfer(id.clone());
+        }
+        #[cfg(target_os = "linux")]
+        if fuse_mount {
+            self.mount_file_transfer_fuse(id.clone());
         }
         if connect || audio_only {
             self.selected_device_id = Some(id);

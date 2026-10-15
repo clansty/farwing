@@ -308,6 +308,44 @@ pub(super) async fn gui_worker_loop(
                         }
                     }
                 }
+                #[cfg(target_os = "linux")]
+                GuiCommand::FuseMount {
+                    generation,
+                    device,
+                    options,
+                } => {
+                    // 无论走哪条路都必须回一个事件：界面靠它清掉「正在挂载…」。
+                    let events = events.clone();
+                    let allowed = generation == catalog_generation && logout_task.is_none();
+                    let client = allowed.then(|| client.as_ref().map(Arc::clone)).flatten();
+                    match client {
+                        Some(client) => {
+                            // 建连接和挂载都会阻塞，挪到阻塞线程，别卡住 worker 的事件循环。
+                            tokio::task::spawn_blocking(move || {
+                                let result =
+                                    crate::features::file_transfer::fuse::mount(client, device, options)
+                                        .map_err(|error| format!("{error:#}"));
+                                let _ = events.send(GuiEvent::FuseMounted(generation, result));
+                            });
+                        }
+                        None => {
+                            let _ = events.send(GuiEvent::FuseMounted(
+                                generation,
+                                Err("设备后台服务已停止或已切换账号，请重试".to_owned()),
+                            ));
+                        }
+                    }
+                }
+                #[cfg(target_os = "linux")]
+                GuiCommand::FuseUnmount { generation } => {
+                    // 卸载也要等内核，同样放阻塞线程；没挂着时是无害的 no-op。
+                    let events = events.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let result = crate::features::file_transfer::fuse::unmount()
+                            .map_err(|error| format!("{error:#}"));
+                        let _ = events.send(GuiEvent::FuseUnmounted(generation, result));
+                    });
+                }
                 GuiCommand::Diagnostics {
                     generation,
                     device,
