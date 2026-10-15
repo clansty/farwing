@@ -194,7 +194,7 @@ winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "
 arboard = { version = "3.6.1", default-features = false, features = ["image-data", "wayland-data-control"] }
 libc = "0.2"
 fuser = { version = "0.15", default-features = false }
-x11rb = { version = "0.13", features = ["randr", "shm", "xfixes", "xtest"] }
+x11rb = { version = "0.13", features = ["dpms", "randr", "shm", "xfixes", "xtest"] }
 # Notification-area icon (StatusNotifierItem), the counterpart of the Windows tray.
 # zbus must stay on async-io: its tokio feature is global, and makes the
 # blocking Secret Service calls of the keyring panic inside our runtime.
@@ -209,7 +209,7 @@ pollster = "0.4"
 # everything built on them serve it, and unlike the portal it never asks the
 # local user for consent.
 wayland-client = "0.31"
-wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+wayland-protocols = { version = "0.32", features = ["client", "unstable", "staging"] }
 # Text input: the client brings its own keymap, so characters the local
 # layout cannot produce (a phone input method's Chinese) are typeable.
 wayland-protocols-misc = { version = "0.3", features = ["client"] }
