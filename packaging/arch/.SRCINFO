@@ -41,7 +41,7 @@ pkgbase = openuuyc-clansty
 	conflicts = openuuyc
 	conflicts = openuuyc-bin
 	conflicts = openuuyc-git
-	options = !lto
+	options = !debug !lto
 	source = openuuyc-clansty::git+https://github.com/clansty/farwing.git#branch=clansty
 	sha256sums = SKIP
 

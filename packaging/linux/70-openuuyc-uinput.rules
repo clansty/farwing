@@ -1,10 +1,16 @@
 # The host role's virtual keyboard and pointer are created through /dev/uinput,
 # which is the only permission they need.
 #
+# Access is granted through `uaccess` alone, which logind turns into an ACL for
+# the active session user. Also setting GROUP="input"/MODE="0660" would let any
+# process in the `input` group write to uinput, i.e. inject system-wide
+# keyboard and mouse — a privilege well beyond reading input events, and one
+# nothing in the flow needs.
+#
 # The devices those become (/dev/input/eventN) deliberately get no rule of
 # their own: a compositor does not open the node itself, it takes the device
 # from logind — the session layer wlroots, niri and the rest sit on — and
 # logind opens it as root and hands the file descriptor back. Adding an ACL
 # there would instead let every process in the session read every keystroke the
 # controller sends, passwords included.
-KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", GROUP="input", MODE="0660", TAG+="uaccess"
+KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", TAG+="uaccess"

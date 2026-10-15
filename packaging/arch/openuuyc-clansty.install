@@ -3,7 +3,7 @@
 _openuuyc_uinput_note() {
   cat <<'NOTE'
 OpenUUYC 被远程控制时，键鼠经 /dev/uinput 注入，需要该设备的写权限。
-已安装的 udev 规则：/usr/lib/udev/rules.d/70-openuuyc-uinput.rules（uaccess + input 组）
+已安装的 udev 规则：/usr/lib/udev/rules.d/70-openuuyc-uinput.rules（uaccess，登录会话的用户才有权限）
 
 让它对当前系统生效：
     sudo udevadm control --reload-rules && sudo udevadm trigger

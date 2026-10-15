@@ -81,7 +81,9 @@ conflicts=("$_pkgname" "${_pkgname}-bin" "${_pkgname}-git")
 install="$pkgname.install"
 # 关闭 makepkg 的 LTO：Cargo.toml 的 release profile 已经调好 lto/codegen-units，
 # 混入 makepkg 的 -flto 只会让 NetEq 的 C++ 对象与 rustc 链接参数打起来。
-options=('!lto')
+# 同时跳过 debug 分包：release profile 的 strip="debuginfo" 之后二进制里已无 .debug_* 段，
+# 但 makepkg 仍会用 objcopy --only-keep-debug 抠出一个几十 MB 的空 stub 包，纯属白产。
+options=('!debug' '!lto')
 
 if [[ -n ${OPENUUYC_LOCAL_SRC:-} ]]; then
   source=()
