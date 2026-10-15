@@ -31,11 +31,7 @@ impl Bounds {
 }
 
 pub(crate) const NETWORK_FLOOR: u32 = 300_000;
-// 起步速率的上限。它只是给 GoogCC 的 starting_rate，链路吃不下时它会自己退回来；
-// 但定得太低，一台千兆局域网也要爬一分钟才用得上链路：实测 500 Mbps 档从 3 Mbps
-// 起步，要 90 秒才靠探测爬到 100 Mbps，而在这之前编码器一直按十几 Mbps 出图，
-// 画面一有变化就是糊的。码率本身仍然由网络估计决定，这里只改起点的保守程度。
-pub(crate) const STARTUP_CEILING: u32 = 20_000_000;
+pub(crate) const STARTUP_CEILING: u32 = 3_000_000;
 pub(crate) const MIN_ENCODER_RATE: u32 = 30_000;
 
 // A quality decision threshold, never a network allocation guarantee.

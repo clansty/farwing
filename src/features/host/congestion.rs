@@ -66,13 +66,6 @@ impl Controller {
             .alr_experiment_settings
             .alr_stop_budget_level_percent = -60;
         field_trials.alr_experiment_settings.group_id = 3;
-        // 共享桌面的发送端几乎永远处在 ALR：一屏静止画面只要一两 Mbps，链路再空
-        // 也测不出来，估计值只能靠 ALR 探测往上走。libwebrtc 的默认值是按视频通话
-        // 调的（ALR 偶尔出现、几分钟就过去），照搬过来就是实测到的那个台阶——500
-        // Mbps 档要 90 秒才从 3 Mbps 爬到 100 Mbps。这里把探测加密、步长加大，探测
-        // 本身只有 15 毫秒，失败时付出的代价可以忽略。
-        field_trials.probing_configuration.alr_interval = TimeDelta::from_seconds(3);
-        field_trials.probing_configuration.alr_scale = 4.0;
         field_trials.probing_configuration.probe_max_allocation = true;
         field_trials.min_alloc_as_lower_bound = false;
         field_trials.ignore_probes_lower_than_network_state_estimate = false;
