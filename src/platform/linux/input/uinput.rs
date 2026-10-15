@@ -11,9 +11,9 @@
 //!
 //! - a keyboard, which is every key code there is plus the three lock LEDs;
 //! - a pointer, relative, which is what a mouse is;
-//! - and, once the desktop geometry is known, an absolute pointer. Relative
-//!   motion cannot express "go to this pixel", and the default mouse mode
-//!   asks for exactly that;
+//! - an absolute pointer, whose axes are a fixed range the compositor resolves
+//!   against its own output layout. Relative motion cannot express "go to this
+//!   pixel", and the default mouse mode asks for exactly that;
 //! - a touchscreen, which the compositor reads as a device lying on a panel
 //!   and dispatches itself. That is what makes a multi-touch session real
 //!   instead of a pointer moved by the first finger.
@@ -70,6 +70,10 @@ const INPUT_PROP_POINTER: u32 = 0;
 const INPUT_PROP_DIRECT: u32 = 1;
 const BUS_USB: u16 = 0x03;
 
+/// 绝对轴的最大值，与 Sunshine 一样固定，不随布局变：布局变了只改换算，
+/// 不用换设备（换设备又要等合成器重新接手）。
+const AXIS_MAX: i32 = 65535;
+
 /// 触摸屏两条轴能取的最大值。触摸报的是屏幕上的比例，所以量程只决定精度：
 /// 这个量程在 5120 宽的屏上一个单位是 0.16 个像素。
 const TOUCH_RANGE: f32 = 32767.0;
@@ -78,6 +82,9 @@ const TOUCH_RANGE: f32 = 32767.0;
 const TOUCH_RESOLUTION: i32 = 40;
 /// 触摸屏同时能按住的触点数，和协议允许的一样多。
 const TOUCH_SLOTS: usize = 10;
+/// 设备声明的 tracking id 上限。id 在 `0..=TRACKING_MAX` 里回绕，和内核
+/// `input_mt` 一样按位截断，-1 留给「抬起」。
+const TRACKING_MAX: i32 = 0xffff;
 
 const UI_SET_EVBIT: libc::c_ulong = 0x4004_5564;
 const UI_SET_KEYBIT: libc::c_ulong = 0x4004_5565;
@@ -231,6 +238,25 @@ impl Device {
         ioctl(self.raw(), UI_ABS_SETUP, &mut setup).context("设置绝对轴范围失败")
     }
 
+    /// 绝对指针：`ABS_X`/`ABS_Y` 的范围固定为 `0..=AXIS_MAX`，合成器把它按
+    /// 比例映射到自己全部输出的外接矩形上。
+    fn open_absolute() -> Result<Self> {
+        Self::create("OpenUUYC 虚拟绝对鼠标", |device| {
+            device.event_type(EV_KEY)?;
+            for button in [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA] {
+                device.key(button)?;
+            }
+            device.event_type(EV_ABS)?;
+            device.absolute(ABS_X, AXIS_MAX, 0)?;
+            device.absolute(ABS_Y, AXIS_MAX, 0)?;
+            // A pointer, not a direct device: `INPUT_PROP_DIRECT` tells a
+            // compositor the coordinates map onto a single output, and these
+            // are a fraction of the whole desk.
+            device.property(INPUT_PROP_POINTER)
+        })
+        .context("创建虚拟绝对鼠标失败")
+    }
+
     /// Writes a run of events and closes it with a report, which is what makes
     /// the kernel deliver them together.
     fn send(&self, events: &[(u16, u16, i32)]) -> Result<()> {
@@ -277,11 +303,15 @@ impl Drop for Device {
 ///
 /// 它比「用指针模拟触摸」多出来的东西，正是合成器愿意认它是一块触摸屏的理由：
 /// `INPUT_PROP_DIRECT` 和多点轴（`ABS_MT_*`）让 libinput 把它判成触摸屏，于是
-/// 它报的触点被合成器原样派发给应用——双指滚动、捏合、手势、触摸面积都是真的，
-/// 而不是把一个触点翻译成鼠标左键。
+/// 它报的触点被合成器原样派发给应用——双指滚动、捏合、手势都是真的，而不是把
+/// 一个触点翻译成鼠标左键。
+///
+/// 触点大小照实体触摸屏的样子报在 `ABS_MT_TOUCH_MAJOR` 上，但 libinput 处理
+/// 触摸屏的那条路径不读这个轴，公开接口里也没有触摸屏的接触面积，所以合成器和
+/// 应用拿不到它。
 ///
 /// 设备坐标是「面板自己」的坐标：合成器读它的时候会套上输出当前的旋转和缩放
-/// （`Rotation::panel` 就是这件事的逆），所以屏幕大小和缩放都不进这里。
+/// （`panel` 就是这件事的逆），所以屏幕大小和缩放都不进这里。
 pub(super) struct Touchscreen {
     device: Device,
     contacts: Contacts,
@@ -297,7 +327,8 @@ impl Touchscreen {
                 device.absolute(axis, TOUCH_RANGE as i32, TOUCH_RESOLUTION)?;
             }
             device.absolute(ABS_MT_SLOT, TOUCH_SLOTS as i32 - 1, 0)?;
-            device.absolute(ABS_MT_TRACKING_ID, 65535, 0)?;
+            device.absolute(ABS_MT_TRACKING_ID, TRACKING_MAX, 0)?;
+            // 接触椭圆的长轴，按 evdev 的定义是直径，量程和位置轴一样。
             device.absolute(ABS_MT_TOUCH_MAJOR, TOUCH_RANGE as i32, 0)?;
             // 直接设备：坐标落在某一块输出上，而不是像鼠标那样在整张桌子上。
             device.property(INPUT_PROP_DIRECT)
@@ -309,24 +340,25 @@ impl Touchscreen {
         })
     }
 
-    fn touch(&mut self, kind: u8, points: &[Touch], rotation: Rotation) -> Result<()> {
-        let frames = self.contacts.step(kind, points, rotation)?;
-        for frame in &frames {
-            if let Err(error) = self.device.send(frame) {
-                // 写到一半失败，设备里的状态就不知道是什么了，按全抬起来算。
-                self.contacts = Contacts::default();
-                return Err(error);
-            }
+    /// 算出这一帧触点要写进设备的帧。触点比槽位多时报错，什么也不改，设备
+    /// 照样能用。
+    fn step(&mut self, kind: u8, points: &[Touch], rotation: Rotation) -> Result<Vec<Frame>> {
+        self.contacts.step(kind, points, rotation)
+    }
+
+    /// 把帧写进设备。写失败时设备里按着哪些触点就不知道了，调用方要丢掉这块
+    /// 触摸屏：设备一移除，合成器（libinput）会自己把它上面的触点全部收尾。
+    fn write(&self, frames: &[Frame]) -> Result<()> {
+        for frame in frames {
+            self.device.send(frame)?;
         }
         Ok(())
     }
 
+    /// 抬起所有触点。和 `write` 一样，失败了这块触摸屏就不能再用。
     fn release(&mut self) -> Result<()> {
         let frames = self.contacts.lift_all();
-        for frame in &frames {
-            self.device.send(frame)?;
-        }
-        Ok(())
+        self.write(&frames)
     }
 }
 
@@ -334,16 +366,17 @@ impl Touchscreen {
 ///
 /// 这段逻辑和设备本身分开，是为了能脱开 `/dev/uinput` 单独验：触摸屏的协议要求
 /// 全在帧的顺序里（谁先抬起、槽位什么时候能复用、BTN_TOUCH 什么时候翻转）。
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Contacts {
     active: BTreeMap<u32, Contact>,
     used: [bool; TOUCH_SLOTS],
-    /// 上一个发出去的 tracking id，每个新触点加一。
+    /// 上一个发出去的 tracking id，每个新触点加一，在声明的范围里回绕。
     tracking: i32,
     /// 上一次发出去的按下状态，只在变化时重发 BTN_TOUCH。
     touching: bool,
 }
 
+#[derive(Clone)]
 struct Contact {
     slot: u8,
     tracking: i32,
@@ -356,9 +389,22 @@ impl Contacts {
     /// 一帧触点。`kind` 是 UU 的说法：1 是「触点集合从现在开始」，2 是移动，
     /// 3 是抬起，4 是取消。返回要写进设备的帧。
     ///
-    /// 一次同步里不能把「抬起旧触点」和「按下新触点」当成同一批，所以 kind 1
-    /// 的取消自己是一个完整的帧。
+    /// 一次同步里不能把「抬起旧触点」和「按下新触点」当成同一批：新触点常常拿到
+    /// 刚空出来的槽位，同一帧里同一个槽位先写 -1 再写新 id，libinput
+    /// （`evdev-fallback.c`）会当成内核的错误，抬起和按下一起丢掉。所以抬起
+    /// 总是自己一帧，和 Windows 的 `Touch::update` 先单独注入一帧 UP 一样。
+    ///
+    /// 出错时（触点比槽位多）什么也不改：整步先在一份副本上算完，成功了才换上。
+    /// 否则消失的触点已经从这里删掉，抬起它们的那一帧却没有发出去，合成器那边
+    /// 就会一直按着。
     fn step(&mut self, kind: u8, points: &[Touch], rotation: Rotation) -> Result<Vec<Frame>> {
+        let mut next = self.clone();
+        let frames = next.advance(kind, points, rotation)?;
+        *self = next;
+        Ok(frames)
+    }
+
+    fn advance(&mut self, kind: u8, points: &[Touch], rotation: Rotation) -> Result<Vec<Frame>> {
         let mut frames = Vec::new();
         if kind == 1 || kind >= 3 {
             frames.extend(self.lift_all());
@@ -367,7 +413,6 @@ impl Contacts {
                 return Ok(frames);
             }
         }
-        let mut frame = Frame::new();
         // 这一帧里没有了的触点先抬起，槽位空出来给新触点用。
         let gone: Vec<u32> = self
             .active
@@ -375,14 +420,23 @@ impl Contacts {
             .copied()
             .filter(|id| !points.iter().any(|point| point.id == *id))
             .collect();
+        let mut lifts = Frame::new();
         for id in gone {
             let Some(contact) = self.active.remove(&id) else {
                 continue;
             };
             self.used[usize::from(contact.slot)] = false;
-            frame.push((EV_ABS, ABS_MT_SLOT, i32::from(contact.slot)));
-            frame.push((EV_ABS, ABS_MT_TRACKING_ID, -1));
+            lifts.push((EV_ABS, ABS_MT_SLOT, i32::from(contact.slot)));
+            lifts.push((EV_ABS, ABS_MT_TRACKING_ID, -1));
         }
+        if !lifts.is_empty() {
+            if self.active.is_empty() && self.touching {
+                self.touching = false;
+                lifts.push((EV_KEY, BTN_TOUCH, 0));
+            }
+            frames.push(lifts);
+        }
+        let mut frame = Frame::new();
         for point in points {
             let (x, y) = position(point, rotation);
             match self.active.get(&point.id) {
@@ -397,10 +451,9 @@ impl Contacts {
                         .context("虚拟触摸屏的触点已经用满")?;
                     self.used[slot] = true;
                     // 新触点要一个新的 tracking id；抬起时把那个槽位的 id 写回 -1。
-                    self.tracking = self.tracking.wrapping_add(1);
                     let contact = Contact {
                         slot: slot as u8,
-                        tracking: self.tracking,
+                        tracking: self.next_tracking(),
                     };
                     frame.push((EV_ABS, ABS_MT_SLOT, i32::from(contact.slot)));
                     frame.push((EV_ABS, ABS_MT_TRACKING_ID, contact.tracking));
@@ -409,7 +462,7 @@ impl Contacts {
             }
             frame.push((EV_ABS, ABS_MT_POSITION_X, x));
             frame.push((EV_ABS, ABS_MT_POSITION_Y, y));
-            frame.push((EV_ABS, ABS_MT_TOUCH_MAJOR, touch_value(point.radius)));
+            frame.push((EV_ABS, ABS_MT_TOUCH_MAJOR, touch_value(2.0 * point.radius)));
         }
         // 第一个触点的单点坐标。实体触摸屏也会报，libinput 的单点回退路径读它。
         if let Some(point) = points.first() {
@@ -426,6 +479,22 @@ impl Contacts {
             frames.push(frame);
         }
         Ok(frames)
+    }
+
+    /// 下一个 tracking id：加一后截到声明的范围里，跳过还按着的触点正在用的 id
+    /// （回绕一圈之后才可能撞上；按着的最多 `TOUCH_SLOTS` 个，所以一定找得到）。
+    fn next_tracking(&mut self) -> i32 {
+        loop {
+            self.tracking = (self.tracking + 1) & TRACKING_MAX;
+            let tracking = self.tracking;
+            if !self
+                .active
+                .values()
+                .any(|contact| contact.tracking == tracking)
+            {
+                return tracking;
+            }
+        }
     }
 
     /// 抬起所有触点，并把槽位还回去。
@@ -447,8 +516,30 @@ impl Contacts {
 
 /// 触点在内核里的位置：先把屏幕比例变回面板比例，再放到量程上。
 fn position(point: &Touch, rotation: Rotation) -> (i32, i32) {
-    let (x, y) = rotation.panel(point.x.clamp(0.0, 1.0), point.y.clamp(0.0, 1.0));
+    let (x, y) = panel(rotation, point.x.clamp(0.0, 1.0), point.y.clamp(0.0, 1.0));
     (touch_value(x), touch_value(y))
+}
+
+/// A position on the screen as a fraction of it, to the same position as a
+/// fraction of the touchscreen's own, untransformed panel.
+///
+/// The compositor does the opposite: it reads a touch as a fraction of the
+/// panel and applies the output's transform to it, in the output's rectangle
+/// (smithay's `transform_point_in`, which is what a compositor scales a touch
+/// device's axes with). Undoing that is this inverse, in normalized
+/// coordinates: both spaces are the unit square, so the axis lengths, the
+/// output's scale and its physical size never enter.
+fn panel(rotation: Rotation, x: f32, y: f32) -> (f32, f32) {
+    match rotation {
+        Rotation::Normal => (x, y),
+        Rotation::Rotate90 => (y, 1.0 - x),
+        Rotation::Rotate180 => (1.0 - x, 1.0 - y),
+        Rotation::Rotate270 => (1.0 - y, x),
+        Rotation::Flipped => (1.0 - x, y),
+        Rotation::Flipped90 => (y, x),
+        Rotation::Flipped180 => (x, 1.0 - y),
+        Rotation::Flipped270 => (1.0 - y, 1.0 - x),
+    }
 }
 
 /// 一个比例值放到触摸屏的量程上。
@@ -458,8 +549,8 @@ fn touch_value(fraction: f32) -> i32 {
 
 // --- the injector -----------------------------------------------------------
 
-/// The desktop absolute coordinates are resolved against.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// 绝对坐标换算所在的区域：合成器全局布局的外接矩形，左上角加尺寸。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Desktop {
     pub left: i32,
     pub top: i32,
@@ -467,18 +558,156 @@ pub(crate) struct Desktop {
     pub height: u32,
 }
 
+/// 合成器全局布局的外接矩形，包括没有名字的输出：合成器把绝对指针映射到
+/// 它全部输出的外接矩形上（wlroots 的 output layout、Hyprland、niri、KWin 的
+/// 工作区、Mutter 的 stage），少算一块屏落点就整体偏。
+pub(crate) fn layout_bounds(layout: &crate::platform::CompositorLayout) -> Option<Desktop> {
+    let mut outputs = layout
+        .outputs
+        .iter()
+        .filter(|o| o.width > 0 && o.height > 0);
+    let first = outputs.next()?;
+    let span = |o: &crate::platform::CompositorOutput| {
+        (
+            i64::from(o.left),
+            i64::from(o.top),
+            i64::from(o.left) + i64::from(o.width),
+            i64::from(o.top) + i64::from(o.height),
+        )
+    };
+    let (mut left, mut top, mut right, mut bottom) = span(first);
+    for output in outputs {
+        let (l, t, r, b) = span(output);
+        left = left.min(l);
+        top = top.min(t);
+        right = right.max(r);
+        bottom = bottom.max(b);
+    }
+    Some(Desktop {
+        left: i32::try_from(left).ok()?,
+        top: i32::try_from(top).ok()?,
+        width: u32::try_from(right - left).ok()?,
+        height: u32::try_from(bottom - top).ok()?,
+    })
+}
+
+/// 合成器把一个轴值落到像素 `origin + floor(value × extent / (AXIS_MAX + 1))`
+/// 上（libinput 按 `max - min + 1` 换算）。取像素中心对应的值，取整之后正好
+/// 落回这个像素。超过 `AXIS_MAX + 1` 像素宽的布局会有相邻像素共用一个值。
+fn axis_value(position: i32, origin: i32, extent: u32) -> i32 {
+    if extent == 0 {
+        return 0;
+    }
+    let range = i64::from(AXIS_MAX) + 1;
+    let extent = i64::from(extent);
+    let offset = (i64::from(position) - i64::from(origin)).clamp(0, extent - 1);
+    ((2 * offset + 1) * range / (2 * extent)).clamp(0, i64::from(AXIS_MAX)) as i32
+}
+
+/// 内核丢弃与设备当前值相同的绝对坐标，所以要重写同一个值时先在单独一帧里
+/// 挪开一个单位（不到一像素）。在轴的最大值处往回挪，不能出界。只有两条轴
+/// 都相同才需要：只丢一条轴时，合成器沿用设备自己的那个值，正是目标值。
+fn nudge(last: (i32, i32), value: (i32, i32)) -> Option<(i32, i32)> {
+    (last == value).then(|| {
+        let x = if value.0 >= AXIS_MAX {
+            value.0 - 1
+        } else {
+            value.0 + 1
+        };
+        (x, value.1)
+    })
+}
+
+/// 合成器接手一台刚建的 uinput 设备要多久。这段时间里写进去的绝对坐标谁都
+/// 收不到（evdev 只把 open 之后的事件交给读者），所以要反复补写。
+const FRESH_FOR: Duration = Duration::from_millis(1500);
+
+/// 上面那个窗口期里补写的间隔。
+const REPEAT_EVERY: Duration = Duration::from_millis(250);
+
+/// 窗口期里还要补写的位置。
+struct Repeat {
+    until: std::time::Instant,
+    next: std::time::Instant,
+    value: (i32, i32),
+}
+
+/// 由合成器解算的绝对指针。轴范围固定（与 Sunshine 一样），按布局外接矩形
+/// 换算，所以布局变了也不用换设备。
+struct Absolute {
+    device: Device,
+    made: std::time::Instant,
+    /// 设备轴上的当前值（内核里的那份），新建时为 0。
+    last: (i32, i32),
+    repeat: Option<Repeat>,
+}
+
+impl Absolute {
+    fn create() -> Result<Self> {
+        Ok(Self {
+            device: Device::open_absolute()?,
+            made: std::time::Instant::now(),
+            last: (0, 0),
+            repeat: None,
+        })
+    }
+
+    /// 写入一对轴值。与当前值相同时内核会把它整帧丢掉，而光标可能已经被别的
+    /// 设备（相对设备、本机鼠标、程序自己移动指针）挪走了，所以先在单独一帧里
+    /// 挪开一个单位，再写目标值。
+    fn emit(&mut self, value: (i32, i32)) -> Result<()> {
+        if let Some((x, y)) = nudge(self.last, value) {
+            self.device
+                .send(&[(EV_ABS, ABS_X, x), (EV_ABS, ABS_Y, y)])?;
+        }
+        self.device
+            .send(&[(EV_ABS, ABS_X, value.0), (EV_ABS, ABS_Y, value.1)])?;
+        self.last = value;
+        Ok(())
+    }
+
+    /// 把合成器空间里的一点写进设备，设备还新的时候安排补写。
+    fn aim(&mut self, x: i32, y: i32, bounds: Desktop) -> Result<()> {
+        let value = (
+            axis_value(x, bounds.left, bounds.width),
+            axis_value(y, bounds.top, bounds.height),
+        );
+        self.emit(value)?;
+        let now = std::time::Instant::now();
+        let until = self.made + FRESH_FOR;
+        self.repeat = (now < until).then(|| Repeat {
+            until,
+            next: now + REPEAT_EVERY,
+            value,
+        });
+        Ok(())
+    }
+
+    /// 窗口期里按间隔补写。补写的值与当前值相同，`emit` 会先挪开一个单位，
+    /// 每次补写都以目标值结束，窗口结束时不必再写。
+    fn flush(&mut self) -> Result<()> {
+        let Some(repeat) = &mut self.repeat else {
+            return Ok(());
+        };
+        let now = std::time::Instant::now();
+        if now >= repeat.until {
+            self.repeat = None;
+            return Ok(());
+        }
+        if now < repeat.next {
+            return Ok(());
+        }
+        repeat.next = now + REPEAT_EVERY;
+        let value = repeat.value;
+        self.emit(value)
+    }
+}
+
 pub(super) struct Injector {
     keyboard: Device,
     relative: Device,
-    /// The absolute pointer spans the whole of whatever desk the compositor
-    /// lays out, and its ranges are fixed when the device is created, so it
-    /// only appears once the desktop size is known.
-    absolute: Option<Device>,
-    desktop: Option<Desktop>,
-    /// When the absolute device was made, and the position to keep writing
-    /// until the compositor has certainly opened it.
-    made: Option<std::time::Instant>,
-    repeat: Option<Repeat>,
+    /// 由合成器按它自己的全局布局解算的绝对指针；拿不到就没有，退回相对移动。
+    absolute: Option<Absolute>,
     /// Where this backend last left the pointer. The kernel cannot be asked.
     position: (i32, i32),
     /// The lock keys, as a mask of the LEDs they drive.
@@ -519,6 +748,18 @@ impl Injector {
             device.property(INPUT_PROP_DIRECT)
         })
         .context("创建虚拟鼠标失败")?;
+        // 绝对定位另建一台设备，越早建越好：合成器接手它要几百毫秒。轴范围
+        // 固定，用不用它由引擎按合成器布局决定。
+        let absolute = match Absolute::create() {
+            Ok(absolute) => {
+                tracing::info!("虚拟绝对指针已就绪，绝对定位按合成器布局解算");
+                Some(absolute)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "虚拟绝对指针不可用，绝对定位改用相对移动");
+                None
+            }
+        };
         // 触摸屏没有别的后备：没有它就退回用指针模拟单指，见 engine 里的 touch。
         // 一块从来收不到触点的触摸屏什么也不影响，所以它和设备一起常驻。
         let touchscreen = match Touchscreen::create() {
@@ -546,10 +787,7 @@ impl Injector {
         Ok(Self {
             keyboard,
             relative,
-            absolute: None,
-            desktop: None,
-            made: None,
-            repeat: None,
+            absolute,
             position: (0, 0),
             leds: 0,
             virtual_keyboard,
@@ -568,54 +806,9 @@ impl Injector {
         }
     }
 
-    /// Makes the absolute device early, from the desk the compositor itself
-    /// describes, so that it has been open for a while before anything aims at
-    /// it. A compositor opens a device this process has just made in its own
-    /// time -- hundreds of milliseconds -- and evdev hands a reader only what
-    /// arrives after it opens, so a position written in that window reaches
-    /// nobody. The rounds the session later reports replace this desk if it is
-    /// not the same one.
-    pub(super) fn prime(&mut self) -> Result<()> {
-        let Some(desk) = compositor_desktop() else {
-            return Ok(());
-        };
-        self.set_geometry(desk)
-    }
-
-    /// Records the desktop the absolute pointer spans and creates that device
-    /// the first time there is a size to give it.
-    pub(super) fn set_geometry(&mut self, desktop: Desktop) -> Result<()> {
-        if self.desktop == Some(desktop) {
-            return Ok(());
-        }
-        self.desktop = Some(desktop);
-        // The ranges are what the compositor divides the desktop by, so a
-        // desktop of a different size needs a device that says so.
-        self.absolute = None;
-        self.made = None;
-        self.repeat = None;
-        if desktop.width == 0 || desktop.height == 0 {
-            return Ok(());
-        }
-        let width = desktop.width as i32 - 1;
-        let height = desktop.height as i32 - 1;
-        let device = Device::create("OpenUUYC 虚拟绝对鼠标", |device| {
-            device.event_type(EV_KEY)?;
-            for button in [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA] {
-                device.key(button)?;
-            }
-            device.event_type(EV_ABS)?;
-            device.absolute(ABS_X, width, 0)?;
-            device.absolute(ABS_Y, height, 0)?;
-            // A pointer, not a direct device: `INPUT_PROP_DIRECT` tells a
-            // compositor the coordinates map onto a single output, and these
-            // are a fraction of the whole desk.
-            device.property(INPUT_PROP_POINTER)
-        })
-        .context("创建虚拟绝对鼠标失败")?;
-        self.absolute = Some(device);
-        self.made = Some(std::time::Instant::now());
-        Ok(())
+    /// 有没有虚拟绝对指针。有它，引擎才可能按合成器布局定位。
+    pub(super) fn has_absolute_pointer(&self) -> bool {
+        self.absolute.is_some()
     }
 
     pub(super) fn key(&mut self, key: u16, down: bool) -> Result<()> {
@@ -639,40 +832,39 @@ impl Injector {
         self.relative.send(&[(EV_KEY, code, i32::from(down))])
     }
 
+    /// Move to a root-window position, in the display server's own space.
+    /// Positions in the compositor's layout go through [`Self::aim`] instead.
     pub(super) fn move_to(&mut self, x: i32, y: i32) -> Result<()> {
-        let (target_x, target_y) = match self.absolute {
-            Some(_) => (x, y),
-            None => {
-                // Without the absolute device the move has to be a delta from
-                // wherever this backend believes the pointer is.
-                let (dx, dy) = (x - self.position.0, y - self.position.1);
-                self.move_by(dx, dy)?;
-                return Ok(());
-            }
-        };
-        self.write_absolute(target_x, target_y)?;
-        if let Some(made) = self.made.filter(|made| made.elapsed() < FRESH_FOR) {
-            self.repeat = Some(Repeat {
-                until: made + FRESH_FOR,
-                at: std::time::Instant::now(),
-                position: (target_x, target_y),
-                offset: 0,
-            });
-        }
-        Ok(())
+        // 设备不声明 ABS 轴（否则会被 libinput 误分类），所以按当前指针位置
+        // 换算成相对位移。
+        let (dx, dy) = (x - self.position.0, y - self.position.1);
+        self.move_by(dx, dy)
     }
 
-    /// Writes one absolute position, in the desk's own coordinates.
-    fn write_absolute(&mut self, target_x: i32, target_y: i32) -> Result<()> {
-        let Some(desktop) = self.desktop else {
-            bail!("尚未取得桌面尺寸，无法绝对定位");
-        };
-        let device = self.absolute.as_ref().context("没有绝对指针")?;
-        let local_x = (target_x - desktop.left).clamp(0, desktop.width as i32 - 1);
-        let local_y = (target_y - desktop.top).clamp(0, desktop.height as i32 - 1);
-        device.send(&[(EV_ABS, ABS_X, local_x), (EV_ABS, ABS_Y, local_y)])?;
-        self.position = (target_x, target_y);
-        Ok(())
+    /// 移到合成器全局空间里的一点，由合成器按 `bounds`（它全部输出的外接
+    /// 矩形）解算。设备写入失败就不再用它，之后的绝对定位回到相对移动。
+    pub(super) fn aim(&mut self, x: i32, y: i32, bounds: Desktop) -> Result<()> {
+        let absolute = self.absolute.as_mut().context("虚拟绝对指针不可用")?;
+        let result = absolute.aim(x, y, bounds);
+        match &result {
+            Ok(()) => {
+                // 记下落点：设备之后被停用时，相对移动要靠它算位移，`pointer()`
+                // 问的也是它。
+                self.position = (x, y);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "虚拟绝对指针写入失败，停用并改用相对移动");
+                self.absolute = None;
+            }
+        }
+        result
+    }
+
+    /// 放弃还没补写完的位置（输入被收回或释放时，不再替对端移动指针）。
+    pub(super) fn forget_aim(&mut self) {
+        if let Some(absolute) = &mut self.absolute {
+            absolute.repeat = None;
+        }
     }
 
     pub(super) fn move_by(&mut self, mut dx: i32, mut dy: i32) -> Result<()> {
@@ -713,17 +905,31 @@ impl Injector {
         let Some(touchscreen) = &mut self.touchscreen else {
             return Ok(false);
         };
-        touchscreen.touch(kind, points, rotation)?;
+        let frames = touchscreen.step(kind, points, rotation)?;
+        let written = touchscreen.write(&frames);
+        self.keep_touchscreen(written)?;
         Ok(true)
     }
 
     /// 抬起所有触点。会话结束、换屏、取消时都要走一遍：合成器那边一个没抬起来
     /// 的触点会一直按着，应用也收不到结束。
     pub(super) fn release_touch(&mut self) -> Result<()> {
-        match &mut self.touchscreen {
-            Some(touchscreen) => touchscreen.release(),
-            None => Ok(()),
+        let Some(touchscreen) = &mut self.touchscreen else {
+            return Ok(());
+        };
+        let released = touchscreen.release();
+        self.keep_touchscreen(released)
+    }
+
+    /// 触摸屏写入失败就不再用它，和绝对指针一样：写到一半时合成器那边可能还按着
+    /// 触点，而这边已经说不清是哪些了。丢掉设备，内核和 libinput 会在它移除时
+    /// 把上面的触点全部抬起；之后的触摸退回单指模拟，日志也只记这一次。
+    fn keep_touchscreen(&mut self, result: Result<()>) -> Result<()> {
+        if let Err(error) = &result {
+            tracing::warn!(%error, "虚拟触摸屏写入失败，停用它，触摸退回单指模拟");
+            self.touchscreen = None;
         }
+        result
     }
 
     /// The lock keys as this backend last left them.
@@ -850,70 +1056,15 @@ impl Injector {
     /// except a position aimed at a device that may not have been opened yet,
     /// which goes out again until it certainly has been.
     pub(super) fn flush(&mut self) -> Result<()> {
-        let Some(repeat) = &mut self.repeat else {
-            return Ok(());
-        };
-        let now = std::time::Instant::now();
-        if now >= repeat.until {
-            let (x, y) = repeat.position;
-            self.repeat = None;
-            return self.write_absolute(x, y);
+        if let Some(absolute) = &mut self.absolute
+            && let Err(error) = absolute.flush()
+        {
+            tracing::warn!(%error, "虚拟绝对指针写入失败，停用并改用相对移动");
+            self.absolute = None;
+            return Err(error);
         }
-        if now.duration_since(repeat.at) < REPEAT_EVERY {
-            return Ok(());
-        }
-        repeat.at = now;
-        repeat.offset ^= 1;
-        let (x, y) = repeat.position;
-        let offset = repeat.offset;
-        self.write_absolute(x + offset, y)
+        Ok(())
     }
-}
-
-/// How long a device that has just been made is given before a position aimed
-/// at it stops being written again. A compositor opens a device this process
-/// has just created in its own time, and evdev hands a reader only what arrives
-/// after it opens, so a position written in that window reaches nobody.
-const FRESH_FOR: std::time::Duration = std::time::Duration::from_millis(1500);
-
-/// How often that position is written again while the window lasts.
-const REPEAT_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
-
-/// A position aimed at a device the compositor may not have opened yet.
-///
-/// The repeat cannot be the same value: the kernel drops an absolute value
-/// equal to the one the device already holds, which is exactly the case here.
-/// It is written one unit along instead -- one unit of a range that spans the
-/// whole desk, so not a pixel anyone can see -- and the exact position is
-/// written once more when the window closes.
-struct Repeat {
-    until: std::time::Instant,
-    at: std::time::Instant,
-    position: (i32, i32),
-    offset: i32,
-}
-
-/// The desk the compositor lays out, as the bounds of every output it
-/// describes. `None` where there is no compositor to ask, which is every
-/// session whose pointer space is the display server's own.
-fn compositor_desktop() -> Option<Desktop> {
-    let layout = crate::platform::linux::display::compositor_layout()?;
-    let left = layout.iter().map(|output| output.left).min()?;
-    let top = layout.iter().map(|output| output.top).min()?;
-    let right = layout
-        .iter()
-        .map(|output| output.left + output.width as i32)
-        .max()?;
-    let bottom = layout
-        .iter()
-        .map(|output| output.top + output.height as i32)
-        .max()?;
-    (right > left && bottom > top).then(|| Desktop {
-        left,
-        top,
-        width: (right - left) as u32,
-        height: (bottom - top) as u32,
-    })
 }
 
 /// The LED a lock key drives.
@@ -989,6 +1140,7 @@ fn us_key(c: char) -> Option<(u16, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::{CompositorLayout, CompositorOutput};
 
     fn contact(id: u32, x: f32, y: f32) -> Touch {
         Touch {
@@ -1012,6 +1164,8 @@ mod tests {
         assert!(frame.contains(&(EV_ABS, ABS_MT_TRACKING_ID, 1)));
         assert!(frame.contains(&(EV_ABS, ABS_MT_POSITION_X, touch_value(0.25))));
         assert!(frame.contains(&(EV_ABS, ABS_MT_POSITION_Y, touch_value(0.75))));
+        // 触点大小报的是直径：半径 0.02 的触点是 0.04
+        assert!(frame.contains(&(EV_ABS, ABS_MT_TOUCH_MAJOR, touch_value(0.04))));
         // 单点坐标跟着第一个触点走
         assert!(frame.contains(&(EV_ABS, ABS_X, touch_value(0.25))));
         assert!(frame.contains(&(EV_ABS, ABS_Y, touch_value(0.75))));
@@ -1053,19 +1207,94 @@ mod tests {
         assert_eq!(contacts.active.len(), 2);
         assert_eq!(contacts.used.iter().filter(|used| **used).count(), 2);
 
-        // 第二根手指抬起，第一根还在：帧里抬起后分配的那个槽位，面板仍然是按下的
+        // 第二根手指抬起，第一根还在：抬起自己一帧，面板仍然是按下的；剩下那根的
+        // 移动在下一帧
         let frames = contacts
             .step(2, &[contact(1, 0.2, 0.2)], Rotation::Normal)
             .unwrap();
-        assert_eq!(frames.len(), 1);
-        let frame = &frames[0];
-        assert!(frame.contains(&(EV_ABS, ABS_MT_SLOT, 1)));
-        assert!(frame.contains(&(EV_ABS, ABS_MT_TRACKING_ID, -1)));
-        assert!(!frame.contains(&(EV_KEY, BTN_TOUCH, 0)));
-        assert!(frame.contains(&(EV_ABS, ABS_MT_POSITION_X, touch_value(0.2))));
+        assert_eq!(frames.len(), 2);
+        assert_eq!(
+            frames[0],
+            [(EV_ABS, ABS_MT_SLOT, 1), (EV_ABS, ABS_MT_TRACKING_ID, -1)]
+        );
+        assert!(!frames[1].contains(&(EV_KEY, BTN_TOUCH, 0)));
+        assert!(frames[1].contains(&(EV_ABS, ABS_MT_SLOT, 0)));
+        assert!(frames[1].contains(&(EV_ABS, ABS_MT_POSITION_X, touch_value(0.2))));
         assert_eq!(contacts.active.len(), 1);
         assert!(!contacts.used[1]);
         assert!(contacts.used[0]);
+    }
+
+    /// 每一帧里每个槽位写过的 tracking id。libinput 在同一帧里看到一个槽位先
+    /// 写 -1 再写新 id，会把抬起和按下一起丢掉。
+    fn ends_and_begins_in_one_frame(frames: &[Frame]) -> bool {
+        frames.iter().any(|frame| {
+            let mut slot = None;
+            let mut written: BTreeMap<i32, Vec<i32>> = BTreeMap::new();
+            for &(kind, code, value) in frame {
+                match (kind, code) {
+                    (EV_ABS, ABS_MT_SLOT) => slot = Some(value),
+                    (EV_ABS, ABS_MT_TRACKING_ID) => {
+                        written.entry(slot.unwrap()).or_default().push(value)
+                    }
+                    _ => {}
+                }
+            }
+            written
+                .values()
+                .any(|ids| ids.contains(&-1) && ids.iter().any(|id| *id >= 0))
+        })
+    }
+
+    /// 一根手指抬起、另一根同时按下（主控在两次点击之间没有发抬起）：抬起和按下
+    /// 落在两帧里，按下的那一帧可以复用刚空出来的槽位。
+    #[test]
+    fn a_contact_replaced_in_one_step_lifts_and_presses_in_separate_frames() {
+        let mut contacts = Contacts::default();
+        contacts
+            .step(2, &[contact(1, 0.5, 0.5)], Rotation::Normal)
+            .unwrap();
+        let frames = contacts
+            .step(2, &[contact(2, 0.3, 0.3)], Rotation::Normal)
+            .unwrap();
+        assert_eq!(frames.len(), 2);
+        // 先抬起，面板也跟着松开
+        assert_eq!(
+            frames[0],
+            [
+                (EV_ABS, ABS_MT_SLOT, 0),
+                (EV_ABS, ABS_MT_TRACKING_ID, -1),
+                (EV_KEY, BTN_TOUCH, 0),
+            ]
+        );
+        // 再按下新触点，同一个槽位、新的 tracking id
+        assert!(frames[1].contains(&(EV_ABS, ABS_MT_SLOT, 0)));
+        assert!(frames[1].contains(&(EV_ABS, ABS_MT_TRACKING_ID, 2)));
+        assert!(!frames[1].contains(&(EV_ABS, ABS_MT_TRACKING_ID, -1)));
+        assert!(frames[1].contains(&(EV_KEY, BTN_TOUCH, 1)));
+        assert!(!ends_and_begins_in_one_frame(&frames));
+    }
+
+    /// 一串换手指的帧里，没有哪一帧对同一个槽位既写 -1 又写新 id。
+    #[test]
+    fn no_frame_ends_and_begins_a_contact_in_the_same_slot() {
+        let mut contacts = Contacts::default();
+        let steps: [&[Touch]; 6] = [
+            &[contact(1, 0.1, 0.1), contact(2, 0.2, 0.2)],
+            // 1 抬起，3 按下：3 拿到 1 空出来的槽位 0
+            &[contact(2, 0.2, 0.3), contact(3, 0.4, 0.4)],
+            // 两根都换掉
+            &[contact(4, 0.5, 0.5), contact(5, 0.6, 0.6)],
+            &[contact(5, 0.6, 0.7)],
+            &[contact(6, 0.7, 0.7)],
+            &[],
+        ];
+        for points in steps {
+            let frames = contacts.step(2, points, Rotation::Normal).unwrap();
+            assert!(!ends_and_begins_in_one_frame(&frames), "{frames:?}");
+        }
+        assert!(contacts.active.is_empty());
+        assert!(!contacts.touching);
     }
 
     /// 「触点集合从现在开始」这一类帧，先抬起旧的一套，再按下新的一套。
@@ -1108,6 +1337,205 @@ mod tests {
             .map(|id| contact(id, 0.5, 0.5))
             .collect();
         assert!(contacts.step(2, &points, Rotation::Normal).is_err());
+    }
+
+    /// 走不下去的一步什么也不改：本来按着的触点还记着，之后照样能抬起来。
+    #[test]
+    fn a_refused_step_keeps_the_contacts_it_had() {
+        let mut contacts = Contacts::default();
+        contacts
+            .step(
+                2,
+                &[contact(1, 0.1, 0.1), contact(2, 0.2, 0.2)],
+                Rotation::Normal,
+            )
+            .unwrap();
+        // 1 和 2 都没了，换上 11 个新触点：槽位不够
+        let points: Vec<Touch> = (10..10 + TOUCH_SLOTS as u32 + 1)
+            .map(|id| contact(id, 0.5, 0.5))
+            .collect();
+        assert!(contacts.step(2, &points, Rotation::Normal).is_err());
+        assert_eq!(contacts.active.keys().copied().collect::<Vec<_>>(), [1, 2]);
+        assert_eq!(contacts.used.iter().filter(|used| **used).count(), 2);
+        assert_eq!(contacts.tracking, 2);
+        assert!(contacts.touching);
+
+        let frames = contacts.step(3, &[], Rotation::Normal).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].contains(&(EV_ABS, ABS_MT_SLOT, 0)));
+        assert!(frames[0].contains(&(EV_ABS, ABS_MT_SLOT, 1)));
+        assert!(frames[0].contains(&(EV_KEY, BTN_TOUCH, 0)));
+    }
+
+    /// tracking id 在声明的 `0..=TRACKING_MAX` 里回绕，不会是 -1，也不会撞上
+    /// 还按着的触点。
+    #[test]
+    fn tracking_ids_wrap_within_the_declared_range() {
+        let mut contacts = Contacts::default();
+        contacts.tracking = TRACKING_MAX - 1;
+        contacts
+            .step(2, &[contact(1, 0.5, 0.5)], Rotation::Normal)
+            .unwrap();
+        assert_eq!(contacts.active[&1].tracking, TRACKING_MAX);
+        // 1 一直按着；下一个回绕到 0
+        let frames = contacts
+            .step(
+                2,
+                &[contact(1, 0.5, 0.5), contact(2, 0.6, 0.6)],
+                Rotation::Normal,
+            )
+            .unwrap();
+        assert!(frames[0].contains(&(EV_ABS, ABS_MT_TRACKING_ID, 0)));
+        assert_eq!(contacts.active[&2].tracking, 0);
+
+        // 又绕一圈回到 TRACKING_MAX 和 0 时，它们还被 1 和 2 占着，跳过去
+        contacts.tracking = TRACKING_MAX - 1;
+        contacts
+            .step(
+                2,
+                &[
+                    contact(1, 0.5, 0.5),
+                    contact(2, 0.6, 0.6),
+                    contact(3, 0.7, 0.7),
+                ],
+                Rotation::Normal,
+            )
+            .unwrap();
+        assert_eq!(contacts.active[&1].tracking, TRACKING_MAX);
+        assert_eq!(contacts.active[&3].tracking, 1);
+    }
+
+    /// Where a screen position lands on an untransformed panel: on an output
+    /// the compositor has turned 90°, the screen's top-left is the panel's
+    /// bottom-left, and so on.
+    #[test]
+    fn a_rotated_output_maps_screen_corners_to_panel_corners() {
+        let corners = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)];
+        assert_eq!(panel(Rotation::Normal, 0.25, 0.75), (0.25, 0.75));
+        assert_eq!(
+            corners.map(|(x, y)| panel(Rotation::Rotate90, x, y)),
+            [(0.0, 1.0), (0.0, 0.0), (1.0, 1.0), (1.0, 0.0)]
+        );
+        assert_eq!(
+            corners.map(|(x, y)| panel(Rotation::Rotate180, x, y)),
+            [(1.0, 1.0), (0.0, 1.0), (1.0, 0.0), (0.0, 0.0)]
+        );
+        assert_eq!(
+            corners.map(|(x, y)| panel(Rotation::Rotate270, x, y)),
+            [(1.0, 0.0), (1.0, 1.0), (0.0, 0.0), (0.0, 1.0)]
+        );
+    }
+
+    /// The compositor's side of the same mapping: a point as a fraction of the
+    /// panel, to a point as a fraction of the screen, which is smithay's
+    /// `transform_point_in` with the panel's own size as the area. Written out
+    /// here so [`panel`] is checked against it rather than against itself.
+    fn compositor(rotation: Rotation, panel: (f32, f32)) -> (f32, f32) {
+        let (x, y) = panel;
+        match rotation {
+            Rotation::Normal => (x, y),
+            Rotation::Rotate90 => (1.0 - y, x),
+            Rotation::Rotate180 => (1.0 - x, 1.0 - y),
+            Rotation::Rotate270 => (y, 1.0 - x),
+            Rotation::Flipped => (1.0 - x, y),
+            Rotation::Flipped90 => (y, x),
+            Rotation::Flipped180 => (x, 1.0 - y),
+            Rotation::Flipped270 => (1.0 - y, 1.0 - x),
+        }
+    }
+
+    /// Every turn, including the flipped ones: where the compositor puts the
+    /// point this side names for it has to be the point the controller aimed
+    /// at in the first place.
+    #[test]
+    fn a_panel_position_is_the_inverse_of_what_the_compositor_does() {
+        let rotations = [
+            Rotation::Normal,
+            Rotation::Rotate90,
+            Rotation::Rotate180,
+            Rotation::Rotate270,
+            Rotation::Flipped,
+            Rotation::Flipped90,
+            Rotation::Flipped180,
+            Rotation::Flipped270,
+        ];
+        for rotation in rotations {
+            for (x, y) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0), (0.25, 0.6)] {
+                let point = panel(rotation, x, y);
+                let (sx, sy) = compositor(rotation, point);
+                assert!(
+                    (sx - x).abs() < 1e-6 && (sy - y).abs() < 1e-6,
+                    "{rotation:?}: 屏幕 ({x}, {y}) 报成面板 {point:?}，合成器又算回 ({sx}, {sy})"
+                );
+            }
+        }
+    }
+
+    /// What libinput hands the compositor (`value × extent / (max − min + 1)`)
+    /// and the pixel that position falls on.
+    fn landed(value: i32, origin: i32, extent: u32) -> i32 {
+        let position = f64::from(value) * f64::from(extent) / (f64::from(AXIS_MAX) + 1.0);
+        origin + position.floor() as i32
+    }
+
+    #[test]
+    fn every_pixel_maps_back_onto_itself() {
+        for (origin, extent) in [(0, 1), (0, 1000), (-1920, 4793), (1000, 3793), (0, 65536)] {
+            for position in origin..origin + extent as i32 {
+                let value = axis_value(position, origin, extent);
+                assert!((0..=AXIS_MAX).contains(&value));
+                assert_eq!(landed(value, origin, extent), position, "{origin} {extent}");
+            }
+        }
+    }
+
+    #[test]
+    fn positions_outside_the_bounds_stay_on_its_edge() {
+        assert_eq!(
+            axis_value(-5000, -1920, 4793),
+            axis_value(-1920, -1920, 4793)
+        );
+        assert_eq!(axis_value(9000, -1920, 4793), axis_value(2872, -1920, 4793));
+        assert_eq!(axis_value(10, 0, 0), 0);
+    }
+
+    #[test]
+    fn a_repeated_value_is_nudged_within_the_axis() {
+        assert_eq!(nudge((10, 20), (11, 20)), None);
+        assert_eq!(nudge((10, 20), (10, 21)), None);
+        assert_eq!(nudge((10, 20), (10, 20)), Some((11, 20)));
+        assert_eq!(nudge((0, 0), (0, 0)), Some((1, 0)));
+        assert_eq!(nudge((AXIS_MAX, 5), (AXIS_MAX, 5)), Some((AXIS_MAX - 1, 5)));
+    }
+
+    #[test]
+    fn bounds_cover_every_output_named_or_not() {
+        let output = |name: Option<&str>, left, top, width, height| CompositorOutput {
+            name: name.map(Into::into),
+            left,
+            top,
+            width,
+            height,
+            rotation: Rotation::default(),
+        };
+        let layout = CompositorLayout {
+            outputs: vec![
+                output(Some("DP-1"), 0, 0, 2560, 1440),
+                output(None, -1080, -480, 1080, 1920),
+                output(Some("HDMI-A-1"), 2560, 200, 1280, 1024),
+                output(Some("broken"), 9000, 9000, 0, 0),
+            ],
+        };
+        assert_eq!(
+            layout_bounds(&layout),
+            Some(Desktop {
+                left: -1080,
+                top: -480,
+                width: 4920,
+                height: 1920
+            })
+        );
+        assert_eq!(layout_bounds(&CompositorLayout::default()), None);
     }
 
     #[test]

@@ -17,12 +17,12 @@ use crate::platform::Rotation;
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::BTreeSet;
 
-pub(crate) use uinput::Desktop;
+pub(crate) use uinput::{Desktop, layout_bounds};
 
 /// 控制器报来的一个触点：它的 id、屏幕上的比例位置和比例半径。
 ///
 /// 平台层不认识 UU 的消息，所以输入引擎先把触点换算成比例；角度和压力在 evdev
-/// 这边没有对应的轴，虚拟触摸屏只报位置和接触面积。
+/// 这边没有对应的轴，虚拟触摸屏只报位置和触点直径（见 `ABS_MT_TOUCH_MAJOR`）。
 #[derive(Clone, Copy)]
 pub(crate) struct Touch {
     pub id: u32,
@@ -113,12 +113,11 @@ impl Injector {
         }
     }
 
-    /// Whether absolute positions reach the pointer through the compositor's
-    /// own layout rather than through the display server's. The virtual devices
-    /// are resolved by the compositor, which reads them as a fraction of that
+    /// Whether there is a virtual absolute pointer. Only with one can
+    /// absolute positions reach the pointer through the compositor's own
     /// layout; X Test is resolved by X, in X's rectangles.
-    pub fn aims_in_compositor_layout(&self) -> bool {
-        matches!(self, Self::UInput(_))
+    pub fn has_absolute_pointer(&self) -> bool {
+        matches!(self, Self::UInput(injector) if injector.has_absolute_pointer())
     }
 
     /// What the diagnostics page calls this session's injector.
@@ -126,15 +125,6 @@ impl Injector {
         match self {
             Self::XTest(injector) => injector.label(),
             Self::UInput(injector) => injector.label(),
-        }
-    }
-
-    /// Tells the backend how big the desktop is, for the ones that need to
-    /// name a position rather than a displacement.
-    pub fn set_geometry(&mut self, desktop: Desktop) -> Result<()> {
-        match self {
-            Self::XTest(_) => Ok(()),
-            Self::UInput(injector) => injector.set_geometry(desktop),
         }
     }
 
@@ -156,6 +146,23 @@ impl Injector {
         match self {
             Self::XTest(injector) => injector.move_to(x, y),
             Self::UInput(injector) => injector.move_to(x, y),
+        }
+    }
+
+    /// 移到合成器全局空间里的一点，由合成器按 `bounds`（它全部输出的外接矩形）
+    /// 解算。只有 uinput 后端有这台设备；XTest 由 X 在它自己的矩形里解算。
+    pub fn aim(&mut self, x: i32, y: i32, bounds: Desktop) -> Result<()> {
+        match self {
+            Self::XTest(_) => bail!("XTest 后端不按合成器布局定位"),
+            Self::UInput(injector) => injector.aim(x, y, bounds),
+        }
+    }
+
+    /// 放弃还没补写完的位置（输入被收回或释放时，不再替对端移动指针）。
+    pub fn forget_aim(&mut self) {
+        match self {
+            Self::XTest(_) => {}
+            Self::UInput(injector) => injector.forget_aim(),
         }
     }
 
@@ -388,14 +395,6 @@ mod session_tests {
     fn pointer_moves_where_asked() {
         let mut injector = super::Injector::open().unwrap();
         println!("backend: {}", injector.label());
-        injector
-            .set_geometry(super::Desktop {
-                left: 0,
-                top: 0,
-                width: 2560,
-                height: 1600,
-            })
-            .unwrap();
         let before = injector.pointer().unwrap();
         injector.move_to(123, 234).unwrap();
         injector.flush().unwrap();
