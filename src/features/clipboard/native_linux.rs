@@ -442,11 +442,15 @@ impl LocalSnapshot {
                 ensure!(!self.sources.is_empty(), "本地剪贴板没有文件");
                 let files = collect_files(&self.sources)?;
                 let descriptors: Vec<_> = files.items.iter().map(|f| f.desc.clone()).collect();
-                formats::descriptor_bytes(&descriptors)
+                formats::descriptor_bytes(&descriptors, "不安全的文件名称")
             }
             // 只做复制（DROPEFFECT_COPY = 1）。答成移动会让文件管理器把被控端
             // 的原文件搬走——这条不是可选的礼貌，是安全线。
-            _ if format.wire.name.eq_ignore_ascii_case("Preferred DropEffect") => {
+            _ if format
+                .wire
+                .name
+                .eq_ignore_ascii_case("Preferred DropEffect") =>
+            {
                 Ok(1u32.to_le_bytes().to_vec())
             }
             _ => bail!("不支持的本地剪贴板格式 {}", format.wire.name),
@@ -1830,5 +1834,32 @@ mod tests {
             &[PathBuf::from("/run/user/1000/openuuyc/clipboard-other/x")],
             parent
         ));
+    }
+
+    #[test]
+    fn remote_copies_under_a_symlinked_runtime_dir_are_still_ours() {
+        let base = std::env::temp_dir().join(format!("openuuyc-runtime-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real");
+        let link = base.join("link");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let root = super::super::fuse::root_under(&link);
+        let file = root.join("7/a.txt");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"a").unwrap();
+        // What the clipboard hands back after arboard wrote our mount's path.
+        let published = std::fs::canonicalize(&file).unwrap();
+        assert!(own_paths(std::slice::from_ref(&published), &root));
+        // The unresolved root is what used to be compared, and it misses.
+        let raw = link.join("openuuyc").join("clipboard");
+        assert!(!own_paths(&[published], &raw));
+        // A runtime directory that cannot be resolved falls back to the raw path.
+        let missing = base.join("missing");
+        assert_eq!(
+            super::super::fuse::root_under(&missing),
+            missing.join("openuuyc").join("clipboard")
+        );
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

@@ -1763,8 +1763,11 @@ impl IDataObject_Impl for RemoteData_Impl {
             });
         }
         let data = if id == formats::register("FileGroupDescriptorW") {
-            formats::descriptor_bytes(&self.offer.list().map_err(com_error)?)
-                .map_err(com_error)?
+            formats::descriptor_bytes(
+                &self.offer.list().map_err(com_error)?,
+                "不安全的远端文件名称",
+            )
+            .map_err(com_error)?
         } else {
             let cache = lock(&self.offer.cached).get(&id).cloned();
             if let Some(v) = cache {
