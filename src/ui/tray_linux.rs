@@ -87,11 +87,16 @@ impl Tray {
 
     /// 被控角标：这台机器正被别人控制时，托盘图标右上角多一个红三角。
     pub(super) fn set_controlled(&self, controlled: bool) {
-        if self.controlled.swap(controlled, Ordering::Relaxed) == controlled {
+        if self.controlled.load(Ordering::Relaxed) == controlled {
             return;
         }
         let icon = icon(controlled);
-        self.handle.update(|item| item.icon = vec![icon]);
+        // 跟上 Windows 侧同一个原则：只有托盘真的换上了才记状态，没换上就留着重试。
+        if self.handle.update(|item| item.icon = vec![icon]).is_some() {
+            self.controlled.store(controlled, Ordering::Relaxed);
+        } else {
+            tracing::debug!(controlled, "托盘已关闭，角标留到下次再换");
+        }
     }
 }
 
