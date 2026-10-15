@@ -76,7 +76,9 @@ async fn probe(
         let started = std::time::Instant::now();
         ensure!(active(), "媒体准备已取消");
         let _runtime = encoder::Runtime::with_gpu_compatibility(gpu_compatibility)?;
-        let mut desktop = capture::Desktop::open_selected(&screen)?;
+        // 探针只解码一两帧看被控能力，传 false：绝不让它去协商、mmap 合成器的
+        // dma-buf——不可映射的 dma-buf 会让整个能力检查失败，会话根本起不来。
+        let mut desktop = capture::Desktop::open_selected_for(&screen, false)?;
         let codecs = encoder::probe(&mut desktop, &active)?;
         ensure!(active(), "媒体准备已取消");
         tracing::info!(

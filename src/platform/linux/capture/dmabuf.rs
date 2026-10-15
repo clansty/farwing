@@ -63,9 +63,19 @@ const MAP_DUMB: libc::c_ulong = request(0xb3, size_of::<MapDumb>() as u64);
 const DESTROY_DUMB: libc::c_ulong = request(0xb4, size_of::<DestroyDumb>() as u64);
 const HANDLE_TO_FD: libc::c_ulong = request(0x2d, size_of::<PrimeHandle>() as u64);
 
+/// 这块显存缓冲是谁的。
+enum Source {
+    /// 我们自己在 `card` 上用 dumb buffer 分配、再导出 fd 的；不用了要把句柄还回去。
+    Allocated { handle: u32, card: OwnedFd },
+    /// 别人的 fd：门户（PipeWire）递过来的合成器缓冲。它线性排布，直接 mmap
+    /// 就能读，回收只由 `release` 负责，这里没有句柄可还。
+    Imported,
+}
+
 /// 一块交给合成器画的显存缓冲，以及引用它需要的那个 fd。
 pub(crate) struct Buffer {
-    /// 由 `PRIME_HANDLE_TO_FD` 得到，交给 `wl_buffer` 之后合成器自己持有引用。
+    /// 由 `PRIME_HANDLE_TO_FD` 得到（自己分配的），或是门户那块缓冲 fd 的 `dup`。
+    /// 交给 `wl_buffer` 之后合成器自己持有引用。
     pub prime: OwnedFd,
     pub width: u32,
     pub height: u32,
@@ -73,8 +83,11 @@ pub(crate) struct Buffer {
     pub format: u32,
     pub modifier: u64,
     pub size: u64,
-    handle: u32,
-    card: OwnedFd,
+    source: Source,
+    /// 门户那条路专用：内容还在合成器的缓冲池里，等我们不再读它了才能还回去
+    /// （真正归还由挂在这里的那份租约的 `Drop` 做，见 `pipewire::BufferLease`）。
+    /// 自己分配的缓冲是 `None`。
+    release: Option<Box<dyn Send + Sync>>,
 }
 
 impl Buffer {
@@ -122,9 +135,45 @@ impl Buffer {
             format,
             modifier: LINEAR,
             size: create.size,
-            handle: create.handle,
-            card,
+            source: Source::Allocated {
+                handle: create.handle,
+                card,
+            },
+            release: None,
         })
+    }
+
+    /// 把门户递过来的一块缓冲收下来：fd 已经 `dup` 成我们自己的，`release` 负
+    /// 责不用了把它还回合成器的池子。这块缓冲是线性的（调用方保证），所以
+    /// `read_back` 直接 mmap 就能读。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn import(
+        prime: OwnedFd,
+        width: u32,
+        height: u32,
+        stride: u32,
+        format: u32,
+        modifier: u64,
+        size: u64,
+        release: Option<Box<dyn Send + Sync>>,
+    ) -> Self {
+        Self {
+            prime,
+            width,
+            height,
+            stride,
+            format,
+            modifier,
+            size,
+            source: Source::Imported,
+            release,
+        }
+    }
+
+    /// 这块缓冲的内容是不是别人的（门户从合成器池子里借的）。借来的不能攥着当
+    /// 「上一帧」，否则会把池子抽干；自己分配的没这个问题。
+    pub(crate) fn imported(&self) -> bool {
+        matches!(self.source, Source::Imported)
     }
 
     /// 把它包成合成器认的 `wl_buffer`。
@@ -159,12 +208,15 @@ impl Buffer {
     /// 只给探针用：把内容映射回内存看一眼。生产路径不需要这个（也不需要 CPU 读）。
     #[cfg(test)]
     pub(crate) fn write_pattern(&self, pixels: &[u8]) -> Result<()> {
+        let Source::Allocated { handle, card } = &self.source else {
+            bail!("导入的缓冲不能这样写");
+        };
         let mut map = MapDumb {
-            handle: self.handle,
+            handle: *handle,
             ..Default::default()
         };
         // Safe because the handle is this buffer's and the struct matches.
-        let result = unsafe { libc::ioctl(self.card.as_raw_fd(), MAP_DUMB, &mut map) };
+        let result = unsafe { libc::ioctl(card.as_raw_fd(), MAP_DUMB, &mut map) };
         ensure!(result >= 0, "映射显存缓冲失败");
         // Safe because the driver gave us this offset for this buffer.
         let pointer = unsafe {
@@ -173,7 +225,7 @@ impl Buffer {
                 self.size as usize,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED,
-                self.card.as_raw_fd(),
+                card.as_raw_fd(),
                 map.offset as i64,
             )
         };
@@ -198,22 +250,30 @@ impl Buffer {
     /// 把内容读回系统内存。只给「显存那条路走不通了」的后备路径用：一帧几十
     /// 毫秒，正常编解码不会走到这里。
     pub(crate) fn read_back(&self) -> Result<Vec<u8>> {
-        let mut map = MapDumb {
-            handle: self.handle,
-            ..Default::default()
+        // 自己分配的：句柄 → 映射偏移 → 从 card 节点映射。门户导入的：它就是一块
+        // 线性的 dma-buf，直接按 fd 映射，偏移从 0 起。
+        let (fd, offset) = match &self.source {
+            Source::Allocated { handle, card } => {
+                let mut map = MapDumb {
+                    handle: *handle,
+                    ..Default::default()
+                };
+                // Safe because the handle is this buffer's and the struct matches.
+                let result = unsafe { libc::ioctl(card.as_raw_fd(), MAP_DUMB, &mut map) };
+                ensure!(result >= 0, "映射显存缓冲失败");
+                (card.as_raw_fd(), map.offset as i64)
+            }
+            Source::Imported => (self.prime.as_raw_fd(), 0),
         };
-        // Safe because the handle is this buffer's and the struct matches.
-        let result = unsafe { libc::ioctl(self.card.as_raw_fd(), MAP_DUMB, &mut map) };
-        ensure!(result >= 0, "映射显存缓冲失败");
-        // Safe because the driver gave us this offset for this buffer.
+        // Safe because the descriptor is live and `size` is the length we were given.
         let pointer = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 self.size as usize,
                 libc::PROT_READ,
                 libc::MAP_SHARED,
-                self.card.as_raw_fd(),
-                map.offset as i64,
+                fd,
+                offset,
             )
         };
         ensure!(pointer != libc::MAP_FAILED, "mmap 显存缓冲失败");
@@ -229,7 +289,12 @@ impl Buffer {
 
 impl Drop for Buffer {
     fn drop(&mut self) {
-        destroy(self.card.as_raw_fd(), self.handle);
+        if let Source::Allocated { handle, card } = &self.source {
+            destroy(card.as_raw_fd(), *handle);
+        }
+        // 门户那条路：内容还在合成器的池子里，我们不再读了才还回去。放在最后，
+        // 顺手把这份租约的 `Drop` 跑掉（归还 pw_buffer）。
+        drop(self.release.take());
     }
 }
 

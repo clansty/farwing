@@ -362,6 +362,11 @@ impl Frame {
     pub fn hardware_image(&self) -> bool {
         false
     }
+
+    /// Windows 的帧都是 DXGI 交出来的自有资源，留一份当「上一帧」没有代价。
+    pub fn cacheable(&self) -> bool {
+        true
+    }
 }
 
 enum Backend {
@@ -387,7 +392,20 @@ pub(crate) struct Desktop {
     _power: Option<power::Request>,
     _gpu_scheduling: Option<super::gpu_scheduling::Lease>,
 }
+/// Windows 上采集与编码都不存在「显存还是系统内存」这个选择（DXGI 的帧一直在
+/// 显存里、编码器也一直直接吃它），所以对上层恒报「没有可协商的零拷贝」，与
+/// `Frame::hardware_image` 一致。
+pub(crate) fn zero_copy_capable() -> bool {
+    false
+}
+
 impl Desktop {
+    /// `dmabuf` 是 Linux 门户那套显存协商的开关，Windows 上没有对应概念：接入
+    /// 方式不随它变。留着只为两平台接口一致。
+    pub fn open_selected_for(selected: &Screen, _dmabuf: bool) -> Result<Self> {
+        Self::open_selected(selected)
+    }
+
     pub fn open_selected(selected: &Screen) -> Result<Self> {
         if super::host_service::resident::is_owner() {
             let local = session::Session::new(selected)?;

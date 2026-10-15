@@ -93,7 +93,10 @@ pub(super) fn capture_loop(
             let opened_at = Instant::now();
             let connecting = !connected.load(Ordering::Acquire);
             runtime.begin_gpu_work(negotiated.gpu_compatibility);
-            desktop = Some(capture::Desktop::open_selected(&screen)?);
+            desktop = Some(capture::Desktop::open_selected_for(
+                &screen,
+                capture::zero_copy_capable(),
+            )?);
             generation = desktop.as_ref().unwrap().generation;
             tracing::info!(
                 elapsed_ms = opened_at.elapsed().as_millis(),
@@ -268,7 +271,10 @@ pub(super) fn capture_loop(
         }
         if desktop.is_none() {
             runtime.begin_gpu_work(negotiated.gpu_compatibility);
-            desktop = Some(capture::Desktop::open_selected(&screen)?);
+            desktop = Some(capture::Desktop::open_selected_for(
+                &screen,
+                capture::zero_copy_capable(),
+            )?);
             generation = desktop.as_ref().unwrap().generation;
             // Readiness can change after the preparation gate above. Apply the
             // same policy and reread settings after either native open path.
@@ -372,7 +378,13 @@ pub(super) fn capture_loop(
         let frame = match captured {
             Some(frame) => {
                 metrics.new_frames += u64::from(frame.is_new);
-                cached = Some(frame.clone());
+                // 门户那种从合成器池子里借来的显存帧不能留「上一帧」：池子本来就
+                // 浅，攥着不放合成器就没得写，它报 `Out of buffers` 之后整条流会
+                // 重来、一路退到共享内存。wlr 的显存缓冲是我们自己分配的，留一份
+                // 不影响合成器，静态屏上还得靠它发保活帧，所以照旧缓存。
+                if frame.cacheable() {
+                    cached = Some(frame.clone());
+                }
                 frame
             }
             None => {
