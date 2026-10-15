@@ -694,7 +694,7 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
 struct PendingScreen {
     id: i32,
     /// 让 `ScreenPlayback` 申请对端开始推这块屏；句柄只是留个可以放弃的位置。
-    _task: tokio::task::JoinHandle<()>,
+    _task: Option<tokio::task::AbortHandle>,
     result: tokio::sync::oneshot::Receiver<Result<Arc<NativeViewerSession>>>,
 }
 

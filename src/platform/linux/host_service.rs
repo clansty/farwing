@@ -207,6 +207,34 @@ pub(crate) mod startup {
         Ok(())
     }
 
+    /// 开机自启现在是什么状态。共用界面（`application/app/view/startup.rs`）要的是这个
+    /// 形状：Windows 那边从注册表的启动项读，Linux 这边问 systemd。
+    ///
+    /// `DisabledByWindows` 是 Windows 独有的说法（系统设置里被关掉，程序自己开不了），
+    /// Linux 上永远不会返回，留着只是为了让共用界面那段匹配能编译。
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) enum State {
+        Enabled,
+        Disabled,
+        #[allow(dead_code)]
+        DisabledByWindows,
+    }
+
+    /// 共用界面读这个：现在是开还是关。
+    pub(crate) fn state() -> Result<State> {
+        Ok(if enabled()? {
+            State::Enabled
+        } else {
+            State::Disabled
+        })
+    }
+
+    /// 共用界面写这个：开或关开机自启。单元里记的是当前可执行文件的位置。
+    pub(crate) fn configure(enabled: bool) -> Result<()> {
+        let image = std::env::current_exe().context("无法确定当前可执行文件")?;
+        set_image(enabled, &image)
+    }
+
     /// 单元现在是否已启用。查到的是 systemd 的实际状态，所以界面上的「开机自启」
     /// 与 `systemctl --user enable/disable` 永远是同一件事。
     pub(crate) fn enabled() -> Result<bool> {

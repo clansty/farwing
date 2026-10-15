@@ -27,6 +27,12 @@ pub(super) enum State {
     },
     NoRelease,
     Failed(String),
+    /// 这个分支不检查上游的发布。
+    ///
+    /// 我们的版本号后面带着 `-clansty`，而这里问的是 `djkcyl/farwing` 的 release：
+    /// 查到的「新版本」永远是别人的版本，提示出去只会误导。结构保留、请求一律不发，
+    /// 以后合上游时这一处是最好合的改动。
+    Disabled,
 }
 
 pub(super) struct UpdateCheck {
@@ -47,7 +53,7 @@ impl UpdateCheck {
             Err(error) => (Default::default(), Some(format!("{error:#}"))),
         };
         let mut check = Self {
-            state: State::Checking,
+            state: State::Disabled,
             dialog_open: false,
             notified_version: None,
             pending: None,
@@ -99,6 +105,10 @@ impl UpdateCheck {
     }
 
     pub fn request(&mut self, ctx: &egui::Context) {
+        // 见 `State::Disabled`：这个分支不去问上游的发布，手动点也一样。
+        if matches!(self.state, State::Disabled) {
+            return;
+        }
         if self.pending.is_some() || Instant::now() < self.retry_at {
             return;
         }
@@ -234,13 +244,15 @@ async fn fetch(
     url: &str,
     maximum_bytes: usize,
 ) -> Result<Option<Vec<u8>>> {
-    let mut response = client
-        .get(url)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2026-03-10")
-        .send()
-        .await
-        .context("无法连接 GitHub，请检查网络后重试")?;
+    let mut response = crate::transport::http::send(
+        crate::transport::http::Operation::Update,
+        client
+            .get(url)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2026-03-10"),
+    )
+    .await
+    .context("无法连接 GitHub，请检查网络后重试")?;
     match response.status() {
         reqwest::StatusCode::NOT_FOUND => return Ok(None),
         reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::TOO_MANY_REQUESTS => {

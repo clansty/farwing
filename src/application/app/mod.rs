@@ -154,16 +154,6 @@ impl StartupStage {
     }
 }
 
-/// 「开机自启」那一行要知道 systemd 里的真实状态，而查询与开关都是几毫秒的本机
-/// `systemctl` 调用，所以在界面线程做；`checked_at` 只是别让它每帧都问一次。
-#[cfg(target_os = "linux")]
-#[derive(Default)]
-struct AutostartUi {
-    enabled: Option<bool>,
-    error: Option<String>,
-    checked_at: Option<Instant>,
-}
-
 struct DeviceCenterApp {
     brand_texture: egui::TextureHandle,
     updates: updates::UpdateCheck,
@@ -192,7 +182,6 @@ struct DeviceCenterApp {
     host: Option<crate::features::host::Handle>,
     /// 登录自启（Linux 的 systemd 用户单元）的界面状态，见 `view::host_settings`。
     #[cfg(target_os = "linux")]
-    autostart: AutostartUi,
     notifications: notifications::Center,
     status: StatusMessage,
     refreshed_at: Option<Instant>,
@@ -250,7 +239,6 @@ impl DeviceCenterApp {
             media_inventory: media_preferences::Inventory::new(),
             presence: PresenceState::Connecting,
             #[cfg(target_os = "linux")]
-            autostart: AutostartUi::default(),
             host: None,
             notifications: notifications::Center::new(ctx),
             status: display_warning.map_or_else(

@@ -20,8 +20,9 @@
 
 _pkgname=openuuyc
 pkgname=$_pkgname-git
-# 基准版本必须与 Cargo.toml 的 [package].version 一致，pkgver() 会再读一次并追加 .r<rev>.g<hash>
-pkgver=1.0.0
+# 基准版本来自 Cargo.toml 的 [package].version，pkgver() 会再读一次并追加 .r<rev>.g<hash>。
+# 版本号里的 `-`（-clansty 这种预发布后缀）要换成 `.`：pacman 的 pkgver 里不能有连字符。
+pkgver=1.0.2.beta.3.clansty
 pkgrel=1
 pkgdesc='UU 远程（UU Remote）协议的第三方 Rust 客户端：远控别人，或被本机远控'
 arch=('x86_64')
@@ -103,6 +104,8 @@ pkgver() {
   cd "$(_src_dir)"
   local base rev hash
   base=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+  # `-` 是 PKGBUILD 里 pkgver 与 pkgrel 的分隔符，不能出现在版本号里。
+  base=${base//-/.}
   rev=$(git rev-list --count HEAD 2>/dev/null || echo 0)
   hash=$(git rev-parse --short=7 HEAD 2>/dev/null || echo nogit)
   printf '%s.r%s.g%s' "$base" "$rev" "$hash"

@@ -194,6 +194,7 @@ impl DeviceCenterApp {
                 None,
             ),
             State::Failed(_) => ("未能检查更新".into(), MUTED, None),
+            State::Disabled => ("本分支不检查上游的发布".into(), MUTED, None),
             State::Available {
                 version,
                 url,
@@ -213,8 +214,9 @@ impl DeviceCenterApp {
             ),
         };
         let checking = matches!(self.updates.state, State::Checking);
+        let disabled = matches!(self.updates.state, State::Disabled);
         let wait = self.updates.retry_wait();
-        let enabled = !checking && (destination.is_some() || wait == 0);
+        let enabled = !checking && !disabled && (destination.is_some() || wait == 0);
         let button = if destination.is_some() {
             "查看新版本"
         } else if checking {
@@ -229,7 +231,11 @@ impl DeviceCenterApp {
             let response = ui.add_enabled(enabled, primary(button));
             clicked = response.clicked();
             if !enabled && !checking {
-                response.on_disabled_hover_text(format!("{wait} 秒后可重新检查"));
+                response.on_disabled_hover_text(if disabled {
+                    "本分支不检查上游的发布".to_owned()
+                } else {
+                    format!("{wait} 秒后可重新检查")
+                });
             }
             ui.with_layout(egui::Layout::top_down(Align::Min), |ui| {
                 ui.label(RichText::new("软件更新").size(theme::SECTION).strong());
@@ -251,19 +257,21 @@ impl DeviceCenterApp {
                 self.updates.request(ui.ctx());
             }
         }
-        let mut allow = self.updates.allow_prerelease();
-        form_row_content(
-            ui,
-            "允许测试版",
-            "检查 alpha、beta、rc 等测试版更新",
-            |ui| {
-                if crate::ui::controls::switch(ui, &mut allow).changed() {
-                    let _ = self.updates.set_allow_prerelease(allow, ui.ctx());
-                }
-            },
-        );
-        if let Some(error) = &self.updates.settings_error {
-            ui.colored_label(AMBER, error);
+        if !disabled {
+            let mut allow = self.updates.allow_prerelease();
+            form_row_content(
+                ui,
+                "允许测试版",
+                "检查 alpha、beta、rc 等测试版更新",
+                |ui| {
+                    if crate::ui::controls::switch(ui, &mut allow).changed() {
+                        let _ = self.updates.set_allow_prerelease(allow, ui.ctx());
+                    }
+                },
+            );
+            if let Some(error) = &self.updates.settings_error {
+                ui.colored_label(AMBER, error);
+            }
         }
     }
 }

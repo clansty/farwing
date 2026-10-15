@@ -145,71 +145,6 @@ impl DeviceCenterApp {
             ui.label(RichText::new(message).small().color(MUTED));
         }
     }
-    /// 「开机自启」这一行。Linux 上它就是那个 systemd 用户单元的启用状态，问
-    /// systemd 要答案而不是自己记一份，所以在这里 `systemctl --user disable` 之后
-    /// 界面也会自己跟上。查询是几毫秒的本机调用，但不能每帧都问，于是按秒级刷新。
-    #[cfg(target_os = "linux")]
-    fn autostart_row(&mut self, ui: &mut egui::Ui, signed_in: bool) {
-        use crate::platform::host_service::startup;
-        let now = std::time::Instant::now();
-        if signed_in
-            && self
-                .autostart
-                .checked_at
-                .is_none_or(|at| now.duration_since(at) >= std::time::Duration::from_secs(1))
-        {
-            self.refresh_autostart();
-        }
-        let known = self.autostart.enabled.is_some() && signed_in;
-        let mut enabled = self.autostart.enabled.unwrap_or(false);
-        form_row(
-            ui,
-            "开机自启",
-            "登录桌面后自动上线被控；被控要有图形会话，登录界面下连不上",
-            |ui| {
-                ui.add_enabled_ui(known, |ui| {
-                    crate::ui::controls::service_switch(ui, &mut enabled)
-                });
-            },
-        );
-        if known && Some(enabled) != self.autostart.enabled {
-            let result = std::env::current_exe()
-                .map_err(anyhow::Error::from)
-                .and_then(|image| startup::set_image(enabled, &image))
-                // 开完再问一遍：界面上显示的必须是 systemd 的实际状态，不是意图。
-                .and_then(|()| startup::enabled());
-            match result {
-                Ok(now) => {
-                    self.autostart.enabled = Some(now);
-                    self.autostart.error = None;
-                }
-                Err(error) => self.autostart.error = Some(format!("{error:#}")),
-            }
-            self.autostart.checked_at = Some(std::time::Instant::now());
-            self.status = StatusMessage::success(if enabled {
-                "已开启开机自启；下次登录桌面后自动上线"
-            } else {
-                "已关闭开机自启"
-            });
-        }
-        if let Some(error) = self.autostart.error.clone() {
-            ui.colored_label(AMBER, error);
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn refresh_autostart(&mut self) {
-        use crate::platform::host_service::startup;
-        self.autostart.checked_at = Some(std::time::Instant::now());
-        match startup::enabled() {
-            Ok(enabled) => {
-                self.autostart.enabled = Some(enabled);
-                self.autostart.error = None;
-            }
-            Err(error) => self.autostart.error = Some(format!("{error:#}")),
-        }
-    }
-
     fn host_settings_controls(&mut self, ui: &mut egui::Ui) {
         section(ui, "被控设置");
         let host = self.host.clone();
@@ -221,7 +156,7 @@ impl DeviceCenterApp {
             |ui| {
                 if ui
                     .add_enabled_ui(host.is_some(), |ui| {
-                        crate::ui::controls::service_switch(ui, &mut allowed)
+                        crate::ui::controls::switch(ui, &mut allowed)
                     })
                     .inner
                     .changed()
@@ -233,7 +168,7 @@ impl DeviceCenterApp {
             },
         );
         #[cfg(target_os = "linux")]
-        self.autostart_row(ui, host.is_some());
+
         if let Some(host) = host.as_ref() {
             if host.request_audio_devices()
                 && self
