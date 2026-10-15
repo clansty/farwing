@@ -191,6 +191,12 @@ impl ConnectingWindowsRunner {
         self.window.as_ref().is_some_and(|window| window.id() == id)
     }
 
+    pub(crate) fn has_focus(&self) -> bool {
+        self.window
+            .as_ref()
+            .is_some_and(|window| window.has_focus())
+    }
+
     pub(crate) fn focus(&self) {
         if let Some(window) = &self.window {
             window.set_minimized(false);
@@ -818,7 +824,7 @@ impl Player {
             control_error: None,
             cursor: None,
             pointer_locked: false,
-            focused: true,
+            focused: window.has_focus(),
             motion_remainder: [0.0, 0.0],
             polling: Default::default(),
             polling_origin: Instant::now(),
@@ -1084,15 +1090,19 @@ impl Player {
             intercept_shortcuts: self.intercept_shortcuts,
             send_ctrl_alt_del: false,
         };
-        let display_size = self.display_size();
         let screen_id = self.session.screen_id();
+        // 「跟随本机」要的是本机显示器尺寸，和 Windows 侧一致。从前这里传的是
+        // 远端画面尺寸，选项给出的永远是远端当前分辨率，选了等于没选。
+        let local_size = window
+            .current_monitor()
+            .map(|monitor| (monitor.size().width, monitor.size().height));
         show_stream_control_window(
             ui.ctx(),
             &self.session.stream_control,
             &mut self.stream_control_ui,
             &mut view,
             screen_id,
-            display_size,
+            local_size,
             // Windows 那边这里要减掉全屏标题栏的宽度（`menu_inset`），Linux 没有那截。
             egui::vec2(-114.0, 52.0),
         );
@@ -1638,6 +1648,11 @@ impl Player {
         let DeviceEvent::MouseMotion { delta } = event else {
             return false;
         };
+        // X11 的 XI_RawMotion 是按 EventLoop 的 X 连接选在 root 上收的，与窗口
+        // 焦点无关；不看焦点的话，动一次鼠标会把每个观看窗口的远端指针都推一下。
+        if !self.focused {
+            return false;
+        }
         let input = self.input();
         if input.mode() == MouseMode::View || input.waiting_for_neutral() {
             return false;
@@ -1834,28 +1849,36 @@ impl Player {
                     }
                     self.confirm_neutral();
                 }
+                let pressed = *state == ElementState::Pressed;
+                // egui 的 consumed_by_ui 是按它上一帧的指针位置判定的：指针刚从
+                // 标题栏、菜单或通知上移出、下一次重绘之前的那次点击会被当成 UI
+                // 点击丢掉，用户得点两下。改按事件此刻的指针位置对视频层重新判定；
+                // 已经在拖着控件的仍保留指针。
+                self.pointer_in_video = self.pointer_on_video(context);
+                let ui_dragging = context.dragged_id().is_some();
                 tracing::debug!(target: "openuuyc::viewer::input",
-                    ?button, pressed = *state == ElementState::Pressed,
-                    consumed_by_ui, in_video = self.pointer_in_video,
+                    ?button, pressed,
+                    consumed_by_ui, ui_dragging, in_video = self.pointer_in_video,
                     mode = ?self.input().mode(),
                     relative = self.input().relative_mode(),
                     neutral_wait = self.input().waiting_for_neutral(),
                     "mouse button");
-                if consumed_by_ui || dragging || self.input().mode() == MouseMode::View {
+                if dragging || self.input().mode() == MouseMode::View {
                     return false;
                 }
-                if !self.pointer_in_video && *state == ElementState::Pressed {
+                // 松开一律放行：远端只对它在按着的按键有反应。
+                if pressed && (!self.pointer_in_video || ui_dragging) {
                     return false;
                 }
                 let Some(code) = mouse_button(*button) else {
                     return false;
                 };
-                self.input()
-                    .button(self.owner, code, *state == ElementState::Pressed);
+                self.input().button(self.owner, code, pressed);
                 true
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if consumed_by_ui || dragging || !self.pointer_in_video {
+                self.pointer_in_video = self.pointer_on_video(context);
+                if dragging || !self.pointer_in_video || context.dragged_id().is_some() {
                     return false;
                 }
                 let (horizontal, amount) = match delta {
@@ -1948,6 +1971,12 @@ impl Player {
             "remote cursor");
     }
 
+    /// 指针（winit 最后上报的位置）此刻是否落在画面上。
+    fn pointer_on_video(&self, context: &egui::Context) -> bool {
+        self.last_position
+            .is_some_and(|position| self.hit_video(context, position))
+    }
+
     fn hit_video(&self, context: &egui::Context, position: PhysicalPosition<f64>) -> bool {
         let scale = f64::from(context.pixels_per_point());
         self.hit_video_at(
@@ -2036,6 +2065,10 @@ impl Player {
     }
 
     fn send_position(&mut self, position: PhysicalPosition<f64>) {
+        // 失焦时继续转发，会把 owner 从别的观看窗口手里抢回来。
+        if !self.focused {
+            return;
+        }
         let input = self.input();
         if input.mode() == MouseMode::View || input.waiting_for_neutral() {
             return;

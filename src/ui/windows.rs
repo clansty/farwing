@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::WindowEvent;
+#[cfg(target_os = "linux")]
+use winit::event::{DeviceEvent, DeviceId};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 #[cfg(windows)]
 use winit::platform::windows::EventLoopBuilderExtWindows;
@@ -874,6 +876,14 @@ impl ApplicationHandler<Event> for Windows {
             viewer.runner.window_event(event_loop, id, event);
         }
         self.retire(event_loop);
+    }
+    #[cfg(target_os = "linux")]
+    fn device_event(&mut self, event_loop: &ActiveEventLoop, device: DeviceId, event: DeviceEvent) {
+        // 原始运动事件没有 WindowId，只能派给有焦点的那个观看窗口；广播出去会
+        // 让多个远端的指针一起动。
+        if let Some(viewer) = self.viewers.values_mut().find(|v| v.runner.has_focus()) {
+            viewer.runner.device_event(event_loop, device, event);
+        }
     }
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
         match event {
