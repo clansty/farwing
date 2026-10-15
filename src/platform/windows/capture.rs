@@ -22,6 +22,11 @@ use super::power_request as power;
 mod recovery;
 mod session;
 
+/// Windows 上采集从不需要本机用户同意。
+pub(crate) fn needs_consent() -> bool {
+    false
+}
+
 /// Read the state of this process's interactive session. Unknown/failure is
 /// not an unlocked session; callers retain their last confirmed report.
 pub(crate) fn session_locked() -> Option<bool> {

@@ -274,6 +274,32 @@ fn candidates() -> Result<Vec<Kind>> {
     })
 }
 
+/// 这份候选表里真正开得起来的那些，顺序不变。合成器不提供协议时把 `Wlr` 摘掉，
+/// 挡在它后面的东西（Mutter 和 KWin 上就是门户）才能被看见。
+fn usable(kinds: &[Kind], wlr_available: bool) -> Vec<Kind> {
+    kinds
+        .iter()
+        .copied()
+        .filter(|kind| *kind != Kind::Wlr || wlr_available)
+        .collect()
+}
+
+/// 现在开采集会不会要求本机用户共享屏幕：门户排在最前、又没有记住的授权。
+/// 开不起来的 `Wlr` 会把门户顶到第一位，所以这道判断必须问真正会用上的那份
+/// 候选表，而不是 `candidates()` 的原样。
+pub(crate) fn needs_consent() -> bool {
+    candidates().is_ok_and(|kinds| {
+        // 只有 `Wlr` 打头时它才可能把门户挡在后面，而探测要连一次合成器，
+        // 其它顺序就省掉这次连接。
+        let wlr = kinds.first() == Some(&Kind::Wlr) && wlr_screencopy::available();
+        consent_needed(&usable(&kinds, wlr), portal::remembered())
+    })
+}
+
+fn consent_needed(kinds: &[Kind], remembered: bool) -> bool {
+    kinds.first() == Some(&Kind::Portal) && !remembered
+}
+
 enum Backend {
     NvFbc(nvfbc::Grab),
     X11(x11::Grab),
@@ -558,7 +584,14 @@ impl Desktop {
                 .map(|picture| {
                     picture.map(|picture| {
                         let size = output(picture.width, picture.height, quality, maximum);
-                        let image = scale(&picture.pixels, (picture.width, picture.height), size);
+                        // 尺寸已经对上了就别再缩放一次：同尺寸的 scale() 也会
+                        // 老老实实分配并整帧拷一遍（2880x1800 约 20MiB），而这
+                        // 张已是 owned、紧密打包的 BGRA，直接交出去就行。
+                        let image = if size == (picture.width, picture.height) {
+                            picture.pixels
+                        } else {
+                            scale(&picture.pixels, (picture.width, picture.height), size)
+                        };
                         (size, image)
                     })
                 }),
@@ -568,7 +601,13 @@ impl Desktop {
                 .map(|picture| {
                     picture.map(|picture| {
                         let size = output(picture.width, picture.height, quality, maximum);
-                        let image = scale(&picture.pixels, (picture.width, picture.height), size);
+                        // 同上：PipeWire 给的已经是 owned 且紧密打包的 BGRA，
+                        // 原生尺寸下不必再分配、再拷一遍。
+                        let image = if size == (picture.width, picture.height) {
+                            picture.pixels
+                        } else {
+                            scale(&picture.pixels, (picture.width, picture.height), size)
+                        };
                         (size, image)
                     })
                 }),
@@ -815,7 +854,42 @@ pub(crate) fn scale_for_probe(source: &[u8], from: (u32, u32), to: (u32, u32)) -
 
 #[cfg(test)]
 mod tests {
-    use super::scale;
+    use super::{Kind, consent_needed, scale, usable};
+
+    #[test]
+    fn only_an_unremembered_portal_asks_the_user() {
+        assert!(consent_needed(&[Kind::Portal], false));
+        assert!(!consent_needed(&[Kind::Portal], true));
+        // X11 会话要等 NvFBC 与 MIT-SHM 都失败才会落到门户。
+        assert!(!consent_needed(
+            &[Kind::NvFbc, Kind::X11, Kind::Portal],
+            false
+        ));
+    }
+
+    #[test]
+    fn a_wlr_that_cannot_open_leaves_the_portal_in_front() {
+        // Mutter 与 KWin 都不提供 `zwlr_screencopy_manager_v1`：登录时的探测
+        // 绝不能落到底下的门户去弹共享授权窗，这正是 needs_consent() 要拦的事。
+        assert!(consent_needed(
+            &usable(&[Kind::Wlr, Kind::Portal], false),
+            false
+        ));
+        assert!(!consent_needed(
+            &usable(&[Kind::Wlr, Kind::Portal], true),
+            false
+        ));
+        // 已经记住的授权怎么样都不弹。
+        assert!(!consent_needed(
+            &usable(&[Kind::Wlr, Kind::Portal], false),
+            true
+        ));
+        // X11 的顺序里没有 wlr 可摘。
+        assert!(!consent_needed(
+            &usable(&[Kind::NvFbc, Kind::X11, Kind::Portal], false),
+            false
+        ));
+    }
 
     #[test]
     fn crop_to_even_keeps_pixels() {

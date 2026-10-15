@@ -699,6 +699,23 @@ fn pick(outputs: &[Output], screen: &Screen) -> Result<usize> {
     )
 }
 
+/// 这个合成器到底给不给这套协议。只连一次、读一遍注册表，不要任何一帧，
+/// 因此不会问用户任何事。启动探测靠它把「自己就能拷」的合成器和「只能落到底下
+/// 门户」的合成器分开。
+pub(crate) fn available() -> bool {
+    let Ok(connection) = Connection::connect_to_env() else {
+        return false;
+    };
+    let mut queue = connection.new_event_queue::<State>();
+    let handle = queue.handle();
+    connection.display().get_registry(&handle, ());
+    let mut state = State {
+        connection: Some(connection),
+        ..Default::default()
+    };
+    queue.roundtrip(&mut state).is_ok() && state.manager.is_some()
+}
+
 impl Dispatch<wl_registry::WlRegistry, ()> for State {
     fn event(
         state: &mut Self,

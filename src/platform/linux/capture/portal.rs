@@ -57,6 +57,24 @@ fn token_path() -> Result<std::path::PathBuf> {
     Ok(crate::platform::paths::require_local_app_data()?.join("OpenUUYC/screencast-restore-token"))
 }
 
+/// `path` 里的恢复令牌。空文件（用户在隐私设置里撤销后门户写回来的样子）
+/// 与读不到一样，都当作没有。
+fn token_at(path: &std::path::Path) -> Option<String> {
+    let token = std::fs::read_to_string(path).ok()?;
+    let token = token.trim().to_owned();
+    (!token.is_empty()).then_some(token)
+}
+
+/// 门户上次给的恢复令牌。
+fn saved_token() -> Option<String> {
+    token_at(token_path().ok()?.as_path())
+}
+
+/// 用户以前授权过、门户能凭令牌直接恢复会话，这次开采集不会再问他。
+pub(super) fn remembered() -> bool {
+    saved_token().is_some()
+}
+
 impl Session {
     fn start(cursor: bool) -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -64,10 +82,8 @@ impl Session {
             .thread_name("screencast-portal")
             .enable_all()
             .build()?;
-        let token = std::fs::read_to_string(token_path()?)
-            .ok()
-            .map(|token| token.trim().to_owned())
-            .filter(|token| !token.is_empty());
+        // 取令牌失败要让这次开门户直接失败，不能当成「没有令牌」继续（那是上游的语义）。
+        let token = token_at(token_path()?.as_path());
         let started = on_portal(&runtime, async {
             let proxy = Screencast::new()
                 .await

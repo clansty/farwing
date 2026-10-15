@@ -365,6 +365,12 @@ impl Handle {
             return Ok(());
         }
         tokio::task::spawn_blocking(super::displays::recovery::recover_abandoned).await??;
+        if capture::needs_consent() {
+            // 现在开采集会要求本机用户共享屏幕（门户在首次授权之前），登录不能
+            // 卡在这上面。真正的入站会话被授权时会自己准备能力。
+            tracing::info!("host media probe deferred until an authorized incoming session");
+            return Ok(());
+        }
         let screens = capture::screens()?;
         let Some(screen) = screens
             .iter()
