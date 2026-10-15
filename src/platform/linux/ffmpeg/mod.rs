@@ -32,6 +32,58 @@ fn check(code: i32, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// 开一个编码上下文并把它打开。
+///
+/// 码率只在这里生效：`vaapi_encode_init_rate_control` 在 `avcodec_open2` 里跑一次，
+/// 算好的 `bits_per_second`/`target_percentage` 存进编码器自己的私有上下文，之后
+/// 再也不看 `AVCodecContext` 上的 `bit_rate`。所以换码率唯一的路是把这一趟重走一遍，
+/// 不能在活着的上下文上改字段。
+///
+/// Safe as long as `codec` stays valid and `frames` is a live hardware frames
+/// context; the returned context is owned by the caller.
+unsafe fn open_context(
+    codec: *const ff::AVCodec,
+    frames: *mut ff::AVBufferRef,
+    size: (u32, u32),
+    rate: Rate,
+) -> Result<*mut ff::AVCodecContext> {
+    let context = ff::avcodec_alloc_context3(codec);
+    ensure!(!context.is_null(), "分配编码上下文失败");
+    (*context).width = size.0 as i32;
+    (*context).height = size.1 as i32;
+    (*context).pix_fmt = ff::AVPixelFormat::AV_PIX_FMT_VAAPI;
+    (*context).time_base = ff::AVRational {
+        num: 1,
+        den: rate.fps.max(1) as i32,
+    };
+    (*context).framerate = ff::AVRational {
+        num: rate.fps.max(1) as i32,
+        den: 1,
+    };
+    // 一个 GOP 就是一秒：库自己会在该发 IDR 的时候发，不用我们数。
+    (*context).gop_size = rate.fps.max(1) as i32;
+    (*context).max_b_frames = 0;
+    (*context).bit_rate = i64::from(rate.target.max(1));
+    (*context).hw_frames_ctx = ff::av_buffer_ref(frames);
+    rate_control(context, rate);
+    // 私有选项走字典：编码器自己的 priv_data 要到打开时才建立。
+    let mut options: *mut ff::AVDictionary = ptr::null_mut();
+    let name = CString::new("rc_mode")?;
+    // 这个选项是整数枚举：auto 0 / CQP 1 / CBR 2 / VBR 3 / ICQ 4 / QVBR 5 /
+    // AVBR 6。命令行里的 `-rc_mode vbr` 是 ffmpeg 自己把名字解成数字的。
+    check(
+        ff::av_dict_set_int(&mut options, name.as_ptr(), VBR, 0),
+        "设置码率控制",
+    )?;
+    let opened = ff::avcodec_open2(context, codec, &mut options);
+    ff::av_dict_free(&mut options);
+    if opened < 0 {
+        ff::avcodec_free_context(&mut { context });
+        bail!("打开 VA-API 编码器失败（libavcodec {opened}）");
+    }
+    Ok(context)
+}
+
 /// 用 libavcodec 的 VA-API 编码器编一路画面。
 pub(crate) struct Encoder {
     context: *mut ff::AVCodecContext,
@@ -102,40 +154,7 @@ impl Encoder {
                 }
             };
 
-            let context = ff::avcodec_alloc_context3(codec);
-            ensure!(!context.is_null(), "分配编码上下文失败");
-            (*context).width = size.0 as i32;
-            (*context).height = size.1 as i32;
-            (*context).pix_fmt = ff::AVPixelFormat::AV_PIX_FMT_VAAPI;
-            (*context).time_base = ff::AVRational {
-                num: 1,
-                den: rate.fps.max(1) as i32,
-            };
-            (*context).framerate = ff::AVRational {
-                num: rate.fps.max(1) as i32,
-                den: 1,
-            };
-            // 一个 GOP 就是一秒：库自己会在该发 IDR 的时候发，不用我们数。
-            (*context).gop_size = rate.fps.max(1) as i32;
-            (*context).max_b_frames = 0;
-            (*context).bit_rate = i64::from(rate.target.max(1));
-            (*context).hw_frames_ctx = ff::av_buffer_ref(frames);
-            rate_control(context, rate);
-            // 私有选项走字典：编码器自己的 priv_data 要到打开时才建立。
-            let mut options: *mut ff::AVDictionary = ptr::null_mut();
-            let name = CString::new("rc_mode")?;
-            // 这个选项是整数枚举：auto 0 / CQP 1 / CBR 2 / VBR 3 / ICQ 4 / QVBR 5 /
-            // AVBR 6。命令行里的 `-rc_mode vbr` 是 ffmpeg 自己把名字解成数字的。
-            check(
-                ff::av_dict_set_int(&mut options, name.as_ptr(), VBR, 0),
-                "设置码率控制",
-            )?;
-            let opened = ff::avcodec_open2(context, codec, &mut options);
-            ff::av_dict_free(&mut options);
-            if opened < 0 {
-                ff::avcodec_free_context(&mut { context });
-                bail!("打开 VA-API 编码器失败（libavcodec {opened}）");
-            }
+            let context = open_context(codec, frames, size, rate)?;
 
             // 自己建帧上下文的那条路（CPU 喂进来）才需要一块软件输入帧。
             let scratch = if external.is_none() {
@@ -219,29 +238,39 @@ impl Encoder {
         }
     }
 
-    /// 返回 `true` 表示质量档位变了，调用方要补一个关键帧。
+    /// 返回 `true` 表示换过编码器了，调用方要补一个关键帧。
     pub(crate) fn configure_rate(&mut self, rate: Rate) -> Result<bool> {
         let Some(update) = self.frame_rate.decide(rate) else {
             return Ok(false);
         };
-        let key = self.rate.quality != rate.quality;
+        let previous = self.rate;
         self.rate = update.rate;
-        self.frame_rate.commit(update);
-        // Safe because the context is a live libavcodec context of this encoder.
-        // Safe because the context is live and belongs to this encoder.
-        unsafe {
-            (*self.context).bit_rate = i64::from(self.rate.target.max(1));
-            rate_control(self.context, self.rate);
-            let name = CString::new("rc_mode")?;
-            let code = ff::av_opt_set_int(
-                self.context.cast(),
-                name.as_ptr(),
-                VBR,
-                ff::AV_OPT_SEARCH_CHILDREN,
-            );
-            check(code, "更新码率控制")?;
+        if let Err(error) = self.reopen() {
+            // 没换成就当没发生过：不提交这次决定，下一帧还会拿同一份反馈再试，
+            // 编码器也还在按老码率正常出图。
+            self.rate = previous;
+            return Err(error);
         }
-        Ok(key)
+        self.frame_rate.commit(update);
+        Ok(true)
+    }
+
+    /// 换一套码率，办法是把编码上下文重开一遍——`open_context` 上面说明了为什么
+    /// 没有别的路。重开之后第一帧本来就是 IDR，参考帧链从这里重新开始。
+    fn reopen(&mut self) -> Result<()> {
+        let name = CString::new(codec_name(self.format.codec).context("未知编码格式")?)?;
+        // Safe because the codec is looked up from a name, the frames context is
+        // owned by this encoder, and the new context is ours as soon as it opens.
+        let fresh = unsafe {
+            let codec = ff::avcodec_find_encoder_by_name(name.as_ptr());
+            ensure!(!codec.is_null(), "libavcodec 里没有这个 VA-API 编码器");
+            open_context(codec, self.frames, self.size, self.rate)?
+        };
+        // 先开新的再放旧的：开不出来时编码器还能按原样用下去。
+        unsafe { ff::avcodec_free_context(&mut self.context) };
+        self.context = fresh;
+        self.force_keyframe = true;
+        Ok(())
     }
 
     /// 一帧 BGRA 进去，若干包出来。
@@ -408,6 +437,100 @@ fn burned_cpu() -> f64 {
 mod tests {
     use super::*;
     use crate::media::encoding::{Codec, QualityTarget};
+
+    /// 中途把 `configure_rate` 抬上去，编码器到底跟不跟：`vaapi_encode_init_rate_control`
+    /// 只在 `avcodec_open2` 里跑一次（它把算好的码率存进私有上下文，之后不再看
+    /// `avctx->bit_rate`），所以打开之后再改就是改了等于没改——协商出来的带宽就白留了。
+    /// `OPENUUYC_PROBE_OUTPUT=DP-1 cargo test --release --lib -- --ignored reports_the_live_rate_change --nocapture`
+    #[test]
+    #[ignore]
+    fn reports_the_live_rate_change() {
+        let screens = crate::platform::linux::capture::screens().unwrap();
+        let wanted = std::env::var("OPENUUYC_PROBE_OUTPUT").unwrap_or_default();
+        let screen = screens
+            .iter()
+            .find(|screen| screen.device_name == wanted)
+            .unwrap_or(&screens[0])
+            .clone();
+        let (quality, maximum) = (4, (3840, 2160));
+        let mut desktop = crate::platform::linux::capture::Desktop::open_selected(&screen).unwrap();
+        let format = Format {
+            codec: Codec::H264,
+            chroma: 1,
+            depth: 8,
+        };
+        // 对照组：`PROBE_LOW` 一开始就是高码率时，后段的码率就是这套画面能花掉的
+        // 上限——抬上去的后段跟它一样，才说明重开真的把新码率装上去了。
+        let low = std::env::var("PROBE_LOW")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(3_000_000u32);
+        let high = std::env::var("PROBE_HIGH")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(45_000_000u32);
+        let mut rate = Rate {
+            target: low,
+            peak: low,
+            fps: 30,
+            quality,
+            quality_target: QualityTarget {
+                bitrate: low,
+                fps: 30,
+            },
+        };
+        // 采集只在画面有变化时给帧，静止的桌面几乎不出帧，所以两段都按帧数收工，
+        // 不按时间——否则后段可能只有三五帧，量出来的全是那个强制 IDR。
+        let (switch, settle) = (150u32, 90u32);
+        let mut switched = false;
+        let mut encoder = None;
+        let started = std::time::Instant::now();
+        let mut index = 0i64;
+        let (mut before, mut after) = ((0usize, 0u32), (0usize, 0u32));
+        while after.1 < settle && started.elapsed() < std::time::Duration::from_secs(120) {
+            let Ok(Some(frame)) = desktop.next(33, quality, false, false, maximum) else {
+                continue;
+            };
+            let size = (frame.width, frame.height);
+            let encoder = match encoder.as_mut() {
+                Some(encoder) => encoder,
+                None => {
+                    encoder = Some(Encoder::new(size, format, rate).unwrap());
+                    encoder.as_mut().unwrap()
+                }
+            };
+            if !switched && before.1 >= switch {
+                switched = true;
+                rate.target = high;
+                rate.peak = high;
+                rate.quality_target.bitrate = high;
+                let applied = encoder.configure_rate(rate);
+                println!(
+                    "前段满 {switch} 帧，把目标从 {} 改成 {} Mbps，configure_rate 返回 {applied:?}",
+                    f64::from(low) / 1e6,
+                    f64::from(high) / 1e6
+                );
+            }
+            let Ok(encoded) = encoder.encode(&frame.image, index * 333_333, index == 0) else {
+                continue;
+            };
+            let bytes: usize = encoded.iter().map(|item| item.data.len()).sum();
+            let slot = if switched { &mut after } else { &mut before };
+            slot.0 += bytes;
+            slot.1 += 1;
+            index += 1;
+        }
+        let mbps = |(bytes, frames): (usize, u32)| {
+            bytes as f64 * 8.0 * 30.0 / f64::from(frames.max(1)) / 1e6
+        };
+        println!(
+            "改之前 {} 帧 {:.2} Mbps；改之后 {} 帧 {:.2} Mbps",
+            before.1,
+            mbps(before),
+            after.1,
+            mbps(after)
+        );
+    }
 
     /// 真机采一路交给 libavcodec 编码，逐帧留下「编码器看到的亮度」与码流：
     /// ffmpeg 解回来逐帧对比编码器输入，就能看出参考帧会不会漂。
