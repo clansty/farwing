@@ -1,4 +1,4 @@
-use super::gfx::{Retained, UiPresenter, create_device, split_output};
+use super::gfx::{Retained, UiPresenter, can_hide, create_device, split_output};
 use super::window_manager::{self, Event, Repaint, Request};
 use super::{AppFactory, AppSession, WindowConfig};
 use crate::application::viewer::presenter::ConnectingWindowsRunner;
@@ -108,9 +108,22 @@ fn sync_tray(tray: Option<&super::tray::Tray>, controlled: bool) {
     }
 }
 
+/// Hides its window when dropped. It is [`DesktopWindow`]'s first field, so
+/// every window disappears before the application, the presenter (which
+/// detaches the composition tree) and the window itself are released, and
+/// the system background cannot show through in between.
+struct HideOnDrop(Arc<Window>);
+
+impl Drop for HideOnDrop {
+    fn drop(&mut self) {
+        self.0.set_visible(false);
+    }
+}
+
 struct DesktopWindow {
     // Hide before field destruction, then release business and composition
     // resources before destroying the HWND.
+    hide_on_drop: HideOnDrop,
     app: AppSession,
     presenter: UiPresenter,
     context: egui::Context,
@@ -118,6 +131,7 @@ struct DesktopWindow {
     viewport: egui::ViewportInfo,
     close_requested: bool,
     /// 关闭请求已经转成「收进托盘」，等这一帧结束由 [`Runner`] 拆掉窗口资源。
+    /// Only where the window cannot be hidden in place (Wayland).
     hide_requested: bool,
     tray: Option<super::tray::Tray>,
     exiting: bool,
@@ -139,23 +153,20 @@ struct DesktopWindow {
 impl Runner {
     fn fail(&mut self, event_loop: &ActiveEventLoop, error: anyhow::Error) {
         self.error = Some(format!("{error:#}"));
-        self.release_window();
+        self.state.take();
         self.closed = true;
         if self.root {
             event_loop.exit();
         }
     }
 
-    /// 退出窗口：先隐藏再拆合成树，中间这段间隔不能露出系统底色。
-    fn release_window(&mut self) {
-        if let Some(state) = self.state.take() {
-            state.window.set_visible(false);
-            drop(state);
-        }
-    }
-
     /// 把主窗口收进托盘：窗口放掉，应用、egui 上下文、托盘与绘制资源留下。托盘再
-    /// 打开时按收起来之前的尺寸重建窗口，并把这些资源接到新窗口上。
+    /// 打开时按收起来之前的尺寸重建窗口，并把这些资源接到新窗口上。Only where
+    /// the window cannot be hidden in place; see [`can_hide`].
+    // Windows always hides in place, so its `Retained` is uninhabited and the
+    // compiler rightly sees everything after `Retained::take` as unreachable
+    // there; the destroy-and-recreate path exists for Wayland only.
+    #[cfg_attr(windows, allow(unreachable_code, unused_variables, unused_mut))]
     fn hide_main(&mut self) {
         let Some(state) = self.state.take() else {
             return;
@@ -165,6 +176,7 @@ impl Runner {
         let position = state.window.outer_position().ok();
         state.window.set_visible(false);
         let DesktopWindow {
+            hide_on_drop,
             app,
             context,
             tray,
@@ -176,6 +188,7 @@ impl Runner {
         // 绘制资源里装着 egui 的全部纹理，跟应用一起留下；surface 则随窗口放掉。
         let retained = Some(Retained::take(presenter));
         drop(input);
+        drop(hide_on_drop);
         drop(window);
         tracing::info!(?size, "主窗口已收进托盘");
         self.hidden = Some(Hidden {
@@ -282,11 +295,22 @@ impl Runner {
             size.y += caption_height;
         }
         let min_inner_size = viewport_builder.min_inner_size;
-        let window = Arc::new(egui_winit::create_window(
-            &context,
-            event_loop,
-            &viewport_builder.with_visible(false).with_decorations(false),
-        )?);
+        let viewport_builder = viewport_builder.with_visible(false).with_decorations(false);
+        // The first control center window takes the token its launcher left in
+        // the environment, so it gets focus and the launch feedback ends. The
+        // variables stay set: removing them now would race the threads already
+        // reading the environment, and a spent token is worthless to a child.
+        #[cfg(target_os = "linux")]
+        let window = {
+            use winit::platform::startup_notify::EventLoopExtStartupNotify;
+            let token = (self.root && self.factory.is_some())
+                .then(|| event_loop.read_token_from_env())
+                .flatten();
+            create_window(&context, event_loop, &viewport_builder, token)?
+        };
+        #[cfg(not(target_os = "linux"))]
+        let window = egui_winit::create_window(&context, event_loop, &viewport_builder)?;
+        let window = Arc::new(window);
         super::chrome::configure_dwm_window(&window);
         super::branding::set_taskbar_icon(&window);
         let notification = if self.config.notification {
@@ -374,6 +398,7 @@ impl Runner {
             .filter(|rate| *rate != 0)
             .unwrap_or(60_000);
         self.state = Some(DesktopWindow {
+            hide_on_drop: HideOnDrop(window.clone()),
             app,
             presenter,
             context,
@@ -428,6 +453,31 @@ impl Runner {
 }
 
 impl DesktopWindow {
+    /// Show the control center for a launch elsewhere. With the launcher's
+    /// token the window is raised past focus-stealing prevention and the
+    /// launch feedback ends; without one, or if that fails, it is shown as
+    /// the tray's "打开" shows it.
+    #[cfg(target_os = "linux")]
+    fn activate(&mut self, token: &crate::platform::linux::startup_notify::LaunchToken) {
+        let raised = token.for_window(&self.window).is_some_and(|value| {
+            let window = &self.window;
+            crate::platform::linux::startup_notify::raise(window, value, || {
+                window.set_visible(true);
+                window.set_minimized(false);
+            })
+            .inspect_err(|error| {
+                tracing::warn!(error = %format!("{error:#}"), "无法用启动通知令牌激活控制中心")
+            })
+            .is_ok()
+        });
+        if !raised {
+            self.window.set_visible(true);
+            self.window.set_minimized(false);
+            self.window.focus_window();
+        }
+        self.context.request_repaint();
+    }
+
     fn schedule(&mut self, when: Instant) {
         let when = self
             .last_frame
@@ -551,16 +601,15 @@ impl DesktopWindow {
         {
             self.close_requested = false;
             self.show_after_present = false;
-            self.app.0.on_focus_changed(false);
             // Windows 的窗口能直接隐藏，而且必须留着：更新器和通知激活都按
-            // 控制中心 HWND 找进程。Wayland 的 set_visible 是空操作，只能销毁窗口
-            // 和它的 surface，等托盘再打开时重建。
-            #[cfg(windows)]
-            self.window.set_visible(false);
-            #[cfg(not(windows))]
-            {
+            // 控制中心 HWND 找进程；X11 也能直接隐藏。Wayland 的 set_visible
+            // 是空操作，只能销毁窗口和它的 surface，等托盘再打开时重建。
+            if can_hide(&self.window) {
+                self.window.set_visible(false);
+            } else {
                 self.hide_requested = true;
             }
+            self.app.0.on_focus_changed(false);
         }
         if self.close_requested && !self.app.0.on_close_requested() {
             self.close_requested = false;
@@ -728,9 +777,31 @@ impl ApplicationHandler<Event> for Runner {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        self.release_window();
+        self.state.take();
         self.hidden.take();
     }
+}
+
+/// `egui_winit::create_window`, giving the new window the launcher's
+/// startup-notification token when there is one. (egui_winit's own placement
+/// on a numbered monitor only applies to fullscreen viewports, which the shell
+/// windows are not.)
+#[cfg(target_os = "linux")]
+fn create_window(
+    context: &egui::Context,
+    event_loop: &ActiveEventLoop,
+    builder: &egui::ViewportBuilder,
+    token: Option<winit::window::ActivationToken>,
+) -> Result<Window, winit::error::OsError> {
+    use winit::platform::startup_notify::WindowAttributesExtStartupNotify;
+    let Some(token) = token else {
+        return egui_winit::create_window(context, event_loop, builder);
+    };
+    let attributes = egui_winit::create_winit_window_attributes(context, builder.clone())
+        .with_activation_token(token);
+    let window = event_loop.create_window(attributes)?;
+    egui_winit::apply_viewport_builder_to_window(context, &window, builder);
+    Ok(window)
 }
 
 struct ManagedViewer {
@@ -840,6 +911,16 @@ impl ApplicationHandler<Event> for Windows {
                     self.main.fail(event_loop, error);
                 }
             }
+            #[cfg(target_os = "linux")]
+            Event::Request(Request::ActivateMain(token)) => {
+                if let Some(state) = &mut self.main.state {
+                    state.activate(&token);
+                } else if self.main.hidden.is_some()
+                    && let Err(error) = self.main.create(event_loop)
+                {
+                    self.main.fail(event_loop, error);
+                }
+            }
             Event::Request(Request::Exit) => {
                 if let Some(state) = &mut self.main.state {
                     state.exiting = true;
@@ -938,9 +1019,7 @@ impl ApplicationHandler<Event> for Windows {
             viewer.finish(event_loop);
         }
         self.viewers.clear();
-        for (_, mut window) in self.windows.drain() {
-            window.release_window();
-        }
+        self.windows.clear();
         self.main.exiting(event_loop);
     }
 }

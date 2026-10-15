@@ -11,3 +11,4 @@ Terminal=false
 Categories=Network;RemoteAccess;
 Keywords=remote;desktop;uu;远程;
 StartupWMClass=OpenUUYC
+StartupNotify=true
