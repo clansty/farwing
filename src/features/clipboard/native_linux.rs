@@ -1157,10 +1157,6 @@ fn poll_local(state: &mut State) -> Result<()> {
     if state.writing || state.sessions.is_empty() {
         return Ok(());
     }
-    let wayland = read_wayland(state)?;
-    let x11 = super::x11_read::read();
-    // 自己挂上去的远端副本不算「本地复制」：发回去等于向远端要它刚给我们的东西。
-    let (own_wayland, own_x11) = (own_copy(&wayland.sources), own_copy(&x11.sources));
     // 「变了没有」不能只看内容：同一个文件复制第二遍，路径、文本、像素全都一样，
     // 但那是一次新的复制，对端可能已经把上一份用掉了（官方 Windows 客户端粘完就不
     // 再拿那个 offer），不重新广播它就一直粘不上。Windows 那边有
@@ -1169,6 +1165,23 @@ fn poll_local(state: &mut State) -> Result<()> {
         .watch
         .as_ref()
         .map_or(0, super::watch::Watch::generation);
+    // 写事件通道还活着、而且自我们上次记下写次数以来没人认领过剪贴板：Wayland 那一侧
+    // 的内容不可能变过（认领一次一定会在通道上留下一次前进），这时不必再走 arboard。
+    // 剪贴板上挂着一张截图时，arboard 每一轮都要把整份 PNG 解出来，而这里 400ms 就
+    // 来一轮，实测能一直烧掉半个核；没变的东西没有理由重解一遍。
+    // X11 那一侧照旧每轮都读：两座孤岛不通（见 `publish_files`，本机实测双向都不过
+    // 桥），那边有人复制不会在 Wayland 通道上留下事件，跟着一起跳过就再也看不见了。
+    let settled = state.watch.as_ref().is_some_and(|watch| {
+        watch.alive() && generation != 0 && generation == state.own_generation
+    });
+    let wayland = if settled {
+        state.wayland.clone()
+    } else {
+        read_wayland(state)?
+    };
+    let x11 = super::x11_read::read();
+    // 自己挂上去的远端副本不算「本地复制」：发回去等于向远端要它刚给我们的东西。
+    let (own_wayland, own_x11) = (own_copy(&wayland.sources), own_copy(&x11.sources));
     let written = if own_wayland || own_x11 {
         // 这一轮看到的内容还是我们自己挂上去的那份（远端复制过来的副本）：写次数
         // 前进不算理由——那次前进很可能就是我们自己写它引起的，而合成器的事件到得
@@ -1194,6 +1207,11 @@ fn poll_local(state: &mut State) -> Result<()> {
     } else if wayland_changed {
         wayland
     } else {
+        // 两侧都没报告变化：这一轮前进的写次数是我们自己写剪贴板引起的（读回来
+        // 的还是我们挂上去的那份远端副本，见 `own_copy`），把它记下来，否则下一轮
+        // 还会当成「刚发生、没处理过的变化」，一直重读整份剪贴板——上面那个跳过
+        // 也就永远轮不到。
+        state.own_generation = generation;
         return Ok(());
     };
     if snapshot == state.local && !written {
