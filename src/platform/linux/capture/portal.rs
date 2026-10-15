@@ -261,10 +261,10 @@ pub(super) struct Grab {
 }
 
 impl Grab {
-    /// `dmabuf` 是「这次会话能力上能不能吃显存帧」——真就照它去和门户协商
-    /// DMA-BUF。探针这类只解码一两帧看能力的地方传 `false`，绝不能让它们撞上
-    /// 合成器的 dma-buf（不可映射就 mmap 失败，整个能力检查都起不来）。
-    pub fn open(screen: &Screen, cursor: bool, dmabuf: bool) -> Result<Self> {
+    /// 协商由 [`format_object`](super::pipewire) 那一份格式对象定：它同时要线性
+    /// dma-buf 与共享内存，合成器挑一个给得出的。所以这里不再需要「要不要显存」
+    /// 的入参——拿到什么由门户决定，上层用 `set_hardware` 决定用不用。
+    pub fn open(screen: &Screen, cursor: bool) -> Result<Self> {
         let session = Session::shared(cursor)?;
         let node = session.source(screen)?.node;
         let fd = on_portal(
@@ -274,10 +274,7 @@ impl Grab {
                 .open_pipe_wire_remote(&session.session, OpenPipeWireRemoteOptions::default()),
         )
         .context("无法打开屏幕共享的 PipeWire 连接")?;
-        // `dmabuf` 由上层给：只有本机的编码器能把 dma-buf 导进 GPU、且这次是
-        // 真采集时才去要显存帧。要来了没人能读只会每帧多一次 mmap 读回，还不如
-        // 让合成器拷进共享内存。合成器给不出线性缓冲时它自己会退回共享内存。
-        let stream = Stream::connect(fd, node, dmabuf)?;
+        let stream = Stream::connect(fd, node)?;
         Ok(Self {
             stream,
             session,
@@ -339,6 +336,48 @@ impl Grab {
                     tracing::warn!(%error, "显存画面读回失败，跳过这一帧");
                 }
                 Ok(None)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod negotiation_tests {
+    use super::*;
+
+    /// 真机诊断：开一次门户，把两种协商（共享内存 / 线性 dma-buf）的结果都打出来。
+    /// 需要本机门户与已经授权过的屏幕共享（`screencast-restore-token`），所以默认忽略：
+    ///
+    /// ```text
+    /// PIPEWIRE_DEBUG=4 cargo test --lib -- --ignored --nocapture portal_negotiation
+    /// ```
+    #[test]
+    #[ignore = "需要本机门户与已授权的屏幕共享"]
+    fn portal_negotiation() {
+        let screens = crate::platform::capture::screens().expect("枚举显示器失败");
+        println!("本机屏幕：");
+        for screen in &screens {
+            println!(
+                "  {} left/top={:?} 尺寸={:?}",
+                screen.device_name,
+                (screen.left, screen.top),
+                (screen.width, screen.height)
+            );
+        }
+        // 门户只共享了它授权的那块屏，所以逐块试，看哪块能认上、以及它的协商结果。
+        for screen in &screens {
+            match Grab::open(screen, false) {
+                Ok(grab) => println!(
+                    "{}: 开流成功，协商到{}，尺寸={:?}",
+                    screen.device_name,
+                    if grab.stream.dmabuf_active() {
+                        "线性 dma-buf"
+                    } else {
+                        "共享内存"
+                    },
+                    grab.displayed_size()
+                ),
+                Err(error) => println!("{}: 失败：{error:#}", screen.device_name),
             }
         }
     }

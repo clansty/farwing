@@ -93,10 +93,7 @@ pub(super) fn capture_loop(
             let opened_at = Instant::now();
             let connecting = !connected.load(Ordering::Acquire);
             runtime.begin_gpu_work(negotiated.gpu_compatibility);
-            desktop = Some(capture::Desktop::open_selected_for(
-                &screen,
-                capture::zero_copy_capable(),
-            )?);
+            desktop = Some(capture::Desktop::open_selected(&screen)?);
             generation = desktop.as_ref().unwrap().generation;
             tracing::info!(
                 elapsed_ms = opened_at.elapsed().as_millis(),
@@ -271,10 +268,7 @@ pub(super) fn capture_loop(
         }
         if desktop.is_none() {
             runtime.begin_gpu_work(negotiated.gpu_compatibility);
-            desktop = Some(capture::Desktop::open_selected_for(
-                &screen,
-                capture::zero_copy_capable(),
-            )?);
+            desktop = Some(capture::Desktop::open_selected(&screen)?);
             generation = desktop.as_ref().unwrap().generation;
             // Readiness can change after the preparation gate above. Apply the
             // same policy and reread settings after either native open path.

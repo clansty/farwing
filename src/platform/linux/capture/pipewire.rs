@@ -115,6 +115,12 @@ const STATE_STREAMING: c_int = 3;
 /// `spa_pod_prop` 的标志位。`DONT_FIXATE` 加在 modifier 上就是「这是一串候选，
 /// 你自己挑」——门户正是看到它才会考虑 DMA-BUF。
 const SPA_POD_PROP_FLAG_DONT_FIXATE: u32 = 1 << 4;
+/// 「这个属性必须在最终定下来的格式里出现」。压缩成 dma-buf 的合成器（niri 就是）
+/// 要求客户端把修饰符声明成必需的，只写「你来挑」它会在协商阶段直接拒掉。
+const SPA_POD_PROP_FLAG_MANDATORY: u32 = 1 << 3;
+/// `DRM_FORMAT_MOD_INVALID`：修饰符列表里放它表示「共享内存也可以」。这样一份格式
+/// 同时覆盖显存与共享内存两条候选，由合成器挑。
+const DRM_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 
 const TYPE_ID: u32 = 3;
 const TYPE_INT: u32 = 4;
@@ -333,29 +339,39 @@ impl Pod {
 /// `dmabuf` 为真时，这里额外带上 `SPA_FORMAT_VIDEO_modifier`——门户只有在格式
 /// 里看到修饰符时才肯谈 DMA-BUF，不带就一律协商共享内存。修饰符只列线性一种：
 /// 非线性的画面我们导不进 Scaler，谈成了也是花屏。
-fn enum_format(dmabuf: bool) -> Pod {
+/// 门户要的格式对象。
+///
+/// 永远带上 `SPA_FORMAT_VIDEO_modifier`，列表是「线性 dma-buf 或共享内存」：
+/// 合成器从里面挑一个它给得出的，我们把结果记在 `State::format` 里（修饰符是
+/// 不是线性，决定进来的是显存帧还是系统内存帧）。两点都是实测换来的：
+///
+/// - 必须声明成 `MANDATORY`：niri 那类只吐压缩 dma-buf 的合成器，看到客户端只写
+///   「你来挑」会在协商阶段直接拒掉整个格式（`no more input formats`）。
+/// - 列表里必须有 `DRM_FORMAT_MOD_INVALID`（= 共享内存）。只列线性时，给不出线性
+///   的合成器没有交集、同样是协商失败；而**只谈共享内存**（不带修饰符属性）在
+///   niri 上根本谈不成——它的门户只提供 dma-buf。
+fn format_object() -> Pod {
     Pod::object(OBJECT_FORMAT, PARAM_ENUM_FORMAT, |p| {
         p.key(FORMAT_MEDIA_TYPE);
         p.value(TYPE_ID, &[MEDIA_TYPE_VIDEO]);
         p.key(FORMAT_MEDIA_SUBTYPE);
         p.value(TYPE_ID, &[MEDIA_SUBTYPE_RAW]);
-        if dmabuf {
-            p.key_flags(FORMAT_VIDEO_MODIFIER, SPA_POD_PROP_FLAG_DONT_FIXATE);
-            p.choice_long(CHOICE_ENUM, &[DRM_MOD_LINEAR]);
-        }
-        // 格式用的是 SPA 的 `spa_video_format` 枚举，不是 DRM fourcc：门户自己
-        // 在两边做映射 (`pwFromDrmFourcc`)，这里塞 fourcc 永远匹配不上。
-        // 显存那条路只列 BGRX/BGRA：只有它们对应能导进 Scaler 的 AR24/XR24
-        // （VA-API 只认这两个 32 位 BGRA 排布），谈成 RGBA/RGBX 会被 `read_dmabuf`
-        // 逐帧拒掉。共享内存那条路上 RGBX/RGBA 有意义（`read_shm` 会把红蓝换回来），
-        // 所以照旧列全，别把这条路也收窄了。
+        p.key_flags(
+            FORMAT_VIDEO_MODIFIER,
+            SPA_POD_PROP_FLAG_MANDATORY | SPA_POD_PROP_FLAG_DONT_FIXATE,
+        );
+        p.choice_long(CHOICE_ENUM, &[DRM_MOD_LINEAR, DRM_MOD_INVALID]);
+        // 格式用的是 SPA 的 `spa_video_format` 枚举，不是 DRM fourcc：门户自己在
+        // 两边做映射 (`pwFromDrmFourcc`)，这里塞 fourcc 永远匹配不上。显存那一支
+        // 只会落在这两个上（对应能导进 Scaler 的 AR24/XR24），共享内存那支可能
+        // 给 RGBX/RGBA，`read_shm` 会把红蓝换回来。
         p.key(FORMAT_VIDEO_FORMAT);
-        let formats: &[u32] = if dmabuf {
-            &[VIDEO_BGRX, VIDEO_BGRA]
-        } else {
-            &[VIDEO_BGRX, VIDEO_BGRX, VIDEO_BGRA, VIDEO_RGBX, VIDEO_RGBA]
-        };
-        p.choice(CHOICE_ENUM, TYPE_ID, 1, formats);
+        p.choice(
+            CHOICE_ENUM,
+            TYPE_ID,
+            1,
+            &[VIDEO_BGRX, VIDEO_BGRX, VIDEO_BGRA, VIDEO_RGBX, VIDEO_RGBA],
+        );
         p.key(FORMAT_VIDEO_SIZE);
         p.choice(
             CHOICE_RANGE,
@@ -374,7 +390,7 @@ fn enum_format(dmabuf: bool) -> Pod {
 /// `MemPtr` 放一起，链接会按 CPU 可映射的内存协商，但门户那边已经认定了
 /// DMA-BUF 格式，分配随即 `error alloc buffers: Invalid argument` 失败。所以
 /// 显存那支只报 DMA-BUF，共享内存那支照旧报 MemPtr|MemFd，由协商出来的格式
-/// （有没有修饰符）决定用哪支——这个回退是门户自己做的，我们只负责答对。
+/// （有没有修饰符）决定报哪支。
 fn buffers(dmabuf: bool) -> Pod {
     Pod::object(OBJECT_PARAM_BUFFERS, PARAM_BUFFERS, |p| {
         // 显存帧要留到编码器用完才还回去，池子浅了会被抽干（合成器报
@@ -1016,7 +1032,7 @@ impl Stream {
     /// Connect to `node` on the PipeWire remote behind `fd` (from the portal).
     /// `dmabuf` asks for linear DMA-BUF frames; the compositor falls back to
     /// shared memory on its own when it cannot serve one.
-    pub fn connect(fd: OwnedFd, node: u32, dmabuf: bool) -> Result<Self> {
+    pub fn connect(fd: OwnedFd, node: u32) -> Result<Self> {
         use std::os::fd::IntoRawFd;
         let api = api()?;
         let shared = Arc::new(Shared {
@@ -1105,7 +1121,7 @@ impl Stream {
                 );
                 // 只有格式随连接一起给出去；缓冲类型等 `on_param_changed` 报出
                 // 格式之后再决定，提前发就有可能在还没知道格式时就要了显存。
-                let format = enum_format(dmabuf).aligned();
+                let format = format_object().aligned();
                 let mut params = [format.as_ptr().cast::<c_void>()];
                 let connected = (api.stream_connect)(
                     this.stream,
@@ -1223,9 +1239,32 @@ mod tests {
                 modifier: None,
             })
         );
-        let choices = enum_format(true).aligned();
+        let choices = format_object().aligned();
         let size = unsafe { choices.as_ptr().cast::<u32>().read() } as usize;
         assert_eq!((size + 8) % 8, 0);
+        // 修饰符属性必须在、必须是 MANDATORY|DONT_FIXATE、列表里必须有线性与
+        // INVALID 两项：缺任何一样，某些合成器（niri）会直接让协商失败。
+        let words: Vec<u32> = (0..(size / 4) + 2)
+            .map(|index| unsafe { choices.as_ptr().cast::<u32>().add(index).read() })
+            .collect();
+        let key = words
+            .windows(2)
+            .position(|pair| pair[0] == FORMAT_VIDEO_MODIFIER)
+            .expect("格式里没有修饰符属性");
+        assert_eq!(words[key + 1], SPA_POD_PROP_FLAG_MANDATORY | SPA_POD_PROP_FLAG_DONT_FIXATE);
+        // choice 的排布：size、TYPE_CHOICE、choice 种类、flags、子 pod 的 size 与
+        // 类型（Long），之后才是值，每个 u64 占两个字。
+        let choice = &words[key + 2..];
+        assert_eq!(choice[1], TYPE_CHOICE);
+        assert_eq!(choice[5], TYPE_LONG);
+        let count = (choice[0] as usize - 16) / 8;
+        let values: Vec<u64> = (0..count)
+            .map(|index| {
+                let at = 6 + index * 2;
+                u64::from(choice[at]) | (u64::from(choice[at + 1]) << 32)
+            })
+            .collect();
+        assert_eq!(values, vec![DRM_MOD_LINEAR, DRM_MOD_INVALID]);
     }
 
     /// 协商出来的格式带不带修饰符，决定缓冲类型报哪一支；两边的值都要对，

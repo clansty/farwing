@@ -315,19 +315,12 @@ enum Backend {
 }
 impl Backend {
     /// `size` is the frame size for backends that scale while capturing.
-    /// `dmabuf` 只喂给门户：显存协商在连接那一刻就得有答案。
-    fn open(
-        kind: Kind,
-        screen: &Screen,
-        cursor: bool,
-        size: (u32, u32),
-        dmabuf: bool,
-    ) -> Result<Self> {
+    fn open(kind: Kind, screen: &Screen, cursor: bool, size: (u32, u32)) -> Result<Self> {
         Ok(match kind {
             Kind::NvFbc => Self::NvFbc(nvfbc::Grab::open(screen, cursor, size)?),
             Kind::X11 => Self::X11(x11::Grab::open(screen)?),
             Kind::Wlr => Self::Wlr(wlr_screencopy::Grab::open(screen, cursor)?),
-            Kind::Portal => Self::Portal(portal::Grab::open(screen, cursor, dmabuf)?),
+            Kind::Portal => Self::Portal(portal::Grab::open(screen, cursor)?),
         })
     }
     fn kind(&self) -> Kind {
@@ -339,10 +332,10 @@ impl Backend {
         }
     }
     /// Open the first capture method that works for `screen`.
-    fn select(screen: &Screen, cursor: bool, size: (u32, u32), dmabuf: bool) -> Result<Self> {
+    fn select(screen: &Screen, cursor: bool, size: (u32, u32)) -> Result<Self> {
         let mut failures = Vec::new();
         for kind in candidates()? {
-            match Self::open(kind, screen, cursor, size, dmabuf) {
+            match Self::open(kind, screen, cursor, size) {
                 Ok(backend) => {
                     tracing::info!(
                         backend = backend.name(),
@@ -386,25 +379,15 @@ pub(crate) struct Desktop {
     /// 调用方想让画面留在显存里。后端换了（换屏、换光标设置）要按它再切回来：
     /// 编码器是照着显存帧建起来的，采集这边不能悄悄换回系统内存。
     hardware: bool,
-    /// 开门户时要不要协商显存帧。协商在连接时定死，重建后端也得照它来——探针
-    /// 传 `false`，好让它拿到共享内存的帧、绝不去 mmap 合成器的 dma-buf。
-    dmabuf: bool,
     /// 采集期间点亮屏幕、挡住自动息屏与空闲休眠。放最后，让它比采集资源活得久，
     /// 与 Windows 侧一致。
     _power: Option<super::power_request::Request>,
 }
 
 impl Desktop {
-    /// 打开一路采集，但不协商显存帧。给探针、诊断这类「只看一眼有没有画面」的
-    /// 地方用：它们不认显存帧，拿到 dma-buf 只会去 `read_back` mmap 合成器的缓冲，
-    /// 可能直接把被控端起不起来。
+    /// 打开一路采集。门户那边要线性 dma-buf 还是共享内存由合成器挑（见
+    /// `pipewire::format_object`），拿到显存帧也只在上层要求时才当显存用。
     pub fn open_selected(selected: &Screen) -> Result<Self> {
-        Self::open_selected_for(selected, false)
-    }
-
-    /// 打开一路采集。`dmabuf` 说这次会话**能力上**能不能用显存帧：为真时门户才去
-    /// 协商 dma-buf，否则只谈共享内存。真采集传 `zero_copy_capable()`，探针传 `false`。
-    pub fn open_selected_for(selected: &Screen, dmabuf: bool) -> Result<Self> {
         // 桌面不提供抑制接口时不拦住采集：会话照常，只是屏幕可能按空闲策略熄灭。
         let power = super::power_request::Request::capture()
             .inspect_err(|error| {
@@ -413,7 +396,7 @@ impl Desktop {
             .ok();
         let screen = refresh(selected)?;
         let size = (screen.width & !1, screen.height & !1);
-        let backend = Backend::select(&screen, false, size, dmabuf)?;
+        let backend = Backend::select(&screen, false, size)?;
         Ok(Self {
             device: Device,
             screen,
@@ -426,7 +409,6 @@ impl Desktop {
             last_size: (0, 0),
             refreshed: Instant::now(),
             hardware: false,
-            dmabuf,
             _power: power,
         })
     }
@@ -490,8 +472,8 @@ impl Desktop {
             self.screen.display_name.clone_from(&current.display_name);
             if current != self.screen {
                 let size = output(current.width, current.height, quality, maximum);
-                let backend = Backend::open(self.backend.kind(), &current, cursor, size, self.dmabuf)
-                    .or_else(|_| Backend::select(&current, cursor, size, self.dmabuf))?;
+                let backend = Backend::open(self.backend.kind(), &current, cursor, size)
+                    .or_else(|_| Backend::select(&current, cursor, size))?;
                 self.backend = backend;
                 self.screen = current;
                 self.generation = self.generation.wrapping_add(1);
@@ -506,7 +488,7 @@ impl Desktop {
             && grab.cursor() != cursor
         {
             self.backend =
-                Backend::Portal(portal::Grab::open(&self.screen, cursor, self.dmabuf)?);
+                Backend::Portal(portal::Grab::open(&self.screen, cursor)?);
             self.last = None;
             // 新 Grab 的硬件开关回到默认（关），按桌面记着的意愿补回来。
             self.apply_hardware();
@@ -698,13 +680,6 @@ impl Desktop {
     }
 }
 
-/// 本机的编码器能不能直接吃显存里的帧。采集要不要去协商 dma-buf 得先问它：
-/// 谈来了没法导进 GPU 的显存帧，只会让每一帧多一次 CPU 读回。只有 libavcodec
-/// 那版 VA-API 能导（见 `encoder::Encoder::hardware_images`）。
-pub(crate) fn zero_copy_capable() -> bool {
-    super::vaapi::hardware_backend()
-        .is_some_and(|backend| crate::platform::linux::encoder::Encoder::hardware_images(backend))
-}
 
 /// The encoded size for a source of `width`x`height` at `quality`.
 fn output(width: u32, height: u32, quality: i32, maximum: (u32, u32)) -> (u32, u32) {
