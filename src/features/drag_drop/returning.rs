@@ -39,8 +39,13 @@ impl Actor {
         let Some(entry) = self.entries.get_mut(&id) else {
             return Ok(());
         };
+        // 只在对方会发拖动图像时才等它：对方发图与 `Command::Image` 用同一判据，
+        // 需要双方都声明可拖回；Linux 这边 RETURN_CAPABLE 为假，等下去只会卡到超时
+        // （Windows 这边为真，行为不变）。
         if (entry.reverse && !entry.preserve_source && !entry.source_released)
-            || (self.shared.return_capable.load(Ordering::Acquire) && entry.image.is_none())
+            || (native::RETURN_CAPABLE
+                && self.shared.return_capable.load(Ordering::Acquire)
+                && entry.image.is_none())
         {
             return Ok(());
         }
