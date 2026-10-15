@@ -8,9 +8,12 @@
 //! ordinary close behaviour instead of hiding it somewhere unreachable.
 use anyhow::{Context, Result};
 use ksni::blocking::TrayMethods;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(super) struct Tray {
     handle: ksni::blocking::Handle<Item>,
+    /// 图标合成要解码整张 PNG，所以只有状态翻转时才重建。
+    controlled: AtomicBool,
 }
 
 struct Item {
@@ -55,31 +58,40 @@ impl ksni::Tray for Item {
 }
 
 /// The application icon as SNI wants it: ARGB32, big-endian.
-fn icon() -> Result<ksni::Icon> {
-    let image = image::load_from_memory(include_bytes!("../../assets/icon-256.png"))
-        .context("解析托盘图标失败")?
-        .resize(64, 64, image::imageops::FilterType::Triangle)
-        .into_rgba8();
+fn icon(controlled: bool) -> ksni::Icon {
+    let image = crate::ui::branding::tray_pixmap(64, controlled);
     let (width, height) = image.dimensions();
     let mut data = image.into_raw();
     for pixel in data.chunks_exact_mut(4) {
         pixel.rotate_right(1);
     }
-    Ok(ksni::Icon {
+    ksni::Icon {
         width: width as i32,
         height: height as i32,
         data,
-    })
+    }
 }
 
 impl Tray {
     pub fn new() -> Result<Self> {
         let handle = Item {
-            icon: vec![icon()?],
+            icon: vec![icon(false)],
         }
         .spawn()
         .context("桌面没有可用的托盘（StatusNotifierItem）")?;
-        Ok(Self { handle })
+        Ok(Self {
+            handle,
+            controlled: AtomicBool::new(false),
+        })
+    }
+
+    /// 被控角标：这台机器正被别人控制时，托盘图标右上角多一个红三角。
+    pub(super) fn set_controlled(&self, controlled: bool) {
+        if self.controlled.swap(controlled, Ordering::Relaxed) == controlled {
+            return;
+        }
+        let icon = icon(controlled);
+        self.handle.update(|item| item.icon = vec![icon]);
     }
 }
 

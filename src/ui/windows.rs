@@ -94,9 +94,17 @@ impl Hidden {
     /// 卡片与通知按钮的动作（其中的「打开」会把主窗口叫回来）。回报应用是否已
     /// 经可以退出了。
     fn tick(&mut self) -> bool {
-        let Hidden { app, context, .. } = self;
-        app.0.tick(context);
-        app.0.exit_ready()
+        self.app.0.tick(&self.context);
+        // 窗口收进托盘后不再渲染，被控角标只能在这里跟上。
+        sync_tray(self.tray.as_ref(), self.app.0.controlled());
+        self.app.0.exit_ready()
+    }
+}
+
+/// 被控角标：托盘图标右上角那个红三角跟着应用报上来的被控状态走。
+fn sync_tray(tray: Option<&super::tray::Tray>, controlled: bool) {
+    if let Some(tray) = tray {
+        tray.set_controlled(controlled);
     }
 }
 
@@ -216,6 +224,7 @@ impl Runner {
             tray = tray.is_some(),
             "以不显示主窗口的方式启动（--background）"
         );
+        sync_tray(tray.as_ref(), app.0.controlled());
         let missing_tray = wants_tray && tray.is_none();
         self.hidden = Some(Hidden {
             app,
@@ -357,6 +366,8 @@ impl Runner {
             }
             None => None,
         };
+        // 恢复出来的窗口可能正被别人看/控着，角标要当场对上，别等下一次渲染。
+        sync_tray(tray.as_ref(), app.0.controlled());
         let refresh = window
             .current_monitor()
             .and_then(|monitor| monitor.refresh_rate_millihertz())
@@ -447,6 +458,9 @@ impl DesktopWindow {
         self.window_resize.min_size = self.min_inner_size.map(|size| {
             winit::dpi::LogicalSize::new(size.x, size.y).to_physical(self.window.scale_factor())
         });
+        // 标题栏提示与托盘角标共用这一次判定。
+        let alert = self.app.0.title_bar_alert();
+        let controlled = alert.is_some();
         let output = self.context.run_ui(input, |ui| {
             let ctx = ui.ctx().clone();
             super::chrome::resize_regions(ui, &self.window, |response, direction| {
@@ -460,12 +474,11 @@ impl DesktopWindow {
                 );
             });
             if self.notification.is_none() && !self.floating && self.window.fullscreen().is_none() {
-                let alert = self.app.0.title_bar_alert();
                 super::chrome::title_bar_panel_alert(
                     ui,
                     "desktop-window-chrome",
                     super::chrome::title_bar_height(),
-                    alert.is_some(),
+                    controlled,
                     |ui| {
                         if super::chrome::window_title_bar_alert(
                             ui,
@@ -484,6 +497,7 @@ impl DesktopWindow {
             self.app.0.ui(ui);
             super::controls::show_notices(ui.ctx());
         });
+        sync_tray(self.tray.as_ref(), controlled);
         let (drawing, platform, mut viewports) = split_output(output);
         self.input.handle_platform_output(&self.window, platform);
         if let Some(root) = viewports.remove(&egui::ViewportId::ROOT) {
