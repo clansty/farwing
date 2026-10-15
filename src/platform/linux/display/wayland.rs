@@ -11,7 +11,7 @@
 //! the protocol rounds it to a whole number (2 for both outputs here, where the
 //! scales are 1.6 and 1.35). `xdg_output` is the only place the logical
 //! position and size are stated.
-use crate::platform::CompositorOutput;
+use crate::platform::{CompositorOutput, Rotation};
 use anyhow::{Context, Result, bail};
 use wayland_client::protocol::{wl_output, wl_registry};
 use wayland_client::{Connection, Dispatch, QueueHandle};
@@ -34,6 +34,7 @@ struct Entry {
     /// whatever order the compositor lists its globals.
     described: Option<zxdg_output_v1::ZxdgOutputV1>,
     logical: (i32, i32, u32, u32),
+    rotation: Rotation,
 }
 
 /// Every output, in the compositor's global space.
@@ -68,6 +69,7 @@ pub(crate) fn layout() -> Result<Vec<CompositorOutput>> {
                 top,
                 width,
                 height,
+                rotation: entry.rotation,
             })
         })
         .collect())
@@ -97,6 +99,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     name: None,
                     described: None,
                     logical: (0, 0, 0, 0),
+                    rotation: Rotation::default(),
                 }),
                 _ => {}
             }
@@ -120,9 +123,33 @@ impl Dispatch<wl_output::WlOutput, ()> for State {
         else {
             return;
         };
-        if let wl_output::Event::Name { name } = event {
-            entry.name = Some(name);
+        match event {
+            wl_output::Event::Name { name } => entry.name = Some(name),
+            wl_output::Event::Geometry { transform, .. } => {
+                entry.rotation = rotation(
+                    transform
+                        .into_result()
+                        .unwrap_or(wl_output::Transform::Normal),
+                );
+            }
+            _ => {}
         }
+    }
+}
+
+/// `wl_output.transform` names the same turns this side does, so the mapping is
+/// only the error case turning into "not rotated".
+fn rotation(transform: wl_output::Transform) -> Rotation {
+    match transform {
+        wl_output::Transform::Normal => Rotation::Normal,
+        wl_output::Transform::_90 => Rotation::Rotate90,
+        wl_output::Transform::_180 => Rotation::Rotate180,
+        wl_output::Transform::_270 => Rotation::Rotate270,
+        wl_output::Transform::Flipped => Rotation::Flipped,
+        wl_output::Transform::Flipped90 => Rotation::Flipped90,
+        wl_output::Transform::Flipped180 => Rotation::Flipped180,
+        wl_output::Transform::Flipped270 => Rotation::Flipped270,
+        _ => Rotation::Normal,
     }
 }
 

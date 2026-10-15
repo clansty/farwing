@@ -13,10 +13,23 @@ mod uinput;
 mod virtual_keyboard;
 mod xtest;
 
+use crate::platform::Rotation;
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::BTreeSet;
 
 pub(crate) use uinput::Desktop;
+
+/// 控制器报来的一个触点：它的 id、屏幕上的比例位置和比例半径。
+///
+/// 平台层不认识 UU 的消息，所以输入引擎先把触点换算成比例；角度和压力在 evdev
+/// 这边没有对应的轴，虚拟触摸屏只报位置和接触面积。
+#[derive(Clone, Copy)]
+pub(crate) struct Touch {
+    pub id: u32,
+    pub x: f32,
+    pub y: f32,
+    pub radius: f32,
+}
 
 /// Lock keys whose state a controller can ask to match.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,6 +170,24 @@ impl Injector {
         match self {
             Self::XTest(injector) => injector.wheel_notch(horizontal, positive),
             Self::UInput(injector) => injector.wheel_notch(horizontal, positive),
+        }
+    }
+
+    /// 真实的多点触摸，由合成器派发给应用。返回 false 表示这个后端没有触摸屏，
+    /// 调用方要退回单指模拟。
+    pub fn touch(&mut self, kind: u8, points: &[Touch], rotation: Rotation) -> Result<bool> {
+        match self {
+            // X Test 里没有触摸设备，也没有地方放一个。
+            Self::XTest(_) => Ok(false),
+            Self::UInput(injector) => injector.touch(kind, points, rotation),
+        }
+    }
+
+    /// 抬起所有触点，断开会话和换屏时要走一遍。
+    pub fn release_touch(&mut self) -> Result<()> {
+        match self {
+            Self::XTest(_) => Ok(()),
+            Self::UInput(injector) => injector.release_touch(),
         }
     }
 
@@ -378,6 +409,29 @@ mod session_tests {
         println!("foreground pid: {:?}", injector.foreground());
         injector.move_to(before.0, before.1).unwrap();
         injector.flush().unwrap();
+    }
+    /// 需要真实会话和可写的 `/dev/uinput`：`cargo test -- --ignored`。
+    ///
+    /// 在屏幕右下角按下再抬起一次，验证这块触摸屏真能建起来、内核收下这些帧。
+    /// 触点会落到那个位置的窗口上，所以跑的时候右下角最好什么都没有。
+    #[test]
+    #[ignore = "injects a real touch into the live session"]
+    fn a_touchscreen_takes_a_contact_and_lets_it_go() {
+        let mut injector = super::Injector::open().unwrap();
+        let point = super::Touch {
+            id: 1,
+            x: 0.999,
+            y: 0.999,
+            radius: 0.01,
+        };
+        let rotation = crate::platform::Rotation::Normal;
+        if !injector.touch(2, &[point], rotation).unwrap() {
+            println!("这个会话没有触摸屏设备（后端：{}）", injector.label());
+            return;
+        }
+        injector.release_touch().unwrap();
+        injector.flush().unwrap();
+        println!("触摸屏后端：{}", injector.label());
     }
     /// Types OPENUUYC_TYPE_TEXT into whatever has focus.
     #[test]

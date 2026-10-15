@@ -452,25 +452,27 @@ impl Peer {
                     let layout = crate::platform::display::compositor_layout();
                     lock(&input_reports.catalog)
                         .iter()
-                        .map(|s| super::input::Screen {
-                            id: s.screen.id,
-                            left: s.screen.left,
-                            top: s.screen.top,
-                            width: s.screen.width,
-                            height: s.screen.height,
-                            logical: layout
-                                .as_ref()
-                                .and_then(|layout| {
-                                    layout
-                                        .iter()
-                                        .find(|output| output.name == s.screen.device_name)
-                                })
-                                .map(|output| super::input::Rect {
+                        .map(|s| {
+                            let output = layout.as_ref().and_then(|layout| {
+                                layout
+                                    .iter()
+                                    .find(|output| output.name == s.screen.device_name)
+                            });
+                            super::input::Screen {
+                                id: s.screen.id,
+                                left: s.screen.left,
+                                top: s.screen.top,
+                                width: s.screen.width,
+                                height: s.screen.height,
+                                logical: output.map(|output| super::input::Rect {
                                     left: output.left,
                                     top: output.top,
                                     right: output.left + output.width as i32,
                                     bottom: output.top + output.height as i32,
                                 }),
+                                rotation: output
+                                    .map_or_else(Default::default, |output| output.rotation),
+                            }
                         })
                         .collect()
                 },
