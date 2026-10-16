@@ -64,6 +64,13 @@ pub(super) fn run(config: WindowConfig, factory: AppFactory) -> Result<()> {
     Ok(())
 }
 
+/// 被控角标：托盘图标右上角那个红三角跟着应用报上来的被控状态走。
+fn sync_tray(tray: Option<&super::tray::Tray>, controlled: bool) {
+    if let Some(tray) = tray {
+        tray.set_controlled(controlled);
+    }
+}
+
 struct Runner {
     root: bool,
     closed: bool,
@@ -100,13 +107,6 @@ impl Hidden {
         // 窗口收进托盘后不再渲染，被控角标只能在这里跟上。
         sync_tray(self.tray.as_ref(), self.app.0.controlled());
         self.app.0.exit_ready()
-    }
-}
-
-/// 被控角标：托盘图标右上角那个红三角跟着应用报上来的被控状态走。
-fn sync_tray(tray: Option<&super::tray::Tray>, controlled: bool) {
-    if let Some(tray) = tray {
-        tray.set_controlled(controlled);
     }
 }
 
@@ -399,6 +399,13 @@ impl Runner {
             .and_then(|monitor| monitor.refresh_rate_millihertz())
             .filter(|rate| *rate != 0)
             .unwrap_or(60_000);
+        let tray = if uses_tray {
+            Some(super::tray::Tray::new()?)
+        } else {
+            None
+        };
+        // 主窗口可能一上来就是收进托盘的状态，角标要当场对上。
+        sync_tray(tray.as_ref(), app.0.controlled());
         self.state = Some(DesktopWindow {
             hide_on_drop: HideOnDrop(window.clone()),
             app,
@@ -549,6 +556,7 @@ impl DesktopWindow {
             self.app.0.ui(ui);
             super::controls::show_notices(ui.ctx());
         });
+        // 收进托盘后窗口不再呈现，但这一趟 UI 照跑，角标跟着走。
         sync_tray(self.tray.as_ref(), controlled);
         let (drawing, platform, mut viewports) = split_output(output);
         self.input.handle_platform_output(&self.window, platform);
