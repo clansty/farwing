@@ -1,4 +1,4 @@
-use super::gfx::{Retained, UiPresenter, can_hide, create_device, split_output};
+use super::gfx::{RendererOutput, Retained, UiPresenter, can_hide, create_device, split_output};
 use super::window_manager::{self, Event, Repaint, Request};
 use super::{AppFactory, AppSession, WindowConfig};
 use crate::application::viewer::presenter::ConnectingWindowsRunner;
@@ -16,9 +16,12 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::platform::windows::EventLoopBuilderExtWindows;
 use winit::window::{Window, WindowId};
 
-/// 主窗口收进托盘期间的轮询间隔：那条路径上只有后台事件和通知动作要处理，
-/// 不渲染，所以这个频率的开销可以忽略。
+/// The longest a destroyed (Wayland) control center waits between UI passes:
+/// the device center asks for one every 250 ms anyway, as a hidden X11 or
+/// Windows window gets.
 const HIDDEN_TICK: Duration = Duration::from_millis(250);
+/// The shortest, so an animation request cannot spin a window-less pass.
+const HIDDEN_MIN_TICK: Duration = Duration::from_millis(50);
 
 pub(super) fn run(config: WindowConfig, factory: AppFactory) -> Result<()> {
     #[cfg_attr(not(windows), allow(unused_mut))]
@@ -34,6 +37,8 @@ pub(super) fn run(config: WindowConfig, factory: AppFactory) -> Result<()> {
             factory: Some(factory),
             state: None,
             hidden: None,
+            #[cfg(target_os = "linux")]
+            activation: None,
             error: None,
             proxy: event_loop.create_proxy(),
             root: true,
@@ -79,6 +84,10 @@ struct Runner {
     state: Option<DesktopWindow>,
     /// 主窗口收进托盘后留下的部分；这时 `state` 是 None。
     hidden: Option<Hidden>,
+    /// The startup-notification token the next window is created with: a
+    /// second start's, when it finds the control center destroyed in the tray.
+    #[cfg(target_os = "linux")]
+    activation: Option<winit::window::ActivationToken>,
     error: Option<String>,
     proxy: EventLoopProxy<Event>,
 }
@@ -86,6 +95,12 @@ struct Runner {
 /// 主窗口收进托盘时留下的部分。被控端、观看会话与后台 worker 都挂在应用上，
 /// 应用持有的纹理绑在 egui 上下文上，所以窗口可以销毁，这两样不能。Wayland 没有
 /// 「隐藏窗口」，最后一个 `Arc<Window>` 落地就是真正的销毁。
+///
+/// A hidden X11 or Windows window keeps running its UI pass on the device
+/// center's 250 ms request, only without presenting it. A destroyed window
+/// does the same here, so nothing the application advances inside `ui()`
+/// (worker events, exit handshake, notification cards and their actions,
+/// update checks, dialogs queued for later) freezes on Wayland alone.
 struct Hidden {
     app: AppSession,
     context: egui::Context,
@@ -96,18 +111,111 @@ struct Hidden {
     size: Option<PhysicalSize<u32>>,
     /// Wayland 不向客户端提供窗口位置，那里拿不到值。
     position: Option<PhysicalPosition<i32>>,
+    /// The last window's viewport, in points, that window-less passes reuse.
+    viewport: egui::ViewportInfo,
+    /// The last window's screen size in points; `None` when no window has ever
+    /// existed (`--background`), and egui's own default applies.
+    screen: Option<egui::Rect>,
+    /// egui time continues from the last windowed pass.
+    time: f64,
+    since: Instant,
+    next_pass: Instant,
+    /// 还没有 presenter 时（`--background`）跑出的绘制攒在这里，等第一个窗口
+    /// 建出来交给它，免得字体图集丢在半路。
+    deferred: Option<RendererOutput>,
+}
+
+/// What a window-less pass asks of the runner.
+enum HiddenPass {
+    /// Not due yet, or nothing to do until then.
+    Wait(Instant),
+    /// The application asked for its window, for example to show an error.
+    Show,
+    /// The exit handshake has finished.
+    Exit,
 }
 
 impl Hidden {
-    /// 收进托盘期间的轮询：不渲染，只跑应用里不碰窗口的那部分——后台事件、通知
-    /// 卡片与通知按钮的动作（其中的「打开」会把主窗口叫回来）。回报应用是否已
-    /// 经可以退出了。
-    fn tick(&mut self) -> bool {
-        self.app.0.tick(&self.context);
-        // 窗口收进托盘后不再渲染，被控角标只能在这里跟上。
+    /// Run the application's UI pass without a window when it is due. Its
+    /// drawing is kept for the next window; a request to show the window
+    /// (`Visible`, `Focus`, un-minimize, attention) recreates it.
+    fn pass(&mut self) -> HiddenPass {
+        let now = Instant::now();
+        if now < self.next_pass {
+            return HiddenPass::Wait(self.next_pass);
+        }
+        let mut input = egui::RawInput {
+            screen_rect: self.screen,
+            time: Some(self.time + self.since.elapsed().as_secs_f64()),
+            focused: false,
+            ..Default::default()
+        };
+        input
+            .viewports
+            .insert(egui::ViewportId::ROOT, self.viewport.clone());
+        let Hidden { app, context, .. } = self;
+        let output = context.run_ui(input, |ui| {
+            app.0.ui(ui);
+            super::controls::show_notices(ui.ctx());
+        });
+        // 窗口不呈现，托盘角标只能在这一趟 UI 里跟上。
         sync_tray(self.tray.as_ref(), self.app.0.controlled());
-        self.app.0.exit_ready()
+        // Platform output (cursor, IME, clipboard, links) only follows user
+        // input, which a window-less pass never has.
+        let (drawing, _platform, mut viewports) = split_output(output);
+        match &mut self.retained {
+            Some(retained) => retained.defer_output(drawing),
+            None => merge_output(&mut self.deferred, drawing),
+        }
+        let mut delay = HIDDEN_TICK;
+        let mut show = false;
+        if let Some(root) = viewports.remove(&egui::ViewportId::ROOT) {
+            delay = root.repaint_delay.clamp(HIDDEN_MIN_TICK, HIDDEN_TICK);
+            show = wants_window(&root.commands);
+        }
+        if self.app.0.exit_ready() {
+            return HiddenPass::Exit;
+        }
+        if show {
+            return HiddenPass::Show;
+        }
+        self.next_pass = now + delay;
+        HiddenPass::Wait(self.next_pass)
     }
+}
+
+/// Whether a window-less pass asked to be seen: the device center shows its
+/// window this way when the exit handshake fails, and a hidden X11 or Windows
+/// window would be shown by the same commands.
+fn wants_window(commands: &[egui::ViewportCommand]) -> bool {
+    commands.iter().any(|command| {
+        matches!(
+            command,
+            egui::ViewportCommand::Visible(true)
+                | egui::ViewportCommand::Focus
+                | egui::ViewportCommand::Minimized(false)
+                | egui::ViewportCommand::RequestUserAttention(_)
+        )
+    })
+}
+
+/// 把窗口外的一趟绘制并进等待 presenter 的那份（`--background`），规则与
+/// presenter 自己的 `defer_output` 一致：形状只要最新的，纹理变更全部保留。
+#[cfg(not(windows))]
+fn merge_output(pending: &mut Option<RendererOutput>, next: RendererOutput) {
+    if let Some(pending) = pending {
+        pending.textures_delta.append(next.textures_delta);
+        pending.shapes = next.shapes;
+        pending.pixels_per_point = next.pixels_per_point;
+    } else {
+        *pending = Some(next);
+    }
+}
+
+/// Windows 的窗口能直接隐藏、从不销毁，所以没有「没有 presenter 的一趟」。
+#[cfg(windows)]
+fn merge_output(_pending: &mut Option<RendererOutput>, _next: RendererOutput) {
+    unreachable!("Windows hides the control center instead of destroying its window")
 }
 
 /// Hides its window when dropped. It is [`DesktopWindow`]'s first field, so
@@ -176,6 +284,16 @@ impl Runner {
         let size = Some(state.window.inner_size());
         // Wayland 不给窗口位置，那里只有尺寸能还原。
         let position = state.window.outer_position().ok();
+        // 窗口不在时也要跑完整 UI，用最后一帧的视口与屏幕尺寸。
+        let pixels_per_point = egui_winit::pixels_per_point(&state.context, &state.window);
+        let screen = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(
+                state.window.inner_size().width as f32,
+                state.window.inner_size().height as f32,
+            ) / pixels_per_point,
+        );
+        let time = state.context.input(|input| input.time);
         state.window.set_visible(false);
         let DesktopWindow {
             hide_on_drop,
@@ -184,6 +302,7 @@ impl Runner {
             tray,
             presenter,
             input,
+            mut viewport,
             window,
             ..
         } = state;
@@ -192,6 +311,8 @@ impl Runner {
         drop(input);
         drop(hide_on_drop);
         drop(window);
+        viewport.events.clear();
+        viewport.focused = Some(false);
         tracing::info!(?size, "主窗口已收进托盘");
         self.hidden = Some(Hidden {
             app,
@@ -200,6 +321,12 @@ impl Runner {
             retained,
             size,
             position,
+            viewport,
+            screen: Some(screen),
+            time,
+            since: Instant::now(),
+            next_pass: Instant::now() + HIDDEN_TICK,
+            deferred: None,
         });
     }
 
@@ -248,6 +375,13 @@ impl Runner {
             retained: None,
             size: None,
             position: None,
+            // 还没建过窗口，视口与屏幕尺寸用 egui 的默认值。
+            viewport: egui::ViewportInfo::default(),
+            screen: None,
+            time: 0.0,
+            since: Instant::now(),
+            next_pass: Instant::now() + HIDDEN_TICK,
+            deferred: None,
         });
         if missing_tray {
             return self.create(event_loop);
@@ -263,20 +397,29 @@ impl Runner {
             return Ok(());
         }
         // 收进托盘过的主窗口沿用原来的应用、egui 上下文与绘制资源重建，其余才新建。
-        let (context, app, tray, retained, restore) = match self.hidden.take() {
+        let (context, app, tray, retained, restore, deferred) = match self.hidden.take() {
             Some(Hidden {
                 app,
                 context,
                 tray,
                 retained,
+                deferred,
                 size,
                 position,
-            }) => (context, Some(app), tray, retained, Some((size, position))),
+                ..
+            }) => (
+                context,
+                Some(app),
+                tray,
+                retained,
+                Some((size, position)),
+                deferred,
+            ),
             None => {
                 let context = egui::Context::default();
                 super::fonts::install(&context);
                 context.set_embed_viewports(true);
-                (context, None, None, None, None)
+                (context, None, None, None, None, None)
             }
         };
         // WindowConfig sizes describe page content; the shared caption occupies
@@ -298,16 +441,19 @@ impl Runner {
         }
         let min_inner_size = viewport_builder.min_inner_size;
         let viewport_builder = viewport_builder.with_visible(false).with_decorations(false);
-        // The first control center window takes the token its launcher left in
+        // A window rebuilt for a second start takes that start's token. The
+        // first control center window takes the token its launcher left in
         // the environment, so it gets focus and the launch feedback ends. The
         // variables stay set: removing them now would race the threads already
         // reading the environment, and a spent token is worthless to a child.
         #[cfg(target_os = "linux")]
         let window = {
             use winit::platform::startup_notify::EventLoopExtStartupNotify;
-            let token = (self.root && self.factory.is_some())
-                .then(|| event_loop.read_token_from_env())
-                .flatten();
+            let token = self.activation.take().or_else(|| {
+                (self.root && self.factory.is_some())
+                    .then(|| event_loop.read_token_from_env())
+                    .flatten()
+            });
             create_window(&context, event_loop, &viewport_builder, token)?
         };
         #[cfg(not(target_os = "linux"))]
@@ -341,7 +487,15 @@ impl Runner {
         let graphics = create_device()?;
         let presenter = match retained {
             Some(retained) => retained.reuse(window.clone(), &graphics)?,
-            None => UiPresenter::new(window.clone(), &graphics)?,
+            None => {
+                let mut presenter = UiPresenter::new(window.clone(), &graphics)?;
+                // `--background` 在没有窗口时跑过的绘制攒在这里，交给第一个
+                // presenter，否则字体图集就丢在半路了。
+                if let Some(deferred) = deferred {
+                    presenter.defer_output(deferred);
+                }
+                presenter
+            }
         };
         let input = egui_winit::State::new(
             context.clone(),
@@ -770,16 +924,24 @@ impl ApplicationHandler<Event> for Runner {
                 event_loop.set_control_flow(ControlFlow::Wait);
             }
         } else if let Some(hidden) = &mut self.hidden {
-            let ready = hidden.tick();
-            if ready {
-                // 托盘的「退出」在隐藏状态下完成，不必再建一个窗口。
-                self.closed = true;
-                if self.root {
-                    event_loop.exit();
+            match hidden.pass() {
+                HiddenPass::Wait(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
+                HiddenPass::Show => {
+                    if let Err(error) = self.create(event_loop) {
+                        self.fail(event_loop, error);
+                        return;
+                    }
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now()));
                 }
-                return;
+                HiddenPass::Exit => {
+                    // 托盘的「退出」在隐藏状态下完成，不必再建一个窗口。
+                    self.closed = true;
+                    if self.root {
+                        event_loop.exit();
+                    }
+                    return;
+                }
             }
-            event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + HIDDEN_TICK));
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
@@ -933,10 +1095,19 @@ impl ApplicationHandler<Event> for Windows {
             Event::Request(Request::ActivateMain(token)) => {
                 if let Some(state) = &mut self.main.state {
                     state.activate(&token);
-                } else if self.main.hidden.is_some()
-                    && let Err(error) = self.main.create(event_loop)
-                {
-                    self.main.fail(event_loop, error);
+                } else if self.main.hidden.is_some() {
+                    // Destroyed in the tray (Wayland): the rebuilt window takes
+                    // the launcher's token at creation, as a first start does.
+                    use winit::platform::wayland::ActiveEventLoopExtWayland;
+                    let token = if event_loop.is_wayland() {
+                        token.wayland
+                    } else {
+                        token.x11
+                    };
+                    self.main.activation = token.map(winit::window::ActivationToken::from_raw);
+                    if let Err(error) = self.main.create(event_loop) {
+                        self.main.fail(event_loop, error);
+                    }
                 }
             }
             Event::Request(Request::Exit) => {
@@ -948,10 +1119,12 @@ impl ApplicationHandler<Event> for Windows {
                     }
                 } else if let Some(hidden) = &mut self.main.hidden {
                     // 已经收进托盘：不必为了退出再建一个窗口，请后台开始收尾，
-                    // 退出事件循环的时机交给 about_to_wait 的等待循环。
+                    // 退出事件循环的时机交给 about_to_wait 的窗口外 UI 轮次。
                     if hidden.app.0.on_close_requested() {
                         self.main.closed = true;
                         event_loop.exit();
+                    } else {
+                        hidden.next_pass = Instant::now();
                     }
                 }
                 self.main.finish_close(event_loop);
@@ -974,6 +1147,8 @@ impl ApplicationHandler<Event> for Windows {
                     state: None,
                     // 只有控制中心主窗口会收进托盘。
                     hidden: None,
+                    #[cfg(target_os = "linux")]
+                    activation: None,
                     error: None,
                     proxy: self.main.proxy.clone(),
                     root: false,
@@ -1039,5 +1214,61 @@ impl ApplicationHandler<Event> for Windows {
         self.viewers.clear();
         self.windows.clear();
         self.main.exiting(event_loop);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pass run without a window, as [`Hidden::pass`] runs it.
+    fn windowless_pass(
+        context: &egui::Context,
+        ui: impl FnMut(&mut egui::Ui),
+    ) -> Vec<egui::ViewportCommand> {
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1180.0, 760.0),
+            )),
+            time: Some(1.0),
+            focused: false,
+            ..Default::default()
+        };
+        input
+            .viewports
+            .insert(egui::ViewportId::ROOT, egui::ViewportInfo::default());
+        let mut output = context.run_ui(input, ui);
+        // The font atlas; a real pass keeps it for the next window.
+        output.textures_delta.clear();
+        output
+            .viewport_output
+            .remove(&egui::ViewportId::ROOT)
+            .map(|root| root.commands)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_windowless_pass_reports_requests_to_show_the_window() {
+        let context = egui::Context::default();
+        // The device center's failed exit handshake, raised inside `ui()`.
+        let commands = windowless_pass(&context, |ui| {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        });
+        assert!(wants_window(&commands));
+        // A command queued between passes (another thread, a callback)
+        // arrives with the next one.
+        context.send_viewport_cmd(egui::ViewportCommand::Focus);
+        assert!(wants_window(&windowless_pass(&context, |_| {})));
+        // Nothing asked: the window stays destroyed.
+        assert!(!wants_window(&windowless_pass(&context, |_| {})));
+        // Closing is the exit handshake's business, not a reason to show.
+        let commands = windowless_pass(&context, |ui| {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        });
+        assert!(!wants_window(&commands));
     }
 }

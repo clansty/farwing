@@ -310,6 +310,10 @@ impl Retained {
     ) -> Result<UiPresenter> {
         match self {}
     }
+
+    pub(crate) fn defer_output(&mut self, _output: egui_directx11::RendererOutput) {
+        match *self {}
+    }
 }
 
 /// `set_visible(false)` takes a Win32 window off screen.
@@ -345,6 +349,7 @@ pub(crate) fn create_backbuffer(
 
 /// The D3D11 device behind each shell window.
 pub(crate) use device::{Graphics, create_device};
+pub(crate) use egui_directx11::RendererOutput;
 /// egui output for the presenter, kept apart from what the platform consumes.
 pub(crate) use egui_directx11::split_output;
 
