@@ -598,7 +598,7 @@ impl Desktop {
                     break Err(error);
                 }
                 let size = output(self.screen.width, self.screen.height, quality, maximum);
-                let image = scale(&grab.source, (self.screen.width, self.screen.height), size);
+                let image = scale(grab.pixels(), (self.screen.width, self.screen.height), size);
                 // X11 cannot say whether anything changed; compare.
                 if self.last_size != size
                     || self
@@ -700,7 +700,9 @@ struct Column {
 }
 
 /// Bilinear BGRA scaling, or a crop to even dimensions when the size already
-/// fits. The encoder takes exactly the size it was opened with.
+/// fits. The encoder takes exactly the size it was opened with. 输出一律是不透明
+/// 的：X 留给第四字节的填充值是什么由抓屏那一步决定不再管（见 `x11::Grab`），
+/// 到这里统写成 0xff。
 ///
 /// Each output row is built in two passes instead of one per pixel: the source
 /// rows are blended vertically into a 16-bit row (one weight for the whole row,
@@ -710,6 +712,10 @@ struct Column {
 /// read at random while the encoder waits, and it was the longest stage of the
 /// capture. Weights are fourteen-bit fixed point in both passes, which is
 /// finer than the eight-bit result can show.
+///
+/// 最高画质会把超过 3840x2160 的屏缩下来（4K 级屏幕每帧都要缩），所以整帧按行
+/// 分给几个核：每条输出行只依赖源图，行之间互不相干。两趟的中间行是每个线程自己
+/// 的，别的都只读。
 fn scale(source: &[u8], from: (u32, u32), to: (u32, u32)) -> Vec<u8> {
     let (source_width, source_height) = (from.0 as usize, from.1 as usize);
     let (width, height) = (to.0 as usize, to.1 as usize);
@@ -721,8 +727,11 @@ fn scale(source: &[u8], from: (u32, u32), to: (u32, u32)) -> Vec<u8> {
     {
         for y in 0..height {
             let start = y * source_width * 4;
-            out[y * width * 4..(y + 1) * width * 4]
-                .copy_from_slice(&source[start..start + width * 4]);
+            let line = &mut out[y * width * 4..(y + 1) * width * 4];
+            line.copy_from_slice(&source[start..start + width * 4]);
+            for pixel in line.chunks_exact_mut(4) {
+                pixel[3] = 0xff;
+            }
         }
         return out;
     }
@@ -739,19 +748,52 @@ fn scale(source: &[u8], from: (u32, u32), to: (u32, u32)) -> Vec<u8> {
             weight: ((sx & 0xffff) as u32) >> 2,
         });
     }
-    let mut row = vec![0u16; source_width * 4];
-    for y in 0..height {
-        let sy = ((y as u64 * step_y) + (step_y >> 1)).saturating_sub(1 << 15);
-        let top = ((sy >> 16) as usize).min(source_height - 1);
-        let bottom = (top + 1).min(source_height - 1);
-        blend_rows(
-            &source[top * source_width * 4..(top + 1) * source_width * 4],
-            &source[bottom * source_width * 4..(bottom + 1) * source_width * 4],
-            ((sy & 0xffff) as u32) >> 2,
-            &mut row,
-        );
-        blend_columns(&row, &columns, &mut out[y * width * 4..(y + 1) * width * 4]);
-    }
+    // 每一输出行要的两个源行与权重，和 `columns` 一样只算一次。
+    let rows: Vec<(usize, usize, u32)> = (0..height)
+        .map(|y| {
+            let sy = ((y as u64 * step_y) + (step_y >> 1)).saturating_sub(1 << 15);
+            let top = ((sy >> 16) as usize).min(source_height - 1);
+            (
+                top,
+                (top + 1).min(source_height - 1),
+                ((sy & 0xffff) as u32) >> 2,
+            )
+        })
+        .collect();
+    let row_bytes = width * 4;
+    // 一百万像素以下起线程比省下的还贵。
+    let threads = if width * height < 1 << 20 {
+        1
+    } else {
+        std::thread::available_parallelism().map_or(1, |count| count.get().min(8))
+    };
+    // 尺寸为 0 时不给空的分段：`chunks_mut(0)` 会 panic。
+    let band = height.div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        for (index, chunk) in out.chunks_mut(band * row_bytes).enumerate() {
+            let (columns, rows) = (&columns, &rows);
+            let mut work = move || {
+                // 两趟的中间行归本线程，不共享。
+                let mut row = vec![0u16; source_width * 4];
+                for (offset, line) in chunk.chunks_exact_mut(row_bytes).enumerate() {
+                    let (top, bottom, weight) = rows[index * band + offset];
+                    blend_rows(
+                        &source[top * source_width * 4..(top + 1) * source_width * 4],
+                        &source[bottom * source_width * 4..(bottom + 1) * source_width * 4],
+                        weight,
+                        &mut row,
+                    );
+                    blend_columns(&row, columns, line);
+                }
+            };
+            // 最后一段留在本线程上跑：为它再起一个线程只是白付一次创建。
+            if index + 1 == threads.min(height.div_ceil(band)) {
+                work();
+            } else {
+                scope.spawn(work);
+            }
+        }
+    });
     out
 }
 
@@ -838,11 +880,13 @@ fn blend_columns(row: &[u16], columns: &[Column], out: &mut [u8]) {
 fn blend_columns_one_by_one(row: &[u16], columns: &[Column], out: &mut [u8]) {
     for (x, column) in columns.iter().enumerate() {
         let inverse = 16384 - column.weight;
-        for channel in 0..4 {
+        // 只算三个颜色通道，第四字节统写成不透明（源里那个是 X 的填充值）。
+        for channel in 0..3 {
             let a = u32::from(row[column.left + channel]) * inverse;
             let b = u32::from(row[column.right + channel]) * column.weight;
             out[x * 4 + channel] = ((a + b + (1 << 20)) >> 21) as u8;
         }
+        out[x * 4 + 3] = 0xff;
     }
 }
 
@@ -875,10 +919,13 @@ unsafe fn blend_columns_simd(row: &[u16], columns: &[Column], out: &mut [u8]) {
                 _mm_srai_epi32(_mm_add_epi32(first, rounding), 21),
                 _mm_srai_epi32(_mm_add_epi32(second, rounding), 21),
             );
-            _mm_storel_epi64(
-                out.as_mut_ptr().add(x * 4).cast(),
+            // 第四字节（alpha）同上，统写成不透明：`packus` 已经饱和到 0..=255，
+            // 按 32 位或上 0xff000000 只改这一个字节。
+            let opaque = _mm_or_si128(
                 _mm_packus_epi16(both, both),
+                _mm_set1_epi32(0xff00_0000u32 as i32),
             );
+            _mm_storel_epi64(out.as_mut_ptr().add(x * 4).cast(), opaque);
             x += 2;
         }
         blend_columns_one_by_one(row, &columns[x..], &mut out[x * 4..]);
@@ -933,8 +980,33 @@ mod tests {
     fn crop_to_even_keeps_pixels() {
         let source: Vec<u8> = (0..3 * 3 * 4).map(|v| v as u8).collect();
         let out = scale(&source, (3, 3), (2, 2));
-        assert_eq!(&out[..8], &source[..8]);
-        assert_eq!(&out[8..16], &source[12..20]);
+        let opaque = |pixels: &[u8]| -> Vec<u8> {
+            pixels
+                .chunks_exact(4)
+                .flat_map(|p| [p[0], p[1], p[2], 0xff])
+                .collect()
+        };
+        assert_eq!(&out[..8], &opaque(&source[..8])[..]);
+        assert_eq!(&out[8..16], &opaque(&source[12..20])[..]);
+    }
+
+    /// X 把填充字节留给显示服务器，第四字节是什么由不得我们：缩放器一律写成
+    /// 不透明，两个分支都要。
+    #[test]
+    fn every_output_pixel_is_opaque() {
+        let source: Vec<u8> = (0..64 * 48 * 4).map(|v| (v % 251) as u8).collect();
+        for (from, to) in [
+            ((64u32, 48u32), (32u32, 24u32)),
+            ((64, 48), (48, 36)),
+            ((16, 16), (24, 24)),
+            ((3, 3), (2, 2)),
+        ] {
+            let out = scale(&source, from, to);
+            assert!(
+                out.chunks_exact(4).all(|pixel| pixel[3] == 0xff),
+                "{from:?} -> {to:?}"
+            );
+        }
     }
 
     /// 与一个独立的 f64 双线性实现对照：采样位置、朝向、通道都必须一致，
@@ -984,6 +1056,11 @@ mod tests {
                 let x1 = (x0 + 1).min(sw - 1);
                 let fx = (sx & 0xffff) as f64 / 65536.0;
                 for channel in 0..4 {
+                    // 第四字节是定值，不参与对照。
+                    if channel == 3 {
+                        out[(y * w + x) * 4 + 3] = 0xff;
+                        continue;
+                    }
                     let at = |px: usize, py: usize| f64::from(source[(py * sw + px) * 4 + channel]);
                     let top = at(x0, y0) * (1.0 - fx) + at(x1, y0) * fx;
                     let bottom = at(x0, y1) * (1.0 - fx) + at(x1, y1) * fx;
