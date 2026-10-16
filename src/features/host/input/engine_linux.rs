@@ -662,7 +662,6 @@ mod tests {
                 right: o.left + o.width as i32,
                 bottom: o.top + o.height as i32,
             }),
-            rotation: logical.map_or_else(Default::default, |o| o.rotation),
         }
     }
 
