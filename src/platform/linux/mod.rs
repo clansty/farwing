@@ -31,3 +31,14 @@ mod video_layer;
 pub(crate) mod virtual_audio;
 pub(crate) mod virtual_display;
 pub(crate) mod wol;
+
+/// FUSE 卷的文件系统子类型，写进挂载表就是 `fuse.<子类型>`。
+///
+/// 故意不叫 `openuuyc`：GLib 判断一个文件系统算不算「远端」只用一张写死的名单
+/// （`is_remote_fs_type()`：nfs、nfs4、cifs、smb、smb2、fuse.sshfs），名单里唯一
+/// 能由 FUSE 挂出来的就是 `fuse.sshfs`。而我们的卷本来就是远端——文件管理器据此
+/// 走远端的那套规则，最要紧的一条是 GNOME 在 `local-only` 偏好下**不生成缩略图**：
+/// Nautilus 生成缩略图会把每个文件整份读一遍，落到我们这个卷上就是整份下载（实测
+/// 看一眼 8 个文件的目录要拉 14 MB）。不伪装成远端的话，`filesystem::remote` 是
+/// FALSE，任何 FUSE 卷都被当成本地盘。
+pub(crate) const REMOTE_FS_SUBTYPE: &str = "sshfs";

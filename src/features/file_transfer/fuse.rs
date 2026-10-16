@@ -607,7 +607,7 @@ impl fuser::Filesystem for RemoteFs {
 fn mount_options() -> Vec<fuser::MountOption> {
     vec![
         fuser::MountOption::FSName("openuuyc-remote".to_owned()),
-        fuser::MountOption::Subtype("openuuyc".to_owned()),
+        fuser::MountOption::Subtype(crate::platform::linux::REMOTE_FS_SUBTYPE.to_owned()),
         fuser::MountOption::RO,
         fuser::MountOption::NoSuid,
         fuser::MountOption::NoDev,
