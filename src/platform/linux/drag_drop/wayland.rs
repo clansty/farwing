@@ -21,7 +21,7 @@ use wayland_client::protocol::{
     wl_buffer, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer, wl_output,
     wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
 };
-use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
+use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, WEnum};
 use wayland_protocols::xdg::xdg_output::zv1::client::{zxdg_output_manager_v1, zxdg_output_v1};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 use wayland_protocols_wlr::virtual_pointer::v1::client::{
@@ -44,6 +44,10 @@ fn now_ms() -> u32 {
 const SIDE: i32 = 512;
 /// 一直没等到拖放就安静收工。整体超时由 `tick` 管（30 秒），这里不必等那么久。
 const LIMIT: Duration = Duration::from_secs(20);
+/// 推完指针后等合成器把拖放交过来。指针底下换了 surface 就会重新判定一次，正常
+/// 一个 roundtrip 就到；等不到就是这台合成器不吃这一套，和 X11 那条一样趁早报
+/// `Unavailable`（对齐 `portal.rs` 的 `CAPTURE_WAIT`），别让主控干等 3 秒看门狗。
+const ENTER_WAIT: Duration = Duration::from_millis(600);
 /// 接住之后还要等原来那次拖动收场，等不到也最多等这么久：主控那头等的是这一句
 /// （见 `run` 末尾），一直不吭声它就一直卡在「正在准备文件」。
 const RELEASE: Duration = Duration::from_secs(2);
@@ -75,10 +79,11 @@ impl Catcher {
         std::thread::Builder::new()
             .name("Wayland drag catch".into())
             .spawn(move || {
-                // 失败不报给状态机：X11 那条还在跑，这里一次摆设不成功不该把整个
-                // 拖放判死。真的一直没结果，`tick` 的超时会收场。
+                // Wayland 会话里这是唯一的一条路，接取不了必须让主控知道原因：一声
+                // 不吭地收工，主控只会等 3 秒看门狗然后显示一句「取消了」。`notify`
+                // 走的是 `Command::Portal`，对已经结束的条目会被忽略。
                 if let Err(error) = run(&device, &ending, &allowed, &notify) {
-                    tracing::debug!(error = format!("{error:#}"), "Wayland 拖放接取失败");
+                    notify(Event::Failed(format!("{error:#}")));
                 }
             })?;
         Ok(Self { stop })
@@ -86,6 +91,14 @@ impl Catcher {
     pub fn cancel(&self) {
         self.stop.store(true, Ordering::Release);
     }
+}
+
+/// 合成器的一块输出：`wl_output` 本身、它报上来的名字（v4 才有，之前恒为空串），
+/// 以及当前模式的物理尺寸（名字对不上时拿它认屏）。
+struct Output {
+    proxy: wl_output::WlOutput,
+    name: String,
+    physical: (i32, i32),
 }
 
 #[derive(Default)]
@@ -104,8 +117,8 @@ struct State {
     /// 的绝对位置要按整个布局的比例给——两样都得知道这些数才算得对。
     logical: Vec<Option<((i32, i32), (i32, i32))>>,
     pointer: Option<zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1>,
-    /// 合成器的输出，以及它们报上来的名字（名字要等绑定之后再走一轮才到）。
-    outputs: Vec<(wl_output::WlOutput, String)>,
+    /// 合成器的输出（名字与当前模式要等绑定之后再走一轮才到）。
+    outputs: Vec<Output>,
     /// 这次拖放带的 offer，以及它报出来的类型。
     offer: Option<wl_data_offer::WlDataOffer>,
     mimes: Vec<String>,
@@ -113,6 +126,9 @@ struct State {
     entered: bool,
     /// 文件列表已经问到（`paths` 刚拿到，还没被取走）。
     captured: bool,
+    /// 接住的是个没有文件列表的东西（拖的是文字、网页里的图片之类），已经可以
+    /// 断定拿不到路径，不必再等。
+    refused: bool,
     /// 原来那次拖动收场了：`drop`（松开在我们这块上），或者 `leave`（拖着拖着
     /// 离开了我们这块）。这两条是 Wayland 拖放里唯一能看到的「结束」。
     ended: bool,
@@ -121,6 +137,109 @@ struct State {
     paths: Option<Vec<PathBuf>>,
     configure: Option<(u32, u32, u32)>,
     closed: bool,
+}
+
+/// 第 `index` 块屏报上来的逻辑尺寸，还没报就是 `(0, 0)`。
+fn logical_size(state: &State, index: usize) -> (i32, i32) {
+    state
+        .logical
+        .get(index)
+        .copied()
+        .flatten()
+        .map_or((0, 0), |(_, size)| size)
+}
+
+/// 这块屏在采集那张表里的尺寸。认屏的退路要拿它跟合成器的输出比，而 `device` 就是
+/// 采集那张表里的名字，所以按名字查得到。那张表来自 RandR（Wayland 会话里由 XWayland
+/// 提供），查不到就当没有尺寸：这本来就是条退路，少走一步不该把整次接取判死。
+fn captured_size(device: &str) -> Option<(u32, u32)> {
+    crate::platform::capture::screens()
+        .ok()?
+        .into_iter()
+        .find(|screen| screen.device_name == device && screen.width > 0 && screen.height > 0)
+        .map(|screen| (screen.width, screen.height))
+}
+
+/// 名字对不上时的退路，照采集那边的三段式去掉按名字那一段（调用方已经找过一遍）：
+/// 只有一块屏就用它 → 按尺寸认 → 都不行就报错，并把合成器有的输出都列出来。
+///
+/// 名字对不上是常态：XWayland 那边给的可能压根不是合成器的输出名（老版本直接叫
+/// `XWAYLAND0`），而 `wl_output` 在 v4 之前根本不发名字（绑上去拿到的是空串）。
+/// 比尺寸时按无序对比较，转过 90 度的屏宽高是换过来的。
+///
+/// 先比逻辑尺寸、比不出来再比物理尺寸：`device` 那边来的尺寸有缩放时报的多半是逻辑
+/// 尺寸，而 `wl_output.mode` 是物理像素——只比后者的话，这条退路恰好死在最需要它的
+/// 多屏缩放场景里。逻辑尺寸有好几块屏对得上就报错，不再去比物理尺寸：那样只会挑中
+/// 凑巧对上的另一块屏。
+fn pick(state: &State, device: &str) -> Result<usize> {
+    if state.outputs.is_empty() {
+        bail!("合成器没有报出任何输出");
+    }
+    if state.outputs.len() == 1 {
+        tracing::debug!(
+            device,
+            name = %state.outputs[0].name,
+            "合成器只有一块屏，就按它接取"
+        );
+        return Ok(0);
+    }
+    let describe = |index: usize| {
+        let output = &state.outputs[index];
+        if output.name.is_empty() {
+            format!("无名 {}x{}", output.physical.0, output.physical.1)
+        } else {
+            output.name.clone()
+        }
+    };
+    let listed = || {
+        (0..state.outputs.len())
+            .map(describe)
+            .collect::<Vec<_>>()
+            .join("、")
+    };
+    let Some(size) = captured_size(device) else {
+        bail!(
+            "合成器里没有名为 {device} 的输出，也读不到它的尺寸（它有：{}）",
+            listed()
+        );
+    };
+    let side = |(width, height): (i32, i32)| (width.max(height), width.min(height));
+    let wanted = side((size.0 as i32, size.1 as i32));
+    let matching = |size_of: &dyn Fn(usize) -> (i32, i32)| -> Vec<usize> {
+        (0..state.outputs.len())
+            .filter(|&index| {
+                let size = size_of(index);
+                size != (0, 0) && side(size) == wanted
+            })
+            .collect()
+    };
+    let mut matched = matching(&|index| logical_size(state, index));
+    if matched.is_empty() {
+        matched = matching(&|index| state.outputs[index].physical);
+    }
+    match matched[..] {
+        [index] => {
+            tracing::debug!(device, "输出名对不上，按尺寸认屏");
+            Ok(index)
+        }
+        [] => bail!(
+            "合成器里没有名为 {device} 的输出，也没有 {}x{} 的屏（它有：{}）",
+            size.0,
+            size.1,
+            listed()
+        ),
+        _ => bail!(
+            "合成器里没有名为 {device} 的输出，按尺寸 {}x{} 认又有好几块屏对得上（{}），\
+             分不出是哪一块",
+            size.0,
+            size.1,
+            matched
+                .iter()
+                .map(|&index| describe(index))
+                .collect::<Vec<_>>()
+                .join("、")
+        ),
+    }
 }
 
 fn run(
@@ -142,22 +261,23 @@ fn run(
         .roundtrip(&mut state)
         .context("读取 Wayland 输出描述失败")?;
 
-    let (target, compositor, layer, shm, seat, manager) = (
-        state
-            .outputs
-            .iter()
-            .find(|(_, name)| name == device)
-            .map(|(output, _)| output.clone())
-            .with_context(|| format!("合成器没有名为 {device} 的输出"))?,
-        state.compositor.clone().context("合成器没有 wl_compositor")?,
-        state.layer.clone().context("合成器没有 zwlr_layer_shell_v1")?,
-        state.shm.clone().context("合成器没有 wl_shm")?,
-        state.seat.clone().context("合成器没有 wl_seat")?,
-        state
-            .manager
-            .clone()
-            .context("合成器没有 wl_data_device_manager")?,
-    );
+    // 先确认必需的全局对象，再认屏：顺序反过来的话，GNOME 这类缺 wlr-layer-shell 的
+    // 合成器上报出来的会是「没有名为 XWAYLAND0 的输出」，把真正的原因盖掉，而主控
+    // 要看到的正是「这个合成器不提供 wlr-layer-shell」。
+    let compositor = state
+        .compositor
+        .clone()
+        .context("合成器没有 wl_compositor")?;
+    // 缺 layer-shell 的合成器上这条路走不通，得让主控看到原因，不能一声不吭。
+    let layer = state.layer.clone().context(
+        "这个合成器不提供 wlr-layer-shell（GNOME 就是这样），没法在指针底下接取拖放",
+    )?;
+    let shm = state.shm.clone().context("合成器没有 wl_shm")?;
+    let seat = state.seat.clone().context("合成器没有 wl_seat")?;
+    let manager = state
+        .manager
+        .clone()
+        .context("合成器没有 wl_data_device_manager")?;
 
     // 逻辑坐标只能问 xdg-output：`wl_output` 给的永远是物理尺寸，两者之间差着一个
     // 缩放（本机 DP-1 是 1.35 倍、DP-3 是 1.6 倍），而 layer surface 的边距和虚拟
@@ -166,28 +286,63 @@ fn run(
     let xdg = state
         .xdg
         .clone()
-        .context("合成器没有 zxdg_output_manager_v1")?;
+        .context("合成器没有 zxdg_output_manager_v1，读不到屏幕的逻辑尺寸")?;
     state.described = state
         .outputs
         .iter()
-        .map(|(output, _)| xdg.get_xdg_output(output, &handle, ()))
+        .map(|output| xdg.get_xdg_output(&output.proxy, &handle, ()))
         .collect();
     state.logical = vec![None; state.outputs.len()];
+
+    // 认屏。名字对得上就直接用它，不必先把所有屏的逻辑尺寸等齐——合成器里只要有一
+    // 块从不报逻辑尺寸的输出（笔记本上拔掉的外接屏就是），等它到齐就要白等满
+    // `SETUP`。
+    let index = match state
+        .outputs
+        .iter()
+        .position(|output| !output.name.is_empty() && output.name == device)
+    {
+        Some(index) => index,
+        None => {
+            // 名字对不上只能按尺寸认，而尺寸要在逻辑与物理两套单位里比一遍，所以先把
+            // 逻辑尺寸等齐。正常一轮 roundtrip 就到，`SETUP` 只是兜底。
+            let deadline = Instant::now() + SETUP;
+            while state.logical.iter().any(Option::is_none) && Instant::now() < deadline {
+                dispatch(&mut queue, &mut state, &connection)?;
+                wait(&mut queue, &mut state, &connection, POLL)?;
+            }
+            pick(&state, device)?
+        }
+    };
+    let target = state.outputs[index].proxy.clone();
+    // 认出来的这块屏，它的逻辑尺寸仍要等一轮（`get_xdg_output` 之后事件才到）：
+    // layer surface 的边距按逻辑算，虚拟指针的位置按整个布局的比例算，两样都要这块
+    // 屏的逻辑尺寸。只等这一块，别的屏报不报都无所谓——本来要避开的就只是「别的屏
+    // 从不报逻辑尺寸时白等满 `SETUP`」。
+    let ready = |state: &State| {
+        state
+            .logical
+            .get(index)
+            .is_some_and(|entry| entry.is_some_and(|(_, (width, height))| width > 0 && height > 0))
+    };
     let deadline = Instant::now() + SETUP;
-    while state.logical.iter().any(Option::is_none) && Instant::now() < deadline {
+    while !ready(&state) && Instant::now() < deadline {
         dispatch(&mut queue, &mut state, &connection)?;
         wait(&mut queue, &mut state, &connection, POLL)?;
     }
-    let index = state
-        .outputs
-        .iter()
-        .position(|(bound, _)| bound == &target)
-        .context("目标输出不见了")?;
-    let (logical, (logical_width, logical_height)) =
-        state.logical[index].context("输出没有给出逻辑尺寸")?;
+    let (logical, (logical_width, logical_height)) = state.logical[index]
+        .filter(|(_, (width, height))| *width > 0 && *height > 0)
+        .context("合成器没有给出这块屏的逻辑尺寸")?;
     // 摆在这块屏的正中间，指针也挪过去。中间是最稳的地方：不会碰到别的层，
     // 也离屏幕边缘最远。
     let local = (logical_width / 2, logical_height / 2);
+
+    // data device 必须在这块 surface 上屏**之前**建好。合成器按请求顺序处理：处理
+    // 下面那次 commit 时 surface 一上屏，它就重新判定指针底下是谁、把这次拖放交给
+    // 我们，而 `data_offer` 与 `enter` 是发给我们这个客户端**当时已有的** data
+    // device 的。上屏之后才建的那个不会补发，此后指针不动也不会重新判定，整条路就
+    // 卡在 `Unavailable`（sway 1.7 上实测如此）。
+    state.device = Some(manager.get_data_device(&seat, &handle, ()));
 
     let surface = compositor.create_surface(&handle, ());
     let shell = layer.get_layer_surface(
@@ -227,8 +382,6 @@ fn run(
     shell.ack_configure(serial);
     surface.commit();
 
-    let data = manager.get_data_device(&seat, &handle, ());
-    state.device = Some(data);
     // 把光标挪到这块 surface 中间。
     //
     // 合成器只在收到 motion 事件时才会重新判定指针底下是谁，而用户把指针拖出窗口
@@ -237,8 +390,30 @@ fn run(
     // 边缘挪开：按着键停在边缘会触发 niri 的边缘手势。
     move_pointer(&mut state, &handle, &connection, local, (logical, (logical_width, logical_height)));
 
+    // 推完指针等合成器把这次拖放交过来：`enter` 到不了就没戏了，趁早收工，别让主控
+    // 干等 3 秒看门狗（那时界面上只会有一句没头没脑的「取消了」）。和 X11 那条一样
+    // 报 `Unavailable`——也可能只是这次拖动本来就结束了。
+    let deadline = Instant::now() + ENTER_WAIT;
+    while !state.entered
+        && !state.closed
+        && !stop.load(Ordering::Acquire)
+        && allowed()
+        && Instant::now() < deadline
+    {
+        dispatch(&mut queue, &mut state, &connection)?;
+        wait(&mut queue, &mut state, &connection, POLL)?;
+    }
+    if !state.entered {
+        tracing::info!(device, "合成器没有把这次拖放交给摆出来的 surface");
+        shell.destroy();
+        surface.destroy();
+        notify(Event::Unavailable);
+        return Ok(());
+    }
+
     let deadline = Instant::now() + LIMIT;
     while state.paths.is_none()
+        && !state.refused
         && !state.closed
         && !stop.load(Ordering::Acquire)
         && allowed()
@@ -265,6 +440,11 @@ fn run(
     let Some(paths) = state.paths.take() else {
         shell.destroy();
         surface.destroy();
+        // 接住了却拿不到路径，就把原因说出来：不说的话主控要等满 3 秒看门狗，界面
+        // 上一句「取消了」，用户根本不知道是拖的东西不对。
+        if state.refused {
+            notify(Event::Failed("拖动的不是文件".to_owned()));
+        }
         return Ok(());
     };
     tracing::info!(files = paths.len(), "Wayland 拖放接住了");
@@ -599,10 +779,11 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 ))
             }
             // `wl_output.name` 是 v4 才有的，也就是认这块屏靠的那个字段。
-            "wl_output" => state.outputs.push((
-                registry.bind::<wl_output::WlOutput, _, _>(name, version.min(4), handle, ()),
-                String::new(),
-            )),
+            "wl_output" => state.outputs.push(Output {
+                proxy: registry.bind::<wl_output::WlOutput, _, _>(name, version.min(4), handle, ()),
+                name: String::new(),
+                physical: (0, 0),
+            }),
             _ => {}
         }
     }
@@ -617,10 +798,23 @@ impl Dispatch<wl_output::WlOutput, ()> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_output::Event::Name { name } = event
-            && let Some(entry) = state.outputs.iter_mut().find(|(it, _)| it == output)
-        {
-            entry.1 = name;
+        let Some(entry) = state.outputs.iter_mut().find(|entry| entry.proxy == *output) else {
+            return;
+        };
+        match event {
+            wl_output::Event::Name { name } => entry.name = name,
+            // 合成器可能把几个模式都报一遍，只认标了 current 的那个。
+            wl_output::Event::Mode {
+                flags,
+                width,
+                height,
+                ..
+            } => {
+                if matches!(flags, WEnum::Value(mode) if mode.contains(wl_output::Mode::Current)) {
+                    entry.physical = (width, height);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -666,6 +860,14 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for State {
             wl_data_device::Event::Enter { .. } => {
                 state.entered = true;
                 request(state);
+                // offer 与它的类型清单一定在 `enter` 之前到齐（协议如此），所以这
+                // 一刻就能断定：有 offer、却没一个认得出的类型，那拖的不是文件。
+                state.refused = state.requested.is_none()
+                    && state.offer.is_some()
+                    && !state
+                        .mimes
+                        .iter()
+                        .any(|mime| MIMES.contains(&mime.as_str()));
             }
             // 拖起来的那次松开不会以 `wl_pointer.button` 的形式送到我们手上——
             // 隐式抓取把它吃掉了，落点是谁就以 `drop` 告诉谁。
@@ -739,14 +941,14 @@ mod tests {
     /// 「创建子对象」的事件必须在 `Dispatch` 里给出特化，缺了会在合成器真送来
     /// 事件时 panic，而那个 panic 直接 abort 整个进程。这条就是把这个坑钉住：
     /// 不连真拖放也能查出来。
+    ///
+    /// 要的只是一个 `QueueHandle`，它只要求有一条连接、不要求对面坐着合成器。所以
+    /// 用一对 unix socket 自己喂一条连接进去：CI 和 Xorg 会话里没有 Wayland 显示，
+    /// `connect_to_env` 会直接失败，而这条测试不该只在有合成器的机器上跑得起来。
     #[test]
     fn data_offer_has_a_child_specialization() {
-        // 没有 Wayland 会话就跳过：CI、纯 Xorg、或者测试进程没带上 WAYLAND_DISPLAY
-        // 时，这条会以「环境不满足」失败，而它要钉的是「特化有没有写」，不是环境。
-        let Ok(connection) = Connection::connect_to_env() else {
-            eprintln!("跳过：没有可用的 Wayland 会话");
-            return;
-        };
+        let (ours, _theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let connection = Connection::from_socket(ours).unwrap();
         let queue = connection.new_event_queue::<State>();
         let _ = <State as Dispatch<wl_data_device::WlDataDevice, ()>>::event_created_child(
             0,

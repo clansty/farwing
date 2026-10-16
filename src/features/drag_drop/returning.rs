@@ -39,13 +39,14 @@ impl Actor {
         let Some(entry) = self.entries.get_mut(&id) else {
             return Ok(());
         };
-        // 只在对方会发拖动图像时才等它：对方发图与 `Command::Image` 用同一判据，
-        // 需要双方都声明可拖回；Linux 这边 RETURN_CAPABLE 为假，等下去只会卡到超时
-        // （Windows 这边为真，行为不变）。
+        // 只在对方会发拖动图像时才等它：对方发不发与 `Command::Image` 是同一判据，
+        // 从它那边看就是「我们声明了 `DRAG_IMAGE`（我们总是声明），或双方都能拖回」；
+        // 不声明 `DRAG_IMAGE` 的旧版本或上游对端只在双方都能拖回时才发。等错了对象
+        // 就是白等到超时，或者该等的没等（Linux 这边 RETURN_CAPABLE 为假）。
+        let image_coming = self.shared.image_capable.load(Ordering::Acquire)
+            || (native::RETURN_CAPABLE && self.shared.return_capable.load(Ordering::Acquire));
         if (entry.reverse && !entry.preserve_source && !entry.source_released)
-            || (native::RETURN_CAPABLE
-                && self.shared.return_capable.load(Ordering::Acquire)
-                && entry.image.is_none())
+            || (image_coming && entry.image.is_none())
         {
             return Ok(());
         }

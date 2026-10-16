@@ -12,7 +12,10 @@
 //! 交接窗口假装的，图由源程序自己画，没这一步。
 pub(crate) use crate::protocol::drag_drop::DragImage;
 use anyhow::{Context as _, Result, bail, ensure};
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 /// 单张图的边长，跟 Windows 端 Shell 给的 64 对齐。
 const SIDE: u32 = 64;
@@ -22,6 +25,67 @@ const STACK: u32 = 80;
 const MAX_SOURCE: u32 = 4096;
 /// 位图图标至少要有这么大才值得用，再小放大出来是一团糊。
 const MIN_BITMAP: u32 = 48;
+/// 图标工具的超时。这两张图只是「拖起来好看一点」，而图标主题和文件都可能待在网络
+/// 盘或 FUSE 上：`gio` 一卡住，整次拖出就跟着卡在「正在准备文件」上（图是在发布
+/// 文件清单之前生成的）。超时就杀掉，当没有这张图。
+const TOOL_LIMIT: Duration = Duration::from_secs(2);
+
+/// 跑一个只看输出的子进程，把它的 stdout 拿回来；超过 `TOOL_LIMIT` 就杀掉它。
+///
+/// 「工具」可能是个包装脚本（发行版的 `gio`、用户自己垫的同名脚本），真正干活的是
+/// 它起的孙进程，而孙进程继承着同一根 stdout：只杀直接子进程，管道的写端还开着，
+/// 读线程就要等到孙进程自己退出。所以让它自成一个进程组、超时整组杀掉，读线程也
+/// 只等到时限为止，等不到就不要了（线程自己会在写端全关时退出）。
+fn capture(command: &mut std::process::Command, tool: &str) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    use std::os::unix::process::CommandExt as _;
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .with_context(|| format!("调用 {tool} 失败"))?;
+    // 边跑边读：等它退出了再读，输出填满管道时两边一起卡住。
+    let mut pipe = child.stdout.take().context("子进程没有标准输出")?;
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut data = Vec::new();
+        let _ = pipe.read_to_end(&mut data);
+        let _ = sender.send(data);
+    });
+    let deadline = Instant::now() + TOOL_LIMIT;
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("等待 {tool} 失败"))?
+        {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            // 进程组号就是它自己的 pid（`process_group(0)`）。
+            // SAFETY: 只是发信号。子进程还没被回收（`wait` 在这之后），它的 pid
+            // 连同这个组号都不会被别人复用。
+            unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+            child.wait().with_context(|| format!("回收 {tool} 失败"))?;
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let status = status.with_context(|| format!("{tool} 没有在时限内给出结果"))?;
+    // 子进程退了，可它留下的孙进程也许还攥着 stdout：同样只等到时限，等不到就
+    // 不要了。这时子进程已经回收，组号随时可能被复用，不再去杀那个组。
+    // 刚好卡着时限退出的，也给读线程留一点收尾的工夫。
+    let wait = deadline
+        .saturating_duration_since(Instant::now())
+        .max(Duration::from_millis(100));
+    let data = receiver
+        .recv_timeout(wait)
+        .ok()
+        .with_context(|| format!("{tool} 没有在时限内给出结果"))?;
+    ensure!(status.success(), "{tool} 没能给出结果");
+    Ok(data)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Identity {
@@ -40,15 +104,22 @@ pub fn decorate(_data: &super::Files, _image: &DragImage) -> Result<()> {
 /// 拖动预览图。跑在阻塞线程上（会去翻图标主题、可能还要起 rsvg 画一张）。
 pub fn selection(paths: &[PathBuf]) -> Result<DragImage> {
     ensure!(!paths.is_empty(), "文件选择为空");
-    let first = icon(&paths[0])?;
     if paths.len() == 1 {
-        return Ok(first);
+        return icon(&paths[0]);
     }
-    let mut icons = vec![first];
-    for path in paths.iter().skip(1).take(2) {
-        if let Ok(icon) = icon(path) {
-            icons.push(icon);
+    // 叠的是前三项里拼得出来的那几张：哪一项拼不出来就跳过它，全都拼不出来才算没图。
+    let mut icons = Vec::new();
+    let mut failure = None;
+    for path in paths.iter().take(3) {
+        match icon(path) {
+            Ok(icon) => icons.push(icon),
+            Err(error) => {
+                failure.get_or_insert(error);
+            }
         }
+    }
+    if icons.is_empty() {
+        return Err(failure.unwrap_or_else(|| anyhow::anyhow!("文件选择为空")));
     }
     Ok(stacked(&icons))
 }
@@ -60,13 +131,23 @@ fn icon(path: &Path) -> Result<DragImage> {
     }
     let names = type_icons(path)?;
     // 候选是有先后的，但装着的主题不一定每一枚都有（`application-toml` 这种就常常缺），
-    // 所以按顺序找，第一个真找得到的算数。
+    // 所以按顺序找，第一个真画得出来的算数：矢量图画不出来（没装 `rsvg-convert`）
+    // 就用同名的位图，同名的都不行再看下一个名字。
+    let mut failure = None;
     for name in &names {
-        if let Ok(file) = lookup(name) {
-            return render(&file);
+        for file in lookup(name).unwrap_or_default() {
+            match render(&file) {
+                Ok(image) => return Ok(image),
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
         }
     }
-    bail!("图标主题里没有这个类型的图（{}）", names.join("、"))
+    match failure {
+        Some(error) => Err(error),
+        None => bail!("图标主题里没有这个类型的图（{}）", names.join("、")),
+    }
 }
 
 /// 图片文件自己的缩略图。读不动（不是图片、太大、这种格式没编进来）就当没有。
@@ -88,13 +169,12 @@ fn preview(path: &Path) -> Option<DragImage> {
 /// 这个文件算哪几类图标，交给 GIO 定（它带着 MIME 库和主题）：`standard::icon` 给的
 /// 是有先后的候选，越靠前越是这一类的准确名字；`-symbolic` 那几枚是单色版本，不要。
 fn type_icons(path: &Path) -> Result<Vec<String>> {
-    let output = std::process::Command::new("gio")
+    let mut command = std::process::Command::new("gio");
+    command
         .args(["info", "-a", "standard::icon", "--"])
-        .arg(path)
-        .output()
-        .context("调用 gio 失败")?;
-    ensure!(output.status.success(), "gio 认不出这个文件");
-    let text = String::from_utf8_lossy(&output.stdout);
+        .arg(path);
+    let stdout = capture(&mut command, "gio")?;
+    let text = String::from_utf8_lossy(&stdout);
     let line = text
         .lines()
         .find_map(|line| line.trim().strip_prefix("standard::icon:"))
@@ -109,12 +189,15 @@ fn type_icons(path: &Path) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// 在装着的图标主题里找这个名字的文件。
+/// 在装着的图标主题里找这个名字的文件，按该试的先后排好。
 ///
-/// 矢量图优先：多大都画得清楚。位图则要挑够大的——主题里往往只有 16×16，放大到 64
-/// 只会是一团糊，那就干脆当没有，让主控显示它自己的图标。两边都找不到时也当没有。
-fn lookup(name: &str) -> Result<PathBuf> {
-    let mut best: Option<(u32, PathBuf)> = None;
+/// 矢量图在前：多大都画得清楚。可它要靠 `rsvg-convert` 才画得出来，没装就画不了，
+/// 所以后面再跟一张同名的位图垫底。位图要挑够大的——主题里往往只有 16×16，放大到
+/// 64 只会是一团糊，那就干脆不要，让主控显示它自己的图标。两样都没有时报错。
+fn lookup(name: &str) -> Result<Vec<PathBuf>> {
+    // `scalable` 目录里的矢量图优先于尺寸目录里的（`true` 排在 `false` 后面）。
+    let mut vector: Option<(bool, PathBuf)> = None;
+    let mut bitmap: Option<(u32, PathBuf)> = None;
     for root in roots() {
         let Ok(themes) = std::fs::read_dir(&root) else {
             continue;
@@ -126,24 +209,33 @@ fn lookup(name: &str) -> Result<PathBuf> {
             for entry in entries.flatten() {
                 let directory = entry.file_name().to_string_lossy().into_owned();
                 // 尺寸目录名就是尺寸（`64x64`、`128x128@2`），`scalable` 是矢量那一份。
-                let found = if directory == "scalable" {
-                    find_in(&entry.path(), name).map(|file| (u32::MAX, file))
-                } else {
-                    parse_size(&directory)
-                        .and_then(|size| find_in(&entry.path(), name).map(|file| (size, file)))
-                };
-                if let Some((size, file)) = found
-                    && best.as_ref().is_none_or(|(known, _)| *known < size)
+                let scalable = directory == "scalable";
+                let size = parse_size(&directory);
+                if !scalable && size.is_none() {
+                    continue;
+                }
+                if vector.as_ref().is_none_or(|(known, _)| scalable && !known)
+                    && let Some(file) = find_in(&entry.path(), name, "svg")
                 {
-                    best = Some((size, file));
+                    vector = Some((scalable, file));
+                }
+                if let Some(size) = size
+                    && bitmap.as_ref().is_none_or(|(known, _)| *known < size)
+                    && let Some(file) = find_in(&entry.path(), name, "png")
+                {
+                    bitmap = Some((size, file));
                 }
             }
         }
     }
-    match best {
-        Some((size, file)) if size >= MIN_BITMAP || size == u32::MAX => Ok(file),
-        _ => bail!("图标主题里没有够大的 {name}"),
-    }
+    let mut files: Vec<PathBuf> = vector.into_iter().map(|(_, file)| file).collect();
+    files.extend(
+        bitmap
+            .filter(|(size, _)| *size >= MIN_BITMAP)
+            .map(|(_, file)| file),
+    );
+    ensure!(!files.is_empty(), "图标主题里没有够大的 {name}");
+    Ok(files)
 }
 
 /// 图标主题可能待着的几个地方。
@@ -167,14 +259,12 @@ fn roots() -> Vec<PathBuf> {
     roots
 }
 
-/// 一个尺寸目录（或者 `scalable`）里有没有这个名字的图。
-fn find_in(directory: &Path, name: &str) -> Option<PathBuf> {
+/// 一个尺寸目录（或者 `scalable`）里有没有这个名字、这种格式的图。
+fn find_in(directory: &Path, name: &str, extension: &str) -> Option<PathBuf> {
     for context in std::fs::read_dir(directory).ok()?.flatten() {
-        for extension in ["svg", "png"] {
-            let file = context.path().join(format!("{name}.{extension}"));
-            if file.is_file() {
-                return Some(file);
-            }
+        let file = context.path().join(format!("{name}.{extension}"));
+        if file.is_file() {
+            return Some(file);
         }
     }
     None
@@ -200,17 +290,16 @@ fn render(file: &Path) -> Result<DragImage> {
 }
 
 /// 矢量图标转成位图。自己拖进一整棵 SVG 实现不值当：本机装着的 `rsvg-convert` 就够了，
-/// 没有它这条就当没图。
+/// 没有它这条就报错，`icon` 会改用同名的位图。
 fn rasterize(file: &Path) -> Result<image::RgbaImage> {
-    let output = std::process::Command::new("rsvg-convert")
-        .args(["-w", "64", "-h", "64"])
-        .arg(file)
-        .output()
-        .context("调用 rsvg-convert 失败")?;
-    ensure!(output.status.success(), "rsvg-convert 画不出这张图标");
-    Ok(image::load_from_memory_with_format(&output.stdout, image::ImageFormat::Png)
-        .context("解析画出来的图标失败")?
-        .into_rgba8())
+    let mut command = std::process::Command::new("rsvg-convert");
+    command.args(["-w", "64", "-h", "64"]).arg(file);
+    let stdout = capture(&mut command, "rsvg-convert")?;
+    Ok(
+        image::load_from_memory_with_format(&stdout, image::ImageFormat::Png)
+            .context("解析画出来的图标失败")?
+            .into_rgba8(),
+    )
 }
 
 /// 等比缩到长边 `SIDE`，再转成线路上约定的 BGRA（`image` 给的是 RGBA）。
@@ -251,12 +340,20 @@ fn stacked(icons: &[DragImage]) -> DragImage {
                 let at = (dy * STACK as usize + dx) * 4;
                 let source = &icon.pixels[from..from + 4];
                 let alpha = u32::from(source[3]);
-                // 两张都是直通 alpha，按 alpha 混，不然下面那张会从透明处透出来。
-                for channel in 0..4 {
-                    pixels[at + channel] = (u32::from(source[channel])
-                        + u32::from(pixels[at + channel]) * (255 - alpha) / 255)
-                        .min(255) as u8;
+                let behind = u32::from(pixels[at + 3]);
+                let inverse = 255 - alpha;
+                // 线路上是**直通** alpha（不是预乘），所以这里有两步：先把上面那层
+                // 按自己的 alpha 加权、和下面那层（也按它的 alpha 加权）叠成预乘
+                // 结果，再除以合成出来的 alpha 换回直通。少乘那个 alpha，半透明的
+                // 边缘会整体发亮。
+                let over = alpha + behind * inverse / 255;
+                for channel in 0..3 {
+                    let mut mixed = u32::from(source[channel]) * alpha
+                        + u32::from(pixels[at + channel]) * behind / 255 * inverse;
+                    mixed /= over.max(1);
+                    pixels[at + channel] = mixed.min(255) as u8;
                 }
+                pixels[at + 3] = over.min(255) as u8;
             }
         }
     }
@@ -264,6 +361,24 @@ fn stacked(icons: &[DragImage]) -> DragImage {
         width: STACK,
         height: STACK,
         pixels,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 包装脚本卡住时，真正卡着的是它起的孙进程，而孙进程攥着同一根 stdout：
+    /// 超时要连它一起收拾掉，按时返回，而不是陪它等满 10 秒。
+    #[test]
+    fn tool_timeout_covers_grandchildren() {
+        let started = Instant::now();
+        let mut command = std::process::Command::new("sh");
+        // 后面那个 `:` 让 sh 不能把 `sleep` exec 掉，`sleep` 只能是孙进程。
+        command.args(["-c", "sleep 10; :"]);
+        assert!(capture(&mut command, "sh").is_err());
+        let elapsed = started.elapsed();
+        assert!(elapsed < TOOL_LIMIT + Duration::from_secs(1), "{elapsed:?}");
     }
 }
 
