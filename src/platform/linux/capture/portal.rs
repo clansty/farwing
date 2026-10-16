@@ -15,6 +15,7 @@ use super::Picture;
 use super::Screen;
 use super::dmabuf;
 use super::pipewire::Stream;
+use crate::platform::CompositorLayout;
 use anyhow::{Context, Result, bail};
 use ashpd::desktop::PersistMode;
 use ashpd::desktop::screencast::{
@@ -165,80 +166,60 @@ impl Session {
         Ok(session)
     }
 
-    /// The shared monitor that is `screen`, matched by its desktop rectangle.
-    ///
-    /// 门户报的是**合成器布局里的矩形**（xdg_output 的逻辑位置与尺寸）：分数缩放
-    /// 下它与屏幕自己的像素矩形差一个缩放（5120x2160 的屏、1.35 缩放，门户报的
-    /// 是 3792x1600），拿像素矩形去比永远对不上，采集会直接打不开。所以先按像素
-    /// 矩形比（缩放为 1 的会话与 X11 就是这种），对不上再借合成器布局把门户的
-    /// 矩形翻成输出名、按名字认屏。
+    /// 哪一条共享的流是 `screen`。
     fn source(&self, screen: &Screen) -> Result<&Source> {
-        let rectangle = (
-            (screen.left, screen.top),
-            (screen.width as i32, screen.height as i32),
-        );
-        if let Some(source) = self
-            .sources
-            .iter()
-            .find(|s| s.position == Some(rectangle.0) && s.size == Some(rectangle.1))
-        {
-            return Ok(source);
-        }
-        if let Some(source) = self.source_by_output_name(screen) {
-            return Ok(source);
-        }
-        if let Some(source) = self.source_by_geometry(screen) {
-            return Ok(source);
-        }
-        match self.sources.as_slice() {
-            // A single shared monitor without geometry can only be this one.
-            [only] if only.position.is_none() => Ok(only),
-            _ => bail!("所选显示器不在本机授权共享的屏幕中"),
-        }
-    }
-
-    /// 按「同一个逻辑位置 + 同一宽高比」认屏。
-    ///
-    /// 门户报的是合成器布局里的矩形，而屏幕的 `left`/`top` 也正是那个空间里的
-    /// （XWayland 按输出自己的像素给尺寸、却按合成器的逻辑位置摆放），所以位置
-    /// 可以直接比。尺寸则差一个该输出的缩放（转过 90° 的屏还多一次旋转），用宽高
-    /// 比来认：缩放是等比缩放，旋转只是把宽高对调。
-    fn source_by_geometry(&self, screen: &Screen) -> Option<&Source> {
-        if screen.width == 0 || screen.height == 0 {
-            return None;
-        }
-        self.sources.iter().find(|source| {
-            let (Some((left, top)), Some((width, height))) = (source.position, source.size) else {
-                return false;
-            };
-            if (left, top) != (screen.left, screen.top) || width <= 0 || height <= 0 {
-                return false;
+        // 缩放为 1 的桌面上两个空间报的是同一个矩形，所以先问显示服务器自己的答
+        // 案、大多数会话根本不必去问合成器。
+        let index = match pick(&self.sources, screen, None) {
+            Some(index) => index,
+            None => {
+                let layout = crate::platform::display::compositor_layout_soon();
+                pick(&self.sources, screen, layout.as_deref())
+                    .context("所选显示器不在本机授权共享的屏幕中")?
             }
-            let portal = f64::from(width) / f64::from(height);
-            let straight = f64::from(screen.width) / f64::from(screen.height);
-            (portal - straight).abs() < 0.01 || (portal - 1.0 / straight).abs() < 0.01
-        })
+        };
+        Ok(&self.sources[index])
     }
+}
 
-    /// 把门户报的矩形翻成输出名，再按名字认屏。
-    ///
-    /// 合成器布局里的矩形用的就是 `xdg_output` 的逻辑位置与尺寸，与门户报的是同
-    /// 一套坐标；而输出名（`wl_output` 的 name）与这边屏幕的 `device_name`
-    /// （RandR 的连接器名）是同一个字符串。
-    fn source_by_output_name(&self, screen: &Screen) -> Option<&Source> {
-        let layout = crate::platform::display::compositor_layout()?;
-        self.sources.iter().find(|source| {
-            let (Some((left, top)), Some((width, height))) = (source.position, source.size) else {
-                return false;
-            };
-            layout.outputs.iter().any(|output| {
-                output.name.as_deref() == Some(screen.device_name.as_str())
-                    && output.left == left
-                    && output.top == top
-                    && output.width as i32 == width
-                    && output.height as i32 == height
-            })
+/// 门户这一批流里哪一条是 `screen`，按下标给。
+///
+/// 门户按合成器布局描述显示器，`Screen` 装的是显示服务器给出的矩形：缩放为 1 的
+/// 会话两者同一个矩形，缩放之后怎么差就是合成器的事了——Mutter、KWin 上的
+/// XWayland 把位置和尺寸都乘上该屏缩放，xwayland-satellite 则保留逻辑位置、按输出
+/// 自己的像素给尺寸。所以缩放桌面要靠合成器自己的布局来配对，也就是门户描述显示器
+/// 的那个空间，经输出名（`DP-1`，RandR 也拿它当显示器名）对到屏幕。
+///
+/// 这里不做任何猜测：布局点不出名的屏、或矩形对不上布局的流，都留着不认，交给调用
+/// 方报错，而不是去采一块没人要的屏。
+fn pick(sources: &[Source], screen: &Screen, layout: Option<&CompositorLayout>) -> Option<usize> {
+    let rectangle = (
+        (screen.left, screen.top),
+        (screen.width as i32, screen.height as i32),
+    );
+    if let Some(index) = sources
+        .iter()
+        .position(|s| s.position == Some(rectangle.0) && s.size == Some(rectangle.1))
+    {
+        return Some(index);
+    }
+    if let Some(output) = layout.and_then(|layout| layout.output(&screen.device_name))
+        && let Some(index) = sources.iter().position(|s| {
+            s.position == Some((output.left, output.top))
+                // 工具包把分数布局尺寸四舍五入后才交给 XWayland（KWin）会差一个
+                // 单位；位置从不四舍五入。
+                && s.size.is_some_and(|(width, height)| {
+                    (i64::from(width) - i64::from(output.width)).abs() <= 1
+                        && (i64::from(height) - i64::from(output.height)).abs() <= 1
+                })
         })
+    {
+        return Some(index);
+    }
+    match sources {
+        // 门户只共享了一块、又没给几何，那只能是要的那块。
+        [only] if only.position.is_none() => Some(0),
+        _ => None,
     }
 }
 
@@ -380,5 +361,180 @@ mod negotiation_tests {
                 Err(error) => println!("{}: 失败：{error:#}", screen.device_name),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Source, pick};
+    use crate::media::capture::Screen;
+    use crate::platform::{CompositorLayout, CompositorOutput, Rotation};
+
+    /// 门户报的一条流。
+    fn stream(x: i32, y: i32, width: i32, height: i32) -> Source {
+        Source {
+            node: 0,
+            position: Some((x, y)),
+            size: Some((width, height)),
+        }
+    }
+
+    /// 显示服务器交给 `Screen` 的一块屏。
+    fn screen(device_name: &str, left: i32, top: i32, width: u32, height: u32) -> Screen {
+        Screen {
+            id: 0,
+            device_name: device_name.to_owned(),
+            display_name: device_name.to_owned(),
+            width,
+            height,
+            left,
+            top,
+            primary: false,
+            fps: 60,
+            dpi_scale: None,
+            hdr: false,
+            adapter: 0,
+            render_adapter: None,
+            identity: None,
+        }
+    }
+
+    /// 同一块屏在合成器布局里的样子，正放。
+    fn output(name: &str, left: i32, top: i32, width: u32, height: u32) -> CompositorOutput {
+        CompositorOutput {
+            name: Some(name.to_owned()),
+            left,
+            top,
+            width,
+            height,
+            rotation: Rotation::Normal,
+        }
+    }
+
+    fn layout(outputs: Vec<CompositorOutput>) -> CompositorLayout {
+        CompositorLayout { outputs }
+    }
+
+    /// 缩放为 1 的桌面，两边报的是同一个矩形。
+    #[test]
+    fn an_unscaled_desktop_matches_the_display_servers_rectangle() {
+        let sources = [stream(0, 0, 1920, 1080), stream(1920, 0, 1920, 1080)];
+        assert_eq!(
+            pick(&sources, &screen("DP-2", 1920, 0, 1920, 1080), None),
+            Some(1)
+        );
+    }
+
+    /// GNOME 50 与 KDE 那样三块 4K 并排、缩放 2：门户报逻辑矩形，XWayland 把位置
+    /// 和尺寸都乘了缩放。认第二块必须落到第二条流——第三条流才拿得到显示服务器为
+    /// 它报的那个矩形，也正是按形状配对过去会落错的地方。
+    #[test]
+    fn a_scaled_desktop_matches_the_stream_by_the_compositors_layout() {
+        let sources = [
+            stream(0, 0, 1920, 1080),
+            stream(1920, 0, 1920, 1080),
+            stream(3840, 0, 1920, 1080),
+        ];
+        let layout = layout(vec![
+            output("DP-1", 0, 0, 1920, 1080),
+            output("DP-2", 1920, 0, 1920, 1080),
+            output("DP-3", 3840, 0, 1920, 1080),
+        ]);
+        assert_eq!(
+            pick(
+                &sources,
+                &screen("DP-2", 3840, 0, 3840, 2160),
+                Some(&layout)
+            ),
+            Some(1)
+        );
+    }
+
+    /// 这台机器上出过问题的那套桌面：niri 套 xwayland-satellite，一块 5120x2160
+    /// 缩放 1.35，旁边一块 2560x1600 缩放 1.6、竖着放。显示服务器把输出摆在合成器
+    /// 的逻辑位置、却按该输出自己的像素给尺寸，所以分数缩放的那块光看尺寸就露馅。
+    #[test]
+    fn a_fractionally_scaled_monitor_matches_by_its_name() {
+        let sources = [stream(0, 0, 1000, 1600), stream(1000, 0, 3792, 1600)];
+        let layout = layout(vec![
+            CompositorOutput {
+                rotation: Rotation::Rotate90,
+                ..output("DP-3", 0, 0, 1000, 1600)
+            },
+            output("DP-1", 1000, 0, 3792, 1600),
+        ]);
+        assert_eq!(
+            pick(
+                &sources,
+                &screen("DP-1", 1000, 0, 5120, 2160),
+                Some(&layout)
+            ),
+            Some(1)
+        );
+        // 转过的屏由显示服务器把宽高对调，布局照样点得出它的名：不用再试另一个朝向。
+        assert_eq!(
+            pick(&sources, &screen("DP-3", 0, 0, 1600, 2560), Some(&layout)),
+            Some(0)
+        );
+    }
+
+    /// 布局的尺寸就是门户报的尺寸，差一个单位还算配对；位置是精确的，两块屏可能
+    /// 只隔一个单位。
+    #[test]
+    fn a_rounded_size_pairs_but_a_shifted_position_does_not() {
+        let layout = layout(vec![output("DP-2", 1920, 0, 1920, 1080)]);
+        let second = screen("DP-2", 1920, 0, 1920, 1080);
+        assert_eq!(
+            pick(&[stream(1920, 0, 1919, 1079)], &second, Some(&layout)),
+            Some(0)
+        );
+        assert_eq!(
+            pick(&[stream(1921, 0, 1920, 1080)], &second, Some(&layout)),
+            None
+        );
+    }
+
+    /// 两个空间说法不一致、又没有布局可以定夺，就留着不认：交给调用方报错，而不是
+    /// 去采一块可能是别人屏幕的屏。
+    #[test]
+    fn a_scaled_desktop_without_a_layout_is_not_guessed_at() {
+        let sources = [stream(0, 0, 1920, 1080), stream(3840, 0, 1920, 1080)];
+        let wanted = screen("DP-2", 3840, 0, 3840, 2160);
+        assert_eq!(pick(&sources, &wanted, None), None);
+        // XWayland 23.1 之前把每个输出都叫 `XWAYLAND0…`、不叫连接器名，于是没得查。
+        let layout = layout(vec![output("DP-1", 0, 0, 1920, 1080)]);
+        assert_eq!(
+            pick(
+                &sources,
+                &screen("XWAYLAND1", 3840, 0, 3840, 2160),
+                Some(&layout)
+            ),
+            None
+        );
+    }
+
+    /// 门户只共享了一块又没给几何，那只能是要的那块；两块就说不清了。
+    #[test]
+    fn a_lone_stream_without_geometry_is_the_monitor_asked_for() {
+        let wanted = screen("DP-1", 1000, 0, 5120, 2160);
+        let only = [Source {
+            node: 0,
+            position: None,
+            size: None,
+        }];
+        assert_eq!(pick(&only, &wanted, None), Some(0));
+        let two = [
+            Source {
+                node: 0,
+                position: None,
+                size: None,
+            },
+            Source {
+                node: 1,
+                position: None,
+                size: None,
+            },
+        ];
+        assert_eq!(pick(&two, &wanted, None), None);
     }
 }
