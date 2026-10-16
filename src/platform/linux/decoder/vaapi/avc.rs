@@ -946,7 +946,8 @@ mod crop_tests {
     #[test]
     #[ignore = "requires a VA-API H.264 decoder and render-node access"]
     fn vaapi_decodes_1080p_cropped_fixture() {
-        // 这个测试看的是拷回内存那一路；零拷贝默认是关的，所以这里必定是 Cpu。
+        // 这个测试看的是拷回内存那一路，把零拷贝关掉（它是进程内开关，默认开）。
+        crate::media::preferences::set_decoder_zero_copy(false);
         let frame = match Avc::new()
             .decode(
                 include_bytes!("testdata/crop-1080.h264"),
@@ -955,7 +956,7 @@ mod crop_tests {
             .expect("VA-API decode")
         {
             Output::Cpu(frame) => frame,
-            Output::DmaBuf(_) => panic!("零拷贝不应该在默认设置下打开"),
+            Output::DmaBuf(_) => panic!("这个测试要的是 CPU 那一路"),
         };
         assert_eq!((frame.width, frame.height), (1920, 1080));
         let plane = 1920 * 1080;

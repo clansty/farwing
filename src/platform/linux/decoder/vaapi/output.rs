@@ -203,6 +203,7 @@ mod tests {
 }
 
 /// 导出成 dma-buf 的一个平面。渲染器按单平面把它导成一张纹理。
+#[derive(Debug)]
 pub(crate) struct DmaBufPlane {
     /// 原件。每次导入 Vulkan 都会接管 fd，所以渲染器那边要 dup 一份。
     pub(crate) fd: std::os::fd::OwnedFd,
@@ -218,6 +219,7 @@ pub(crate) struct DmaBufPlane {
 /// 实测（`display.rs` 里的 dmabuf 探测）radv 能按 radeonsi 给的修饰符把 `R8` / `R8G8`
 /// 两个单平面视图导回来、像素与写进去的一致，所以渲染器沿用现有那两张 NV12 纹理，只是
 /// 不再经 CPU 拷一遍。纹理是 **coded** 尺寸（带宏块填充），采样要按 `origin`/可见尺寸取子矩形。
+#[derive(Debug)]
 pub(crate) struct DmaBufFrame {
     pub(crate) width: u32,
     pub(crate) height: u32,

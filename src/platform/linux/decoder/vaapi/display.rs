@@ -171,8 +171,10 @@ pub(super) struct Pool {
 /// 解码器把 surface 导成 dma-buf 交给渲染器之后，**不能**立刻把它还给池子：下一帧
 /// 可能就解到同一张 surface 上，正在显示的那一帧会跟着变。渲染器握着这把租约，直到
 /// 那一帧被换掉才放手；解码线程在下一次解码前用 [`Pool::reclaim`] 收回来。
+#[derive(Debug)]
 pub(super) struct SurfaceLease(Arc<LeaseState>);
 
+#[derive(Debug)]
 struct LeaseState {
     released: AtomicBool,
 }
