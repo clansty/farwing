@@ -1,10 +1,9 @@
 //! 用 libavcodec 做 VA-API 编码。
 //!
-//! 这一层原本是我们手写的（`vaapi/` 下：参数集、POC/DPB、GOP、码率控制）。手写的
-//! 代价是驱动的不透明行为——它自己决定条带里写哪些字段、按我们给的模数决定用几个
-//! 参考帧，而 `frame_num` / `pic_order_cnt_lsb` 回绕一次就会让参考帧永久分叉
-//! （见 AGENTS_QA.md）；HEVC 至今打不开也是同一件事。这些在 libavcodec 里都有成熟
-//! 实现，顺带白拿 HEVC 与 AV1。
+//! 参数集、POC/DPB、GOP 与码率控制都交给它。原先手写那份的代价是驱动的不透明行为
+//! ——它自己决定条带里写哪些字段、按我们给的模数决定用几个参考帧，而 `frame_num` /
+//! `pic_order_cnt_lsb` 回绕一次就会让参考帧永久分叉（见 AGENTS_QA.md）；HEVC 打不开
+//! 也是同一件事。这些在 libavcodec 里都有成熟实现，顺带白拿 HEVC 与 AV1。
 //!
 //! 色彩转换也交给库（BGRA 软件帧 → `av_hwframe_transfer_data` → NV12 硬件帧），
 //! 于是我们不再自己写 NV12 交织与上传。
@@ -230,7 +229,7 @@ impl Encoder {
         }
     }
 
-    /// 和 `vaapi::Encoder` 同一份契约：驱动决定实际上限，这里只给一个保守的天花板。
+    /// 驱动决定实际上限，这里只给一个保守的天花板。
     pub(crate) fn maximum_size(format: Format) -> (u32, u32) {
         match format.codec {
             Codec::H264 | Codec::H265 => (4096, 4096),

@@ -104,8 +104,8 @@ pub(crate) struct ActiveEncoding {
     pub size: (u32, u32),
     pub fps: u32,
     pub target_bps: u32,
-    /// 编码走的是哪条路。同一个后端里有几版实现（手写与库各一版 VA-API），
-    /// 还有零拷贝与走系统内存之分，`backend` 说不出来这些。
+    /// 编码走的是哪条路。同一个后端里还有零拷贝与走系统内存之分，
+    /// `backend` 说不出来这些。
     #[serde(default)]
     pub path: String,
 }

@@ -1,7 +1,7 @@
-//! Linux host encoding: NVENC on NVIDIA, VA-API on AMD and Intel, the Rust
-//! H.264 software codec otherwise. As on Windows, hardware comes first and every
-//! candidate is proven on the selected desktop by encoding a frame and checking
-//! the SPS it produced.
+//! Linux host encoding: NVENC on NVIDIA, VA-API through libavcodec on AMD and
+//! Intel, the Rust H.264 software codec otherwise. As on Windows, hardware comes
+//! first and every candidate is proven on the selected desktop by encoding a
+//! frame and checking the SPS it produced.
 use super::capture::{Desktop, Device, Image};
 use super::cuda;
 use crate::media::encoding::{Backend, Capability, Codec, Color, Format, QualityTarget, Rate};
@@ -119,15 +119,6 @@ pub(crate) fn probe(
     Ok(result)
 }
 
-/// 是否用 libavcodec 那版 VA-API 编码器。默认用它；`OPENUUYC_ENCODER=vaapi`
-/// 退回我们手写的那版，方便对照。
-fn libavcodec() -> bool {
-    !matches!(
-        std::env::var("OPENUUYC_ENCODER").as_deref(),
-        Ok("vaapi") | Ok("legacy")
-    )
-}
-
 /// Per-thread encoder runtime. Neither encoder needs setup.
 pub(crate) struct Runtime;
 #[derive(Debug, thiserror::Error)]
@@ -148,15 +139,9 @@ impl Runtime {
 
 pub(crate) enum Encoder {
     Nvidia(super::nvenc::Encoder),
-    /// VA-API reports the vendor whose encoder it is: the protocol has ids for
-    /// AMD and Intel hardware, and the local name is derived from the id.
-    Vaapi {
-        backend: Backend,
-        encoder: super::vaapi::Encoder,
-    },
-    /// 同一块 GPU 上的 VA-API 编码，但参数集、POC/DPB、GOP 与码率控制都交给
-    /// libavcodec：手写那一层踩过的坑（回绕导致参考帧分叉、没有码率控制）都是
-    /// 库的职责。`OPENUUYC_ENCODER=vaapi` 可以退回手写那版做对照。
+    /// 同一块 GPU 上的 VA-API 编码：参数集、POC/DPB、GOP 与码率控制都交给
+    /// libavcodec。手写那份已经删掉——它回绕一次就让参考帧永久分叉，也没有码率
+    /// 控制（见 AGENTS_QA.md）。
     Libavcodec {
         backend: Backend,
         encoder: super::ffmpeg::Encoder,
@@ -178,14 +163,10 @@ impl Encoder {
         // The capture backends deliver 8-bit SDR BGRA only.
         ensure!(!color.is_hdr(), "Linux 版暂不支持 HDR 采集");
         match backend {
-            Backend::Amd | Backend::Intel if libavcodec() => Ok(Self::Libavcodec {
+            Backend::Amd | Backend::Intel => Ok(Self::Libavcodec {
                 backend,
                 encoder: super::ffmpeg::Encoder::new(size, format, rate)?,
                 scaler: None,
-            }),
-            Backend::Amd | Backend::Intel => Ok(Self::Vaapi {
-                backend,
-                encoder: super::vaapi::Encoder::new(size, format, rate)?,
             }),
             Backend::Nvidia => {
                 ensure!(
@@ -200,11 +181,11 @@ impl Encoder {
             Backend::Software => bail!("软件编码请走 software_format"),
         }
     }
-    /// 这个后端能不能直接吃采集留在显存里的帧（零拷贝）。只有 libavcodec 那版
-    /// VA-API 把 dma-buf 导进 GPU 过：手写那版、NVENC（CUDA 输入）与软件编码
-    /// 都得先把像素拿到系统内存里。
+    /// 这个后端能不能直接吃采集留在显存里的帧（零拷贝）。只有 VA-API（走
+    /// libavcodec）把 dma-buf 导进 GPU 过：NVENC（CUDA 输入）与软件编码都得先把
+    /// 像素拿到系统内存里。
     pub(crate) fn hardware_images(backend: Backend) -> bool {
-        matches!(backend, Backend::Amd | Backend::Intel) && libavcodec()
+        matches!(backend, Backend::Amd | Backend::Intel)
     }
 
     /// 零拷贝：用采集留在显存里的那一帧建编码器。滤镜图的输出帧上下文直接交给
@@ -225,7 +206,7 @@ impl Encoder {
         };
         ensure!(!color.is_hdr(), "Linux 版暂不支持 HDR 采集");
         ensure!(
-            matches!(backend, Backend::Amd | Backend::Intel) && libavcodec(),
+            matches!(backend, Backend::Amd | Backend::Intel),
             "这个编码后端吃不了显存帧"
         );
         let transform = match image {
@@ -279,12 +260,11 @@ impl Encoder {
             super::software_encoder::Encoder::new(size, format, rate)?,
         )))
     }
-    /// 这条编码路径的人话说明，给诊断面板看：同一块 GPU 上有两版 VA-API 编码器，
-    /// 还有走不走显存之分，光看后端名字分不出来。
+    /// 这条编码路径的人话说明，给诊断面板看：同一个后端还有零拷贝与走系统内存
+    /// 之分，光看后端名字分不出来。
     pub(crate) fn path(&self) -> &'static str {
         match self {
             Self::Nvidia(_) => "NVENC",
-            Self::Vaapi { .. } => "VA-API（手写）",
             Self::Libavcodec {
                 scaler: Some(_), ..
             } => "VA-API · libavcodec · 零拷贝",
@@ -295,7 +275,6 @@ impl Encoder {
     pub(crate) fn implementation(&self) -> i32 {
         match self {
             Self::Nvidia(_) => Backend::Nvidia.implementation(),
-            Self::Vaapi { backend, .. } => backend.implementation(),
             Self::Libavcodec { backend, .. } => backend.implementation(),
             Self::Software(_) => Backend::Software.implementation(),
         }
@@ -303,7 +282,6 @@ impl Encoder {
     pub(crate) fn maximum_size(&self) -> (u32, u32) {
         match self {
             Self::Nvidia(encoder) => encoder.maximum_size(),
-            Self::Vaapi { encoder, .. } => encoder.maximum_size(),
             Self::Libavcodec { encoder, .. } => {
                 super::ffmpeg::Encoder::maximum_size(encoder.format())
             }
@@ -313,7 +291,6 @@ impl Encoder {
     pub(crate) fn configure_rate(&mut self, rate: Rate) -> Result<bool> {
         match self {
             Self::Nvidia(encoder) => encoder.configure_rate(rate),
-            Self::Vaapi { encoder, .. } => encoder.configure_rate(rate),
             Self::Libavcodec { encoder, .. } => encoder.configure_rate(rate),
             Self::Software(encoder) => encoder.configure(rate),
         }
@@ -347,7 +324,6 @@ impl Encoder {
         );
         match self {
             Self::Nvidia(encoder) => encoder.encode(image, timestamp, keyframe),
-            Self::Vaapi { encoder, .. } => encoder.encode(image, timestamp, keyframe),
             Self::Libavcodec {
                 encoder,
                 scaler: Some(scaler),

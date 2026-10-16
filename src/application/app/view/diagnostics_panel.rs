@@ -724,8 +724,8 @@ impl DeviceCenterApp {
                 }
                 diagnostics_row(ui, "编码器", active.backend.name())
                     .on_hover_text(format!("适配器标识 {:016X}", active.adapter));
-                // 同一个后端里有几版实现（手写与库各一版 VA-API），还有零拷贝与
-                // 走系统内存之分，光看后面那个后端名字分不出来。
+                // 同一个后端里还有零拷贝与走系统内存之分，光看后面那个后端名字
+                // 分不出来。
                 diagnostics_row(
                     ui,
                     "编码路径",
