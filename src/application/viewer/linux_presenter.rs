@@ -1310,17 +1310,36 @@ impl Player {
             self.stream_control_ui.open = !self.stream_control_ui.open;
         }
 
-        // 这三样是 Windows 播放器里才有的东西：插件面板和批注整套界面都在那边，
-        // 1:1 的「固定左上角」在 Wayland 下也没有可写的地方（合成器不给客户端摆窗口）。
+        // 这两样是 Windows 播放器里才有的东西：插件面板和批注整套界面都在那边。
         for (icon, hint) in [
             (ViewerCaptionIcon::Plugins, "Linux 主控还没有插件面板"),
             (ViewerCaptionIcon::Annotation, "Linux 主控还没有批注"),
-            (ViewerCaptionIcon::OneToOne, "Linux 主控还没有 1:1 实际像素"),
         ] {
             row.add_enabled_ui(false, |ui| caption_button(ui, icon, false, ""))
                 .inner
                 .on_disabled_hover_text(hint);
         }
+
+        // Windows 的 caption 里没有全屏按钮：它全屏之后会浮出一根工具条。Linux 还没有
+        // 那根条子，而全屏时整条标题栏都会隐藏（见 `draw` 里的判断），所以离开全屏
+        // 得留一个入口在这儿。它挨着 1:1，把靠左的位置让给下面那几个常用的开关。
+        if caption_button(
+            &mut row,
+            ViewerCaptionIcon::Fullscreen,
+            window.fullscreen().is_some(),
+            "切换全屏",
+        )
+        .clicked()
+        {
+            toggle_fullscreen(window);
+        }
+
+        // 1:1 那格在 Wayland 下没有可写的地方（合成器不给客户端摆窗口）。
+        row.add_enabled_ui(false, |ui| {
+            caption_button(ui, ViewerCaptionIcon::OneToOne, false, "")
+        })
+        .inner
+        .on_disabled_hover_text("Linux 主控还没有 1:1 实际像素");
 
         // 麦克风：和 Windows 同一套判定，用的是同一份共享状态。
         let mic = self.session.stream_control.microphone().snapshot();
@@ -1335,7 +1354,47 @@ impl Player {
         } else {
             "将所选麦克风发送到远端（设备可在串流设置中切换）"
         };
+
+        // 这一排按钮是从右往左排的，先加的落在右边，所以下面的代码顺序和它们在
+        // 屏幕上的左右顺序相反：剪贴板写在麦克风前头，显示出来才在麦克风右边。
         let control = self.session.stream_control.snapshot();
+        // 剪贴板同步：和 Windows 共用同一份状态和同一套判定。
+        let clip = self.session.stream_control.clipboard().snapshot();
+        let clip_hint = if !clip.enabled {
+            "同步剪贴板：把本机剪贴板发送到远端，并把远端剪贴板取回本机".to_owned()
+        } else if let Some(error) = clip.error.as_deref() {
+            error.to_owned()
+        } else if clip.active {
+            "剪贴板同步中，点击关闭".to_owned()
+        } else {
+            "剪贴板同步已开启，等待通道就绪，点击关闭".to_owned()
+        };
+        if row
+            .add_enabled_ui(
+                clip.enabled || (control.ready && control.mouse_mode != MouseMode::View),
+                |ui| caption_button(ui, ViewerCaptionIcon::Clipboard, clip.enabled, &clip_hint),
+            )
+            .inner
+            .on_disabled_hover_text("请先连接并开启键鼠控制")
+            .clicked()
+        {
+            crate::ui::controls::clear_notice(row.ctx(), "clipboard-request-error");
+            match self
+                .session
+                .stream_control
+                .set_clipboard_enabled(!clip.enabled)
+            {
+                Ok(()) => crate::ui::controls::clear_notice(row.ctx(), "clipboard-error"),
+                Err(error) => crate::ui::controls::notice(
+                    row.ctx(),
+                    "clipboard-request-error",
+                    "剪贴板同步",
+                    crate::ui::controls::DialogIcon::Error,
+                    error.to_string(),
+                ),
+            }
+        }
+
         if row
             .add_enabled_ui(
                 mic.enabled
@@ -1396,21 +1455,6 @@ impl Player {
         {
             self.set_control(!controlling);
         }
-
-        // Windows 的 caption 里没有全屏按钮：它全屏之后会浮出一根工具条。Linux 还没有
-        // 那根条子，而全屏时整条标题栏都会隐藏（见 `draw` 里的判断），所以离开全屏
-        // 得留一个入口在这儿。
-        if caption_button(
-            &mut row,
-            ViewerCaptionIcon::Fullscreen,
-            window.fullscreen().is_some(),
-            "切换全屏",
-        )
-        .clicked()
-        {
-            toggle_fullscreen(window);
-        }
-
         if let Some(error) = &self.control_error {
             row.add(
                 egui::Label::new(
