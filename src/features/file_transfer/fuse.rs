@@ -5,15 +5,16 @@
 //!
 //! 协议只提供两件事：`ReadDir` 列一个目录，和一次基于清单的下载（`SendRequest` →
 //! `FileAsk`/`FileBlock` → `Complete`）。没有“从某偏移读 N 字节”的随机读接口，所以这里
-//! 用目录列举喂 inode 与元数据，第一次读某个文件时触发一次整份下载写进缓存文件，后续读取
-//! 都从缓存文件里取。整份下载是为了让顺序读和随机读都能工作；只读头部也会把文件拉全，
-//! 这是当前协议下的取舍。
+//! 用目录列举喂 inode 与元数据，读某个文件时把它收进本地副本，后续读取都从副本里取。
+//!
+//! 收的时候按需来：打开文件只是记账，真的读了才起拉取；读到哪儿就等哪儿，不预取整份；
+//! 最后一个句柄关掉、文件还没收完就停掉（文件管理器为缩略图看一眼就走的最常见）。副本
+//! 落在 `$XDG_CACHE_HOME`，超过上限淘汰最久没用的一份——远端才是真源。
 
 use anyhow::{Context as _, Result, bail, ensure};
 use std::{
     collections::HashMap,
     ffi::OsStr,
-    io::Write,
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
     sync::{
@@ -39,6 +40,13 @@ const ROOT_INO: u64 = 1;
 const TTL: Duration = Duration::from_secs(1);
 /// 内核单次 read 可能很大；协议单块更小，由下载任务拆分，这里只做上限。
 const MAX_READ: u32 = 1 << 20;
+/// 本地留的副本总量上限。超了就把最久没读、又没人在用的那些整份删掉；远端是
+/// 真源，删掉的读回来就有。文件管理器翻一遍目录、或者往里拷大文件，都不该把
+/// 用户的盘塞满。
+const CACHE_LIMIT: u64 = 2 << 30;
+/// 续传时先要回这么多已经落盘的字节，跟本地比对，确认被控端真的按 `resume_point`
+/// 从中间发的。对不上就退回从 0 收（只多花一次请求）。
+const RESUME_PROBE: u64 = 512 * 1024;
 const NAME_MAX: u32 = 255;
 
 /// 远端给的 `modified_time` 是 **Unix 秒**，但它是**有符号**换算出来的：
@@ -80,31 +88,37 @@ struct State {
     next: u64,
 }
 
-/// 一个已打开文件的下载缓存：后台把整份文件写进 `path`，读侧等数据就绪。
+/// 一个已打开文件的下载缓存：远端文件在本地落一份，读的时候从这里取。
+///
+/// 远端协议只有「整份发过来」，没有「从任意偏移读 N 字节」。所以读命中 `[0, valid)`
+/// 就从本地文件取；读到还没落盘的区间，才起一次拉取把后面的字节接着写进来。
 struct CacheEntry {
     path: PathBuf,
     state: Mutex<CacheState>,
     ready: Condvar,
 }
 
-enum CacheState {
-    Downloading { length: u64 },
-    Ready { length: u64 },
-    Failed(String),
-}
-
-impl CacheState {
-    fn length(&self) -> u64 {
-        match self {
-            Self::Downloading { length } | Self::Ready { length } => *length,
-            Self::Failed(_) => 0,
-        }
-    }
+struct CacheState {
+    /// `[0, valid)` 已经落盘、可以当真；以外是稀疏文件里的洞，读出来是零，不能给。
+    valid: u64,
+    /// 正在跑的拉取：`None` 表示没人在拉。里面是它自己的「停」令牌——中止不能用
+    /// `Rpc` 的 stop（那会让收尾的 Complete 也发不出去，被控端就会一直挂着一个
+    /// 等确认的发送任务），所以拉取循环自己 `select` 这个令牌。
+    fetch: Option<CancellationToken>,
+    /// 打开中的句柄数。降到 0 就把没拉完的拉取停掉：文件管理器为了缩略图打开又
+    /// 关掉的文件，不该整份搬下来。
+    readers: usize,
+    /// 拉取失败的原因。留着，之后每次读都据此报错，不自己重试。
+    error: Option<String>,
+    /// 最近一次被读的时间（进程内的相对毫秒），淘汰缓存时挑最旧的。
+    used: u64,
 }
 
 struct Cache {
     dir: PathBuf,
     entries: Mutex<HashMap<u64, std::sync::Arc<CacheEntry>>>,
+    /// 给 `used` 用的单调时钟。
+    clock: AtomicU64,
 }
 
 struct RemoteFs {
@@ -112,7 +126,7 @@ struct RemoteFs {
     runtime: tokio::runtime::Handle,
     stop: CancellationToken,
     state: Mutex<State>,
-    cache: Cache,
+    cache: std::sync::Arc<Cache>,
     uid: u32,
     gid: u32,
 }
@@ -147,10 +161,11 @@ impl RemoteFs {
                 by_path,
                 next: ROOT_INO + 1,
             }),
-            cache: Cache {
+            cache: std::sync::Arc::new(Cache {
                 dir: cache_dir,
                 entries: Mutex::new(HashMap::new()),
-            },
+                clock: AtomicU64::new(0),
+            }),
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
         }
@@ -265,8 +280,21 @@ impl RemoteFs {
             .map(|(_, ino)| *ino))
     }
 
-    /// 读缓存文件：先把下载启动起来（如未启动），等需要的区间就绪后返回。
+    /// 读本地副本：需要的区间还没落盘就起一次拉取，等它就绪后从本地取。
     fn read_file(&self, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>> {
+        match self.read_file_inner(ino, offset, size)? {
+            Some(data) => Ok(data),
+            // 本地副本文件被外面删了：清掉内存里记的有效长度，重新拉一遍（拉取会重建）。
+            None => {
+                tracing::debug!(ino, "本地副本不见了，重新拉");
+                self.cache_entry_repair(ino);
+                self.read_file_inner(ino, offset, size)?
+                    .context("本地副本反复丢失")
+            }
+        }
+    }
+
+    fn read_file_inner(&self, ino: u64, offset: u64, size: u32) -> Result<Option<Vec<u8>>> {
         let (path, remote_size) = {
             let state = lock(&self.state);
             let node = state.nodes.get(&ino).context("未知文件")?;
@@ -274,92 +302,193 @@ impl RemoteFs {
             (node.path.clone(), node.size)
         };
         if offset >= remote_size {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
         }
-        let wanted = u64::from(size.min(MAX_READ)).min(remote_size - offset) as usize;
-        let entry = self.cache_entry(ino, path)?;
+        let wanted = u64::from(size.min(MAX_READ)).min(remote_size - offset);
+        let entry = self.cache_entry(ino)?;
         let mut state = lock(&entry.state);
+        state.used = self.cache.clock.fetch_add(1, Ordering::Relaxed);
         loop {
-            match &*state {
-                CacheState::Failed(error) => bail!("远端读取失败：{error}"),
-                CacheState::Downloading { length } => {
-                    if offset + wanted as u64 <= *length {
-                        break;
-                    }
-                    // 用带超时的等待：下载任务可能因为连接结束被中断，那时不会再有人
-                    // notify，无限等待会让卸载卡在 join 上。
-                    if self.stop.is_cancelled() {
-                        bail!("远端连接已结束");
-                    }
-                    let (guard, _) = entry
-                        .ready
-                        .wait_timeout(state, Duration::from_millis(500))
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    state = guard;
-                }
-                CacheState::Ready { .. } => break,
+            if let Some(error) = &state.error {
+                bail!("远端读取失败：{error}");
             }
+            // 要的字节已经在本地；或者远端声明的大小已经整份落盘，那之后就是 EOF。
+            if offset + wanted <= state.valid || state.valid >= remote_size {
+                break;
+            }
+            if state.fetch.is_none() {
+                self.start_fetch(&entry, path.clone(), &mut state);
+            }
+            // 用带超时的等待：拉取可能因为连接结束被中断，那时不会再有人 notify，
+            // 无限等待会让卸载卡在 join 上。
+            if self.stop.is_cancelled() {
+                bail!("远端连接已结束");
+            }
+            state = entry
+                .ready
+                .wait_timeout(state, Duration::from_millis(500))
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
         }
         if self.stop.is_cancelled() {
             bail!("远端连接已结束");
         }
-        let available = state.length();
+        let available = state.valid;
         drop(state);
         // 远端声明的大小与实际内容可能不一致，用 saturating 保证越界读退化成空读。
-        let take = usize::try_from(available.saturating_sub(offset).min(wanted as u64)).unwrap_or(0);
-        let file = std::fs::File::open(&entry.path)?;
+        let take = usize::try_from(available.saturating_sub(offset).min(wanted)).unwrap_or(0);
+        if take == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        // `~/.cache` 下的东西会被系统清理工具、tmpfiles 之流删掉，而我们记着的
+        // `valid` 还在——那种情况交给调用方清掉记忆再拉一遍。
+        let file = match std::fs::File::open(&entry.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
         let mut buffer = vec![0u8; take];
         file.read_exact_at(&mut buffer, offset)?;
-        Ok(buffer)
+        Ok(Some(buffer))
     }
 
-    /// 取（必要时创建）某个 inode 的缓存条目，并保证下载已经启动。
-    fn cache_entry(&self, ino: u64, path: String) -> Result<std::sync::Arc<CacheEntry>> {
+    /// 本地副本文件不见了：把内存里记的有效长度清掉，下次读会重新拉（拉取会重建文件）。
+    fn cache_entry_repair(&self, ino: u64) {
+        let entry = lock(&self.cache.entries).get(&ino).cloned();
+        if let Some(entry) = entry {
+            let mut state = lock(&entry.state);
+            state.valid = 0;
+            state.error = None;
+        }
+    }
+
+    /// 取（必要时创建）某个 inode 的本地副本条目。**不**在这里起拉取：打开文件管理器
+    /// 里一个目录就会打开一堆文件（生成缩略图、嗅探类型），只打开不读的不该产生流量。
+    fn cache_entry(&self, ino: u64) -> Result<std::sync::Arc<CacheEntry>> {
         let mut entries = lock(&self.cache.entries);
         if let Some(entry) = entries.get(&ino) {
             return Ok(entry.clone());
         }
         let cache_path = self.cache.dir.join(ino.to_string());
-        // 先把缓存文件建出来，读侧才能在下载进行中就打开它。
         std::fs::File::create(&cache_path)
             .with_context(|| format!("创建缓存文件 {} 失败", cache_path.display()))?;
         let entry = std::sync::Arc::new(CacheEntry {
-            path: cache_path.clone(),
-            state: Mutex::new(CacheState::Downloading { length: 0 }),
+            path: cache_path,
+            state: Mutex::new(CacheState {
+                valid: 0,
+                fetch: None,
+                readers: 0,
+                error: None,
+                used: 0,
+            }),
             ready: Condvar::new(),
         });
         entries.insert(ino, entry.clone());
-        drop(entries);
+        Ok(entry)
+    }
+
+    /// 起一次拉取。调用时要握着 `entry` 的锁。
+    ///
+    /// 本地已经有前缀时用 `resume_point` 从中间续：不然为了读文件尾巴得把前面整段
+    /// 再搬一遍（实测读 18 MB 文件的最后 1 MB 要下 15 MB）。续传位置由
+    /// [`stream_to_cache`] 拿回来的字节自己校验，不假设被控端会照做。
+    fn start_fetch(
+        &self,
+        entry: &std::sync::Arc<CacheEntry>,
+        remote: String,
+        state: &mut CacheState,
+    ) {
+        let abort = CancellationToken::new();
+        state.fetch = Some(abort.clone());
+        let known = state.valid;
         let wire = self.wire.clone();
         let stop = self.stop.clone();
-        // 任务拿到自己那一份引用；外层还要把 entry 交回给调用方。
-        let task_entry = std::sync::Arc::clone(&entry);
+        let cache = self.cache.clone();
+        let cache_path = entry.path.clone();
+        let task_entry = std::sync::Arc::clone(entry);
         self.runtime.spawn(async move {
-            let result = stream_to_cache(wire, path, stop, cache_path, task_entry.clone()).await;
+            let result = stream_to_cache(
+                wire,
+                remote,
+                stop,
+                abort,
+                known,
+                cache_path,
+                task_entry.clone(),
+            )
+            .await;
             let mut state = lock(&task_entry.state);
-            *state = match result {
-                Ok(length) => CacheState::Ready { length },
-                Err(error) => CacheState::Failed(format!("{error:#}")),
-            };
+            match result {
+                Ok(received) => state.valid = state.valid.max(received),
+                Err(error) => state.error = Some(format!("{error:#}")),
+            }
+            state.fetch = None;
             task_entry.ready.notify_all();
+            drop(state);
+            cache.evict_if_needed();
         });
-        Ok(entry)
     }
 }
 
-/// 把 `path` 指向的远端文件整份下载到 `cache_path`，边下边把有效长度发布给读侧。
+impl Cache {
+    /// 本地副本超过上限时，删掉最久没读、又没人在用的那些。远端是真源，删掉的下次
+    /// 读回来就有；正在读的、正在拉的都不动。
+    fn evict_if_needed(&self) {
+        loop {
+            let mut total = 0u64;
+            let mut victim: Option<(u64, u64, PathBuf)> = None;
+            {
+                let entries = lock(&self.entries);
+                for (&ino, entry) in entries.iter() {
+                    let state = lock(&entry.state);
+                    total += state.valid;
+                    if state.readers > 0 || state.fetch.is_some() {
+                        continue;
+                    }
+                    if victim
+                        .as_ref()
+                        .is_none_or(|(used, ..)| state.used < *used)
+                    {
+                        victim = Some((state.used, ino, entry.path.clone()));
+                    }
+                }
+            }
+            if total <= CACHE_LIMIT {
+                return;
+            }
+            let Some((_, ino, path)) = victim else {
+                // 全都在用；下一次再来。
+                return;
+            };
+            lock(&self.entries).remove(&ino);
+            let _ = std::fs::remove_file(&path);
+            tracing::debug!(ino, "本地副本超出上限，淘汰最久没用的一份");
+        }
+    }
+}
+
+/// 把 `remote` 指向的远端文件收进本地副本。
+///
+/// 协议只给「整份」，而且块里不带偏移，流里字节的位置只能靠「从哪儿开始发」推。
+/// `FileConfirm.resume_point` 就是说这件事的：本地已经有 `known` 个字节时，我们
+/// 请它从 `known` 之前一点点发（见 [`RESUME_PROBE`]），拿回来先跟本地那段比一比
+/// ——对得上，说明它真的按偏移发了，那就只落盘 `known` 之后的部分；对不上（被控端
+/// 忽略了续传位置、从 0 头发），就把流当成从 0 开始，跳过本地已有的前缀。两条路都
+/// 不会把字节写到错的位置上。每落一段就把有效长度推给读侧。
 async fn stream_to_cache(
     wire: std::sync::Arc<super::Transport>,
-    path: String,
+    remote: String,
     stop: CancellationToken,
+    abort: CancellationToken,
+    known: u64,
     cache_path: PathBuf,
     entry: std::sync::Arc<CacheEntry>,
 ) -> Result<u64> {
-    let mut rpc = Rpc::new(wire, stop.clone(), contract::Owner::Transfer)?;
+    let mut rpc = Rpc::new(wire, stop, contract::Owner::Transfer)?;
     rpc.req(
         Req::SendRequest(FileTransferSendRequest {
             id: rpc.task(-1),
-            path: path.clone(),
+            path: remote,
             list_data: Vec::new(),
         }),
         false,
@@ -382,37 +511,99 @@ async fn stream_to_cache(
     } else {
         storage::decompress::<FileList>(&response.list_data)?.files
     };
-    let mut file = std::fs::OpenOptions::new()
+    // 带上 create：本地副本可能被外面清掉了，重建一个（读权限是给续传校验用的）。
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
         .write(true)
         .open(&cache_path)
         .with_context(|| format!("打开缓存文件 {} 失败", cache_path.display()))?;
-    let mut position = 0u64;
+    // 已经有这么多字节是可信的；请求它从 `request_from` 开始发。
+    let probe = known.min(RESUME_PROBE);
+    let request_from = known - probe;
+    // 流从文件里的哪个偏移开始：第一块到手才能定（拿本地已有的那段比对）。
+    let mut stream_start: Option<u64> = None;
+    let mut received = 0u64;
     let mut size: Option<u64> = files.first().map(|info| info.size);
     loop {
-        match rpc.next().await?.payload {
+        let incoming = tokio::select! {
+            biased;
+            _ = abort.cancelled() => {
+                // 没人读了。得告诉被控端一声：它按窗口发、等到窗口满了就停在原地
+                // 等确认，不取消的话那边会一直挂着一个发送任务。
+                let _ = rpc
+                    .req(
+                        Req::Complete(FileTransferComplete {
+                            id: rpc.task(-1),
+                            error: 7,
+                        }),
+                        false,
+                    )
+                    .await;
+                return Ok(stream_start.unwrap_or(request_from) + received);
+            }
+            incoming = rpc.next() => incoming?,
+        };
+        match incoming.payload {
             Payload::Request(Req::FileAsk(value)) => {
                 let index = rpc.check(&value.id, None)?;
                 ensure!(index == 1, "远端文件序号不符");
                 let info = files.first().context("远端未返回文件清单")?;
                 contract::metadata(info, &value)?;
                 size = Some(info.size);
-                // 缓存是完整的这一份，永远从头收。
                 rpc.res(Res::FileConfirm(FileTransferConfirm {
                     id: rpc.task(index),
                     skip: false,
                     err: 1,
-                    resume_point: 0,
+                    resume_point: request_from,
                 }))
                 .await?;
             }
             Payload::Request(Req::FileBlock(value)) => {
                 rpc.check(&value.id, Some(1))?;
                 let size = size.context("远端未声明文件大小")?;
+                let start = match stream_start {
+                    Some(start) => start,
+                    None => {
+                        let start = if probe == 0 {
+                            request_from
+                        } else {
+                            let compare = usize::try_from(probe.min(value.data.len() as u64))?;
+                            let mut local = vec![0u8; compare];
+                            file.read_exact_at(&mut local, request_from)?;
+                            if local == value.data[..compare] {
+                                request_from
+                            } else {
+                                // 它没按续传位置发（或者发的是别的东西）：按从 0 头
+                                // 处理，错位的字节会被下面跳过。
+                                tracing::warn!(
+                                    remote_size = size,
+                                    resume_point = request_from,
+                                    "被控端未按续传位置发送，改按流首对齐"
+                                );
+                                0
+                            }
+                        };
+                        stream_start = Some(start);
+                        start
+                    }
+                };
+                let position = start + received;
                 let end = contract::received_bytes(position, value.data.len(), size)?;
-                file.write_all(&value.data)?;
-                position = end;
-                *lock(&entry.state) = CacheState::Downloading { length: position };
-                entry.ready.notify_all();
+                if end > known {
+                    let skip = usize::try_from(known.saturating_sub(position))
+                        .unwrap_or(usize::MAX)
+                        .min(value.data.len());
+                    file.write_all_at(&value.data[skip..], position + skip as u64)?;
+                    let mut state = lock(&entry.state);
+                    state.valid = state.valid.max(end);
+                    let valid = state.valid;
+                    drop(state);
+                    if valid > 0 {
+                        entry.ready.notify_all();
+                    }
+                }
+                received += value.data.len() as u64;
                 rpc.res(Res::BlockConfirm(FileTransferBlockConfirm {
                     id: rpc.task(1),
                     block_id: value.block_id,
@@ -433,7 +624,7 @@ async fn stream_to_cache(
                         err_msg: String::new(),
                     }))
                     .await?;
-                    return Ok(position);
+                    return Ok(stream_start.unwrap_or(request_from) + received);
                 }
                 ensure!(index == 1, "远端完成了未预期的文件");
                 rpc.res(Res::Result(FileTransferResult {
@@ -564,18 +755,37 @@ impl fuser::Filesystem for RemoteFs {
             reply.error(libc::EROFS);
             return;
         }
-        // 打开就开始下载：fuser 一次只派发一个请求，等第一次 read 才起下载会让
-        // 顺序读的每次等待都更长；预取让数据在应用真正要之前就在流了。
-        let path = {
-            let state = lock(&self.state);
-            state.nodes.get(&ino).map(|node| node.path.clone())
-        };
-        if let Some(path) = path
-            && let Err(error) = self.cache_entry(ino, path)
-        {
-            tracing::debug!(%error, "预取远端文件失败，等 read 时再试");
+        // 只是记账，不起拉取：文件管理器打开文件多半是为了看一眼（缩略图、类型
+        // 嗅探），只打开不读的不该产生任何流量；真的读了再拉。
+        if let Ok(entry) = self.cache_entry(ino) {
+            lock(&entry.state).readers += 1;
         }
         reply.opened(0, 0);
+    }
+
+    /// 最后一个句柄关掉、文件又没收完，就把拉取停掉。缩略图那类「打开、读一点、
+    /// 关掉」的用法，省下来的就是这里。
+    fn release(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        ino: u64,
+        _fh: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        _flush: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
+        let entry = lock(&self.cache.entries).get(&ino).cloned();
+        if let Some(entry) = entry {
+            let mut state = lock(&entry.state);
+            state.readers = state.readers.saturating_sub(1);
+            if state.readers == 0
+                && let Some(abort) = &state.fetch
+            {
+                abort.cancel();
+            }
+        }
+        reply.ok();
     }
 
     fn read(
@@ -618,18 +828,26 @@ fn mount_options() -> Vec<fuser::MountOption> {
     ]
 }
 
-/// 挂载点的父目录：优先 `$XDG_RUNTIME_DIR/openuuyc`，没有就退 `/tmp`。
+/// 挂载点放运行目录（它本来就该是个短命路径），本地副本放缓存目录。
+///
+/// 副本**不能**跟挂载点一起放 `$XDG_RUNTIME_DIR`：那是 tmpfs，等于把远端文件的每个
+/// 字节都塞进内存。缓存目录也不能退到 `/tmp`（同样常是内存盘），所以拿 `$HOME` 兜底。
 fn mount_paths() -> (PathBuf, PathBuf) {
-    match xdg_runtime_dir() {
-        Some(base) => {
-            let root = base.join("openuuyc");
-            (root.join("remote-fs"), root.join("remote-fs-cache"))
-        }
-        None => (
-            PathBuf::from("/tmp/openuuyc-remote-fs"),
-            PathBuf::from("/tmp/openuuyc-remote-fs-cache"),
-        ),
-    }
+    let mountpoint = match xdg_runtime_dir() {
+        Some(base) => base.join("openuuyc/remote-fs"),
+        None => PathBuf::from("/tmp/openuuyc-remote-fs"),
+    };
+    (mountpoint, cache_root().join("remote-fs"))
+}
+
+/// 本地副本的根目录：`$XDG_CACHE_HOME/openuuyc`，没有就用 `~/.cache/openuuyc`。
+fn cache_root() -> PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .unwrap_or_else(|| PathBuf::from("/var/tmp"))
+        .join("openuuyc")
 }
 
 /// `XDG_RUNTIME_DIR` 解析到规范路径：进程里可能带着符号链接形式，缓存与挂载点落在同一棵树上更省心。
@@ -937,6 +1155,12 @@ mod tests {
             eprintln!("跳过：未设置 OPENUUYC_TEST_DEVICE");
             return;
         };
+        // 手动跑的时候要看得见 FUSE 自己的警告（比如续传位置没被遵守），测试进程不
+        // 走 diagnostics::logging 那套文件日志，所以这里起一个只放警告的订阅器。
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_target(true)
+            .try_init();
         let runtime = tokio::runtime::Runtime::new().expect("创建运行时失败");
         let client = std::sync::Arc::new(
             runtime
@@ -956,9 +1180,13 @@ mod tests {
             .expect("没有找到设备");
         mount(client, device, ConnectionMediaOptions::default()).expect("挂载失败");
         let root = mounted_path().expect("取挂载点失败");
-        eprintln!("已挂载 {}，等待外部卸载（最多 90 秒）", root.display());
+        let hold = std::env::var("OPENUUYC_TEST_HOLD_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(300);
+        eprintln!("已挂载 {}，等待外部卸载（最多 {hold} 秒）", root.display());
         eprintln!("请在另一个终端跑：fusermount3 -u {}", root.display());
-        let deadline = std::time::Instant::now() + Duration::from_secs(90);
+        let deadline = std::time::Instant::now() + Duration::from_secs(hold);
         while std::time::Instant::now() < deadline {
             if mounted_path().is_none() {
                 eprintln!("检测到外部卸载 ✓（会话与连接都收尾了）");
