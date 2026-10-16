@@ -21,6 +21,7 @@
 use crate::platform::{CompositorLayout, CompositorOutput, Rotation};
 use anyhow::{Context, Result, bail};
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use wayland_client::protocol::{wl_callback, wl_output, wl_registry};
@@ -40,6 +41,9 @@ const RETRY_MAX: Duration = Duration::from_secs(60);
 const WAIT_POLL: Duration = Duration::from_millis(100);
 
 static SNAPSHOT: RwLock<Option<Arc<CompositorLayout>>> = RwLock::new(None);
+/// 监视线程最近一次尝试失败了：布局拿不到这件事已经知道，[`layout_soon`] 不再为它
+/// 等；等到下一次真的描述出布局时清掉。
+static UNAVAILABLE: AtomicBool = AtomicBool::new(false);
 
 /// The latest layout the compositor described, without waiting for it.
 ///
@@ -56,8 +60,9 @@ pub(crate) fn layout() -> Option<Arc<CompositorLayout>> {
 ///
 /// A caller that cannot go on without the layout, and is not in anyone's hot
 /// path, asks this way; the wait is bounded so a compositor that never answers
-/// costs it one pause rather than hanging. Without a Wayland session there is
-/// nothing to wait for at all.
+/// costs one pause rather than hanging. 监视线程失败过之后，后面的调用立刻返回，
+/// 直到它重新描述出布局为止——那一次等待是进程级的，不是每次调用都要付。Without
+/// a Wayland session there is nothing to wait for at all.
 pub(crate) fn layout_soon() -> Option<Arc<CompositorLayout>> {
     if !watching() {
         return None;
@@ -66,6 +71,9 @@ pub(crate) fn layout_soon() -> Option<Arc<CompositorLayout>> {
     loop {
         if let Some(layout) = layout() {
             return Some(layout);
+        }
+        if UNAVAILABLE.load(Ordering::Acquire) {
+            return None;
         }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
@@ -92,6 +100,9 @@ fn watching() -> bool {
 
 fn publish(layout: Option<CompositorLayout>) {
     let mut snapshot = SNAPSHOT.write().unwrap_or_else(|e| e.into_inner());
+    if layout.is_some() {
+        UNAVAILABLE.store(false, Ordering::Release);
+    }
     if snapshot.as_deref() != layout.as_ref() {
         tracing::info!(?layout, "合成器输出布局");
         *snapshot = layout.map(Arc::new);
@@ -108,13 +119,14 @@ fn watch() {
             Ok(never) => match never {},
         };
         publish(None);
+        UNAVAILABLE.store(true, Ordering::Release);
         if described {
             pause = RETRY_FIRST;
         }
         // The same failure every minute is one message, not a log full of it.
         let message = format!("{error:#}");
         if reported.as_ref() != Some(&message) {
-            tracing::warn!(error = %message, "合成器输出布局不可用，绝对定位改用相对移动");
+            tracing::warn!(error = %message, "合成器输出布局不可用：绝对定位改用相对移动，缩放的桌面上门户采集也认不出屏");
             reported = Some(message);
         }
         std::thread::sleep(pause);
