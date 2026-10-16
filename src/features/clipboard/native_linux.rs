@@ -400,7 +400,7 @@ impl LocalSnapshot {
             ));
             ids.push((formats::register("FileContents"), "FileContents".into()));
             // Shell 靠这条判断粘过来是复制还是移动；不给的话官方客户端会一直
-            // 停在试探阶段（它也会先要 FileGroupDescriptorW，见 `data`）。
+            // 停在试探阶段。
             ids.push((
                 formats::register("Preferred DropEffect"),
                 "Preferred DropEffect".into(),
@@ -434,33 +434,19 @@ impl LocalSnapshot {
                 })
                 .context("本地剪贴板没有文本"),
             8 => self.image.clone().context("本地剪贴板没有图片"),
-            // 官方 Windows 客户端不走 `FileDescListRequest`：它先按名字来问这个
-            // 二进制块（DWORD 个数 + N × 592 字节的 FILEDESCRIPTORW），答不上就
-            // 不再往下问 FileContents，粘贴永远不动。我们自己两个客户端之间看不出
-            // 这件事——我们走的是 FileDescList。
+            // 这块按 Windows 标准语义放 FILETIME（ticks）。曾经以为官方主控粘我们的
+            // 文件时按名字来问的就是这一槽、而且按 Unix 秒读，于是这里也换成过秒——
+            // 2026-10-16 实测把它否掉了：官方取我们的文件走的是 `FileDescListRequest`
+            // （日志「剪贴板收到文件列表请求」连问四次），这条没被问过；当时那个「日期
+            // 空白」是**线上描述符**里发 ticks 造成的（见 `protocol::wire_seconds`）。
             _ if format.wire.name == "FileGroupDescriptorW" => {
                 ensure!(!self.sources.is_empty(), "本地剪贴板没有文件");
                 let files = collect_files(&self.sources)?;
-                // 官方主控把我们的文件粘到 Windows 上走的就是这一条（它按名字来问这个
-                // 二进制块），而它按 **Unix 秒** 读这一槽，不是 Windows 标准的 FILETIME：
-                // 一处一秒地实测证据是——我们以前放 ticks（约 1.34e17），它做「秒→FILETIME」
-                // 的 ×10^7 时溢出，粘出来的文件「修改日期」就是空白；它也从不发 11644473600
-                // 这个纪元常数（客户端二进制里 0 命中），×10^7 却出现 45 次。
-                // `formats::descriptor_bytes` 的语义保持标准 FILETIME 不动：Windows 侧那份
-                // 同名调用是给本地应用（Explorer）看的，必须是 ticks，所以只在这里换。
-                let descriptors: Vec<_> = files
-                    .items
-                    .iter()
-                    .map(|f| {
-                        let mut desc = f.desc.clone();
-                        desc.last_write_time = wire_seconds(desc.last_write_time);
-                        desc
-                    })
-                    .collect();
+                let descriptors: Vec<_> = files.items.iter().map(|f| f.desc.clone()).collect();
                 let blob = formats::descriptor_bytes(&descriptors, "不安全的文件名称")?;
                 tracing::info!(
                     files = descriptors.len(),
-                    seconds = descriptors.first().map_or(0, |f| f.last_write_time),
+                    ticks = descriptors.first().map_or(0, |f| f.last_write_time),
                     bytes = blob.len(),
                     first = %descriptors.first().map_or(String::new(), |f| f.file_name.clone()),
                     "剪贴板文件描述块已答出"
