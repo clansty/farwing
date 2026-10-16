@@ -704,6 +704,55 @@ impl DeviceCenterApp {
                             .truncate(),
                     )
                     .on_hover_text(&shown);
+                    // 写进挂载点的文件是先落本地、再由后台传回被控端的：拷贝在
+                    // 文件管理器里瞬间就完了，真正在传的是这里。失败也报在这儿
+                    // （本地那份还在，下次写同一个文件会再传）。
+                    let (uploads, upload_error) =
+                        crate::features::file_transfer::fuse::upload_progress();
+                    if !uploads.is_empty() {
+                        ui.add_space(12.0);
+                        let shown = uploads
+                            .iter()
+                            .take(2)
+                            .map(|item| {
+                                let name = item
+                                    .path
+                                    .rsplit(['/', '\\'])
+                                    .next()
+                                    .unwrap_or(item.path.as_str());
+                                let retry = if item.attempt > 1 {
+                                    format!("（第 {} 次）", item.attempt)
+                                } else {
+                                    String::new()
+                                };
+                                format!(
+                                    "{name} {:.1}/{:.1} MB{retry}",
+                                    item.sent as f64 / 1048576.0,
+                                    item.total as f64 / 1048576.0
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("、");
+                        let suffix = if uploads.len() > 2 {
+                            format!(" 等 {} 个文件", uploads.len())
+                        } else {
+                            String::new()
+                        };
+                        ui.label(
+                            RichText::new(format!("正在传回被控端：{shown}{suffix}"))
+                                .size(theme::SMALL)
+                                .color(theme::AMBER),
+                        );
+                        ui.ctx()
+                            .request_repaint_after(std::time::Duration::from_millis(400));
+                    } else if let Some(error) = upload_error {
+                        ui.add_space(12.0);
+                        ui.label(
+                            RichText::new(format!("上次传回被控端失败：{error}"))
+                                .size(theme::SMALL)
+                                .color(theme::RED),
+                        );
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // 非模态：不弹确认框，点了直接卸载。
                         if ui.add(crate::ui::controls::secondary("结束")).clicked() {
