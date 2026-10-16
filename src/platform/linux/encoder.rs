@@ -375,19 +375,45 @@ mod tests {
 
 #[cfg(test)]
 mod throughput_tests {
-    /// Needs a desktop and an NVIDIA GPU: capture and encode at full size.
+    /// 上面那条用例的尺寸约定，不需要桌面也不需要 GPU：按画质上限算出来的 `size`
+    /// 交给采集当 `maximum`，采集出来的帧就正好是 `size`，不会被再缩一次。这条一断，
+    /// 那条吞吐用例又会在 >4K 的屏上撞「采集画面尺寸与编码器不一致」。
+    #[test]
+    fn the_capture_maximum_is_the_size_the_encoder_is_built_for() {
+        use crate::media::geometry::{fit_size, output_size};
+        for (width, height) in [(5120, 2160), (3840, 2160), (1920, 1080), (1600, 2560)] {
+            let size = output_size(width, height, 4);
+            assert_eq!(
+                fit_size(size.0, size.1, size),
+                size,
+                "{width}x{height} 会被再缩一次"
+            );
+        }
+        // 这块 5120x2160 的屏在最高画质下缩到 3840x1620。
+        assert_eq!(output_size(5120, 2160, 4), (3840, 1620));
+    }
+
+    /// Needs a desktop and a GPU with a hardware encoder: capture and encode
+    /// through a session's whole path, at the size a session would use.
     #[test]
     #[ignore]
     fn capture_and_encode_throughput() {
         use crate::media::encoding::{Color, Format, Rate};
+        // 最高画质，和官方客户端一样把码流封在 3840x2160。
+        const QUALITY: i32 = 4;
         let screens = super::super::capture::screens().unwrap();
         let mut desktop = super::Desktop::open_selected(&screens[0]).unwrap();
-        let size = (screens[0].width & !1, screens[0].height & !1);
+        // 比这个上限大的屏会被采集缩下来，所以编码器要按**缩完之后**的尺寸建：
+        // 三个后端都拿 `image.size() == self.size` 卡输入，按屏幕自己的尺寸建会在
+        // 第一帧就报「采集画面尺寸与编码器不一致」。生产路径也是这么取的
+        // （`features/host/peer/capture_worker.rs` 里从抓回来的那一帧倒推）。
+        let size =
+            crate::media::geometry::output_size(screens[0].width, screens[0].height, QUALITY);
         let rate = Rate {
             target: 20_000_000,
             peak: 20_000_000,
             fps: 60,
-            quality: 4,
+            quality: QUALITY,
             quality_target: crate::media::encoding::QualityTarget {
                 bitrate: 20_000_000,
                 fps: 60,
@@ -416,7 +442,8 @@ mod throughput_tests {
         let mut cached = None;
         while started.elapsed() < std::time::Duration::from_secs(3) {
             let t = std::time::Instant::now();
-            if let Some(frame) = desktop.next(16, 4, false, false, (3840, 2160)).unwrap() {
+            // `maximum` 就是 `size`：抓帧这一步再缩放一次的话又会和编码器对不上。
+            if let Some(frame) = desktop.next(16, QUALITY, false, false, size).unwrap() {
                 cached = Some(frame);
             }
             capture += t.elapsed();
