@@ -45,6 +45,10 @@ pub(crate) enum DecoderOutputIssue {
 pub(crate) enum DecodedSurface {
     CpuNv12(Bytes),
 
+    /// 解码器直接给的 dma-buf（Linux 的零拷贝）。
+    #[cfg(not(windows))]
+    DmaBuf(crate::platform::decoder::DmaBufFrame),
+
     CpuI444(Bytes),
 
     D3D11(windows_surface::D3D11Surface),
@@ -63,6 +67,15 @@ pub(crate) enum RenderSurface {
     #[cfg(not(windows))]
     CpuNv12 {
         data: Bytes,
+        color: RenderColor,
+    },
+
+    /// 解码 surface 直接给的 dma-buf：连那一次上传都省了。渲染器把它导成两张
+    /// 单平面纹理（Y 是 R8、色度是 R8G8），采样矩形由帧里的裁剪原点决定。
+    #[cfg(not(windows))]
+    DmaBuf {
+        /// 渲染端把它取走并持有（里面是解码 surface 的租约）；取走之后这里是 `None`。
+        frame: Option<crate::platform::decoder::DmaBufFrame>,
         color: RenderColor,
     },
 
@@ -96,6 +109,11 @@ impl DecodedSurface {
                 nv12_layout(width, height, &data)?;
                 Ok(RenderSurface::CpuNv12 { data, color })
             }
+            #[cfg(not(windows))]
+            Self::DmaBuf(frame) => Ok(RenderSurface::DmaBuf {
+                frame: Some(frame),
+                color,
+            }),
 
             Self::D3D11(surface) => Ok(RenderSurface::D3D11(surface)),
         }
@@ -532,6 +550,13 @@ fn poll_platform_decoder(
                         .map(DecodedSurface::D3D11),
                     _ => Err(anyhow!("GPU decoder output has no owning device")),
                 },
+            ),
+            #[cfg(not(windows))]
+            PlatformDecodedFrame::DmaBuf { pts, frame } => (
+                pts,
+                frame.width,
+                frame.height,
+                Ok(DecodedSurface::DmaBuf(frame)),
             ),
             PlatformDecodedFrame::Cpu(frame) => {
                 let surface = if let FrameReader::Windows(writer) = frame_reader {

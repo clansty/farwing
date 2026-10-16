@@ -16,6 +16,7 @@ use crate::media::VideoCodec;
 use crate::media::decode_api::{DecodeError, VideoDecoderConfig};
 
 pub(super) use avc::Frame;
+pub(crate) use output::{DmaBufFrame, DmaBufPlane};
 
 /// 一帧解码结果：要么已经拷回内存，要么是解码 surface 直接导出的 dma-buf。
 pub(super) enum Output {
@@ -23,19 +24,11 @@ pub(super) enum Output {
     DmaBuf(output::DmaBufFrame),
 }
 
-/// 解码端零拷贝是否开着。**目前默认关**：解码这一半（导出 dma-buf + surface 租约）已经
-/// 完成并验过（`display.rs` 里的 dmabuf 探测：导出的两个平面导进 radv 后像素逐字节一致），
-/// 但渲染端还没接上——纹理导入、采样子矩形（coded 与可见尺寸差着宏块填充）与图
-/// 形界面的开关是下一步。`OPENUUYC_DECODER_ZEROCOPY=1` 可以提前打开（当前会明确报错）。
+/// 解码端零拷贝是否开着：偏好（图形界面 / `media-preferences.json`，默认开）
+/// 与 `OPENUUYC_DECODER_ZEROCOPY` 环境变量，见 `media::preferences::decoder_zero_copy`。
 /// 导出失败一次之后整体不再试：这类失败基本是驱动或格式层面的。
 fn zero_copy_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("OPENUUYC_DECODER_ZEROCOPY").as_deref(),
-            Ok("1") | Ok("true")
-        )
-    })
+    crate::media::preferences::decoder_zero_copy()
 }
 
 fn zero_copy_given_up() -> bool {

@@ -116,7 +116,10 @@ fn create_graphics() -> Result<Graphics> {
     let (device, queue) = pollster::block_on(
         adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("openuuyc-ui"),
-            required_features: wgpu::Features::empty(),
+            // 解码端零拷贝要把 dma-buf 导成纹理，需要这个特性；适配器不支持就不申请
+            // （申请一个不支持的特性会让设备创建直接失败，GL 后端更是没有）。
+            required_features: adapter.features()
+                & wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF,
             // The UI stays within the baseline limits; video upload does too.
             required_limits: wgpu::Limits::downlevel_defaults()
                 .using_resolution(adapter.limits())
@@ -224,6 +227,16 @@ impl UiPresenter {
         self.transform = Some(transform);
         self.video
             .upload_nv12(&self.device, &self.queue, width, height, data)
+    }
+
+    /// Replace it with a decoded frame's dma-buf, imported as NV12 textures.
+    pub(crate) fn upload_video_dmabuf(
+        &mut self,
+        frame: super::decoder::DmaBufFrame,
+        transform: [[f32; 4]; 3],
+    ) -> Result<()> {
+        self.transform = Some(transform);
+        self.video.import_nv12(&self.device, frame)
     }
 
     pub(crate) fn set_video_placement(

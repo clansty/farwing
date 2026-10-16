@@ -345,6 +345,7 @@ fn main() -> Result<()> {
             if let Some(transport) = transport {
                 options.transport = transport;
             }
+            media::preferences::set_decoder_zero_copy(options.zero_copy);
             app::run(app::GuiOptions {
                 background,
                 media: options,
@@ -369,6 +370,7 @@ fn main() -> Result<()> {
             force_takeover,
         } => {
             let mut options = media::preferences::load()?;
+            media::preferences::set_decoder_zero_copy(options.zero_copy);
             options.audio_only = audio_only;
             options.muted = mute;
             if let Some(fps) = fps {

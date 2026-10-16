@@ -7,7 +7,7 @@
 //!
 //! The quad is letterboxed into the content area and can be rotated by the
 //! multiples of 90 degrees the remote display reports.
-use anyhow::Result;
+use anyhow::{Context, Result};
 use wgpu::util::DeviceExt;
 
 /// Where the video sits inside the window, in physical pixels.
@@ -59,6 +59,11 @@ struct Frame {
     height: u32,
     /// 采样矩形，见 `Uniform::source`。
     source: [f32; 4],
+    /// 这张帧的纹理是从解码器的 dma-buf 导进来的：只读、不能 `write_plane` 复用，
+    /// 而且要一直握着 `dmabuf`——里面的 surface 租约决定了解码器什么时候能再拿这张
+    /// surface 去解下一帧。
+    imported: bool,
+    dmabuf: Option<crate::platform::decoder::DmaBufFrame>,
 }
 
 /// 紧致纹理的采样矩形：整张。
@@ -164,6 +169,8 @@ impl VideoLayer {
                 width,
                 height,
                 source: FULL_SOURCE,
+                imported: false,
+                dmabuf: None,
             });
         }
         let Some(Frame {
@@ -196,9 +203,14 @@ impl VideoLayer {
                 && data.len() >= luma_bytes + chroma_width as usize * chroma_height as usize * 2,
             "视频帧尺寸与数据不匹配"
         );
+        // 导入进来的帧只读，不能当上传目标复用。
         let reuse = matches!(
             &self.frame,
-            Some(frame) if frame.is_nv12() && frame.width == width && frame.height == height
+            Some(frame)
+                if frame.is_nv12()
+                    && !frame.imported
+                    && frame.width == width
+                    && frame.height == height
         );
         if !reuse {
             let luma = plane(device, width, height, wgpu::TextureFormat::R8Unorm);
@@ -238,6 +250,8 @@ impl VideoLayer {
                 width,
                 height,
                 source: FULL_SOURCE,
+                imported: false,
+                dmabuf: None,
             });
         }
         let Some(Frame {
@@ -256,6 +270,115 @@ impl VideoLayer {
             2,
             &data[luma_bytes..],
         );
+        Ok(())
+    }
+
+    /// 直接把解码器给的 dma-buf 导成两张 NV12 纹理，不再经 CPU。
+    ///
+    /// 平面 0（Y）是 `R8`、平面 1（色度）是 `R8G8`，各自的偏移与行距照搬驱动给的
+    /// 描述；纹理尺寸是 **coded** 尺寸，可见区只是其中一块，所以 `source` 按
+    /// 原点/缩放算出来，采样时由顶点着色器套上（见 `Uniform::source`）。
+    ///
+    /// `initial_state` 必须填与用途相同的值：填 `UNINITIALIZED` 会被当成「内容可以
+    /// 丢弃」，第一次转换就把 VA-API 已经写好的画面丢了。
+    pub(crate) fn import_nv12(
+        &mut self,
+        device: &wgpu::Device,
+        frame: crate::platform::decoder::DmaBufFrame,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            frame.width > 0 && frame.height > 0 && frame.origin.0 % 2 == 0 && frame.origin.1 % 2 == 0,
+            "零拷贝帧的尺寸或裁剪原点不合法"
+        );
+        let coded = (frame.planes[0].width, frame.planes[0].height);
+        anyhow::ensure!(coded.0 > 0 && coded.1 > 0, "零拷贝帧的 coded 尺寸不合法");
+        let plane = |index: usize, format: wgpu::TextureFormat| -> Result<wgpu::Texture> {
+            let plane = &frame.planes[index];
+            let size = wgpu::Extent3d {
+                width: plane.width,
+                height: plane.height,
+                depth_or_array_layers: 1,
+            };
+            let descriptor = wgpu::hal::TextureDescriptor {
+                label: Some("openuuyc-video-dmabuf"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUses::RESOURCE,
+                memory_flags: wgpu::hal::MemoryFlags::empty(),
+                view_formats: Vec::new(),
+            };
+            let handle = unsafe { device.as_hal::<wgpu::hal::api::Vulkan>() }
+                .context("导入 dma-buf 需要 Vulkan 设备")?;
+            let imported = unsafe {
+                handle.texture_from_dmabuf_fd(
+                    plane.fd.try_clone().context("复制 dma-buf 描述符失败")?,
+                    &descriptor,
+                    plane.modifier,
+                    plane.pitch,
+                    plane.offset,
+                )
+            }
+            .map_err(|error| anyhow::anyhow!("导入 dma-buf 失败：{error:?}"))?;
+            Ok(unsafe {
+                device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(
+                    imported,
+                    &wgpu::TextureDescriptor {
+                        label: Some("openuuyc-video-dmabuf"),
+                        size,
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    },
+                    wgpu::TextureUses::RESOURCE,
+                )
+            })
+        };
+        let luma = plane(0, wgpu::TextureFormat::R8Unorm)?;
+        let chroma = plane(1, wgpu::TextureFormat::Rg8Unorm)?;
+        let luma_view = luma.create_view(&wgpu::TextureViewDescriptor::default());
+        let chroma_view = chroma.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("openuuyc-video-nv12"),
+            layout: &self.nv12.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&luma_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&chroma_view),
+                },
+            ],
+        });
+        self.frame = Some(Frame {
+            planes: Planes::Nv12 { luma, chroma },
+            bind_group,
+            width: frame.width,
+            height: frame.height,
+            source: [
+                frame.origin.0 as f32 / coded.0 as f32,
+                frame.origin.1 as f32 / coded.1 as f32,
+                frame.width as f32 / coded.0 as f32,
+                frame.height as f32 / coded.1 as f32,
+            ],
+            imported: true,
+            dmabuf: Some(frame),
+        });
         Ok(())
     }
 

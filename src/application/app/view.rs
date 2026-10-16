@@ -1382,6 +1382,16 @@ impl DeviceCenterApp {
                             });
                     });
                 });
+            if cfg!(not(windows)) {
+                form_row(
+                    ui,
+                    "解码零拷贝",
+                    "解码出来的画面直接交给显卡采样，不再经内存拷一遍",
+                    |ui| {
+                        ui.checkbox(&mut self.media.zero_copy, "启用");
+                    },
+                );
+            }
             form_row(
                 ui,
                 "连接线路",
@@ -1415,6 +1425,8 @@ impl DeviceCenterApp {
             }
         });
         if self.media != original_media {
+            // 零拷贝开关是进程内生效的（解码器建池子时读），保存的同时就换过来。
+            crate::media::preferences::set_decoder_zero_copy(self.media.zero_copy);
             if let Err(error) = crate::media::preferences::save(self.media) {
                 self.media = original_media;
                 self.status = StatusMessage::error(format!("保存编解码设置失败：{error:#}"));

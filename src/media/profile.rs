@@ -199,6 +199,14 @@ pub struct ConnectionMediaOptions {
     pub codec: CodecPreference,
     pub decoder: super::selection::DecoderPreference,
     pub transport: TransportChoice,
+    /// 解码端零拷贝：把解码 surface 的 dma-buf 直接导成渲染纹理（不再经 CPU）。
+    /// 只在 Linux 被控端的观看端有意义；老偏好文件里没有这一项，按默认（开）读。
+    #[serde(default = "zero_copy_default")]
+    pub zero_copy: bool,
+}
+
+const fn zero_copy_default() -> bool {
+    true
 }
 
 impl Default for ConnectionMediaOptions {
@@ -210,6 +218,7 @@ impl Default for ConnectionMediaOptions {
             codec: CodecPreference::Auto,
             decoder: Default::default(),
             transport: TransportChoice::Auto,
+            zero_copy: zero_copy_default(),
         }
     }
 }

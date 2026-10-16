@@ -8,6 +8,7 @@ use crate::media::decode_api::{DecodeError, DecoderMode, DecoderNotification, Vi
 use bytes::Bytes;
 
 mod vaapi;
+pub(crate) use vaapi::{DmaBufFrame, DmaBufPlane};
 use std::collections::VecDeque;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +31,8 @@ pub(crate) type GpuDevice = std::convert::Infallible;
 
 pub enum PlatformDecodedFrame {
     Cpu(CpuVideoFrame),
+    /// 解码 surface 直接导出的 dma-buf：渲染器自己导成纹理，不再经 CPU。
+    DmaBuf { pts: i64, frame: DmaBufFrame },
 }
 
 /// Whether the local VA-API driver decodes this format in hardware.
@@ -149,12 +152,9 @@ impl LinuxVideoDecoder {
                                 data: Bytes::from(frame.data),
                             }));
                     }
-                    // 解码端的零拷贝这一半已经就绪，渲染端（纹理导入与采样子矩形）
-                    // 还没接上；眼下唯一能开它的方式是 `OPENUUYC_DECODER_ZEROCOPY=1`，
-                    // 那就明确报错，不要悄悄丢掉一帧。
-                    vaapi::Output::DmaBuf(_) => {
-                        tracing::error!("解码端零拷贝的渲染端尚未接上");
-                        return Err(DecodeError::Unsupported);
+                    vaapi::Output::DmaBuf(frame) => {
+                        self.pending
+                            .push_back(PlatformDecodedFrame::DmaBuf { pts: token, frame });
                     }
                 }
                 return Ok(());
@@ -253,6 +253,8 @@ mod tests {
                 return None;
             }
         };
+        // 零拷贝是进程内开关、默认开；这组测试量的是拷回内存那条路。
+        crate::media::preferences::set_decoder_zero_copy(false);
         let mut size = (0, 0);
         let mut frames = 0usize;
         for unit in access_units(codec, stream) {
@@ -260,7 +262,10 @@ mod tests {
                 panic!("{codec:?} 第 {frames} 帧之后解码失败：{error:?}");
             }
             while let Ok(Some(frame)) = decoder.poll_owned_frame() {
-                let PlatformDecodedFrame::Cpu(frame) = frame;
+                // 这个测试量的是拷回内存那一路。
+                let PlatformDecodedFrame::Cpu(frame) = frame else {
+                    panic!("默认设置下不应该拿到 dma-buf 帧");
+                };
                 assert_eq!(frame.format, CpuFormat::Nv12);
                 assert_eq!(
                     frame.data.len(),

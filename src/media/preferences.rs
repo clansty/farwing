@@ -10,6 +10,29 @@ fn path() -> Result<std::path::PathBuf> {
 pub fn load() -> Result<ConnectionMediaOptions> {
     load_from(&path()?)
 }
+/// 解码端零拷贝的进程内开关。图形界面的复选框与偏好文件走 [`set_decoder_zero_copy`]；
+/// `OPENUUYC_DECODER_ZEROCOPY` 环境变量优先，用来排查（`0`/`false` 关，`1`/`true` 开）。
+/// 解码器那边发现 surface 导不出来时会自己退回 CPU 拷贝，跟这个开关无关。
+static DECODER_ZERO_COPY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub(crate) fn decoder_zero_copy() -> bool {
+    static OVERRIDE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    match OVERRIDE.get_or_init(|| match std::env::var("OPENUUYC_DECODER_ZEROCOPY").as_deref() {
+        Ok("0") | Ok("false") => Some(false),
+        Ok("1") | Ok("true") => Some(true),
+        _ => None,
+    }) {
+        Some(forced) => *forced,
+        None => DECODER_ZERO_COPY.load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// 图形界面改了偏好之后立刻生效（下一次打开解码器就读到新值）。
+/// `pub` 是因为二进制（`main.rs`）在另一个 crate 里，读设置时也要同步一次。
+pub fn set_decoder_zero_copy(enabled: bool) {
+    DECODER_ZERO_COPY.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub(super) fn load_from(path: &std::path::Path) -> Result<ConnectionMediaOptions> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,

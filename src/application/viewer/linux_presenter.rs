@@ -478,11 +478,17 @@ impl ConnectingWindowsRunner {
         }
         let drawing = window.is_minimized() != Some(true);
         if let Stage::Playing(player) = &mut self.stage
-            && let Some(frame) = player.take_frame()
+            && let Some(mut frame) = player.take_frame()
         {
             let upload = Instant::now();
             if drawing {
-                match &frame.surface {
+                match &mut frame.surface {
+                    // 零拷贝：整个 dma-buf（连同解码 surface 的租约）交给视频层持有，
+                    // 直到这一帧被下一帧换掉。
+                    RenderSurface::DmaBuf { frame: dmabuf, color } => {
+                        let dmabuf = dmabuf.take().context("零拷贝帧已经被取走")?;
+                        shell.presenter.upload_video_dmabuf(dmabuf, color.transform(8))?
+                    }
                     RenderSurface::CpuNv12 { data, color } => shell.presenter.upload_video_nv12(
                         frame.width,
                         frame.height,
