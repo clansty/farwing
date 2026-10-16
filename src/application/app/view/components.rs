@@ -371,9 +371,6 @@ impl Manager {
             });
             if accepted {
                 self.confirm = None;
-                if operation == Operation::Install {
-                    self.apply_link_takeover();
-                }
                 self.work(Some(operation), ctx.clone());
             } else if dismiss || result.should_close() {
                 self.confirm = None;
