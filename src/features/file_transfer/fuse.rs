@@ -749,10 +749,15 @@ pub(crate) fn mount(
 
     *lock(active()) = Some(Active {
         generation,
-        mountpoint,
+        mountpoint: mountpoint.clone(),
         shutdown: shutdown_tx,
         thread: Some(worker),
     });
+    // 挂上就把文件管理器叫出来。失败不影响挂载本身（比如没有 xdg-open、没有桌面会话）。
+    match std::process::Command::new("xdg-open").arg(&mountpoint).spawn() {
+        Ok(_) => {}
+        Err(error) => tracing::debug!(%error, "xdg-open 打不开挂载点，不影响挂载"),
+    }
     Ok(())
 }
 
@@ -818,7 +823,20 @@ fn session_thread(
         return;
     }
     // 等主线程喊停；在此之前保持运行时活着，下载任务与会话都靠它跑。
-    let _ = shutdown.recv();
+    // 等停止。**同时盯着会话自己有没有结束**：文件管理器（或用户）从外面
+    // `fusermount3 -u` 卸载时没人会给我们发信号，FUSE 会话线程读到 ENODEV 就退出了，
+    // 而我们还在这里等——那样挂载已经没了、连接却一直活着，界面也以为还挂着。
+    let mut externally_unmounted = false;
+    loop {
+        match shutdown.recv_timeout(Duration::from_millis(250)) {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if session.guard.is_finished() {
+            externally_unmounted = true;
+            break;
+        }
+    }
     stop.cancel();
     drop(end_tx);
     let _ = handle.block_on(alive);
@@ -839,6 +857,12 @@ fn session_thread(
         drop(runtime);
         let _ = std::fs::remove_dir_all(&cache_dir);
         let _ = std::fs::remove_dir(&mountpoint);
+        if externally_unmounted {
+            tracing::info!("远端文件系统已被从外部卸载，收尾");
+            // 界面靠全局状态判断「还挂着没有」。我们**就是**那个线程，不能 join 自己，
+            // 所以只把槽位摘掉（丢掉手柄与发送端）。
+            drop(lock(active()).take());
+        }
     } else {
         tracing::warn!("FUSE 会话线程没有在卸载后退出，把它留在后台（挂载点已经摘掉）");
         drop(session);
@@ -932,9 +956,18 @@ mod tests {
             .expect("没有找到设备");
         mount(client, device, ConnectionMediaOptions::default()).expect("挂载失败");
         let root = mounted_path().expect("取挂载点失败");
-        eprintln!("已挂载 {}，保持 90 秒供检查（gio mount -li / 文件管理器）", root.display());
-        std::thread::sleep(Duration::from_secs(90));
-        unmount().expect("卸载失败");
+        eprintln!("已挂载 {}，等待外部卸载（最多 90 秒）", root.display());
+        eprintln!("请在另一个终端跑：fusermount3 -u {}", root.display());
+        let deadline = std::time::Instant::now() + Duration::from_secs(90);
+        while std::time::Instant::now() < deadline {
+            if mounted_path().is_none() {
+                eprintln!("检测到外部卸载 ✓（会话与连接都收尾了）");
+                std::process::exit(0);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        eprintln!("90 秒内没有检测到外部卸载 ✗");
+        let _ = unmount();
         std::process::exit(0);
     }
 
