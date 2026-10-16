@@ -263,8 +263,8 @@ pub(super) fn receive(
                             directory:f.file_attributes&0x10!=0,
                             info:crate::features::file_transfer::protocol::FileInfo {
                                 rel_path:f.file_name,size:f.file_size,
-                                // The drag manifest already carries the 1601-epoch ticks the transfer
-                                // manifest uses; the receiver reads that scale directly.
+                                // Descriptors off the wire are ticks by the time they get here
+                                // (`protocol::wire_filetime`), and the receiver accepts either scale.
                                 modified_time:f.last_write_time,
                             },
                         }).collect();
