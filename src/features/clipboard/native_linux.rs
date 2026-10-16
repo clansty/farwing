@@ -442,7 +442,19 @@ impl LocalSnapshot {
                 ensure!(!self.sources.is_empty(), "本地剪贴板没有文件");
                 let files = collect_files(&self.sources)?;
                 let descriptors: Vec<_> = files.items.iter().map(|f| f.desc.clone()).collect();
-                formats::descriptor_bytes(&descriptors, "不安全的文件名称")
+                let blob = formats::descriptor_bytes(&descriptors, "不安全的文件名称")?;
+                // 官方主控把我们的文件粘到 Windows 上走的就是这一条（它按名字来问这个
+                // 二进制块）。它把 ftLastWriteTime 当什么读还没定论——我们写进去的是
+                // ticks，而官方**自己发的**线上时间戳是 Unix 秒。这条把「答了什么」和
+                // 「槽里放了什么」一起留证，免得再靠猜。
+                tracing::info!(
+                    files = descriptors.len(),
+                    slot = descriptors.first().map_or(0, |f| f.last_write_time),
+                    bytes = blob.len(),
+                    first = %descriptors.first().map_or(String::new(), |f| f.file_name.clone()),
+                    "剪贴板文件描述块已答出"
+                );
+                Ok(blob)
             }
             // 只做复制（DROPEFFECT_COPY = 1）。答成移动会让文件管理器把被控端
             // 的原文件搬走——这条不是可选的礼貌，是安全线。
@@ -1424,7 +1436,11 @@ fn serve(
                     segments.push(std::mem::take(&mut current));
                     bytes = 0;
                 }
-                current.push(item.desc.clone());
+                // 线上发 Unix 秒（见 `wire_seconds`）：官方客户端按秒读，
+                // 而我们内部、以及给 Windows 的 FILEDESCRIPTORW 里都是 ticks。
+                let mut wire = item.desc.clone();
+                wire.last_write_time = wire_seconds(wire.last_write_time);
+                current.push(wire);
                 bytes += size;
             }
             if !current.is_empty() {

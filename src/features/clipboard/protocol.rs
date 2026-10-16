@@ -141,6 +141,20 @@ pub(super) fn wire_filetime(value: u64) -> u64 {
     }
 }
 
+/// 反过来：[`wire_filetime`] 的逆，把进程内部的 ticks 写回线上，线上统一发 Unix 秒。
+///
+/// 依据是官方客户端自己的做法（实机量到它发 `1791981679`），而我们的 Windows 客户端
+/// 以前是把自己那边 `FILEDESCRIPTORW` 的 FILETIME 原样透传，于是官方粘贴我们复制过去的
+/// 文件时「修改日期」是空的——它按秒读，我们发的是 ticks。读的那一侧两种都认
+/// （`wire_filetime`），所以线上改成秒不会破坏我们自己的两个客户端。
+pub(super) fn wire_seconds(ticks: u64) -> u64 {
+    // 小于 1601 纪元（只可能是 Unix 秒或 0）的原样通过，免得来回转换把值搅坏。
+    if ticks < FILETIME_EPOCH_OFFSET * TICKS_PER_SECOND {
+        return ticks;
+    }
+    (ticks - FILETIME_EPOCH_OFFSET * TICKS_PER_SECOND) / TICKS_PER_SECOND
+}
+
 /// 100ns ticks 读成本地时间。未知（`0`）、回绕和超出 9999 年的值都落到 Unix 纪元，
 /// 也就是 1970——这一层没有第二个「没有时间」的表达。
 pub(super) fn local_mtime(ticks: u64) -> SystemTime {
@@ -329,6 +343,20 @@ mod time_tests {
             local_mtime(OURS_TICKS).duration_since(UNIX_EPOCH).unwrap().subsec_nanos(),
             578_560_400
         );
+    }
+
+    #[test]
+    fn sends_seconds_reads_ticks() {
+        // 我们内部是 ticks，线上发秒；读回来还是同一秒（100ns 的小数部分会丢，
+        // 官方那条路本来也只有秒的精度）。
+        assert_eq!(
+            wire_filetime(wire_seconds(OURS_TICKS)),
+            OFFICIAL_SECONDS * TICKS_PER_SECOND + FILETIME_EPOCH_OFFSET * TICKS_PER_SECOND
+        );
+        // 已经是秒的值不会被二次换算。
+        assert_eq!(wire_seconds(OFFICIAL_SECONDS), OFFICIAL_SECONDS);
+        assert_eq!(wire_seconds(0), 0);
+        assert_eq!(wire_filetime(wire_seconds(0)), 0);
     }
 
     #[test]

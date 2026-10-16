@@ -436,37 +436,24 @@ async fn send(rpc: &mut Rpc, v: FileTransferSendRequest) -> Result<()> {
     let id = v.id.clone();
     // 官方主控的下载请求不带 path：源路径由先到的 RemoteDownloadPath 顶层消息给出，
     // 而那条走 CONTROL、这条走 TEXT，两个通道的到达顺序不保证，因此留一小段等待窗口。
-    let mut path = v.path.clone();
-    // 这条路径是「主控在会话建立时声明的下载路径」，不是这一条请求指名要的文件：
-    // 我们记下来了，但它指到目录时不敢照发（见下面的判断）。
-    let mut advertised = false;
-    if path.is_empty() {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            if let Some(known) = super::super::lock(&rpc.download_path).clone() {
-                path = known;
-                advertised = true;
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        tracing::info!(task = rpc.task, found = !path.is_empty(), "host file send without path");
-    }
+    // 官方主控点下载时发的 send_request 只有任务号：实机抓到的 26 字节就是
+    // `{1: TaskId, 8: ftp{2: send_request{1: id}}}`，path 与 list_data 都空着。
+    // 会话建立时那条 `RemoteDownloadPath` 曾像是答案，但把官方二进制里的构造点读出来
+    // 才发现它是主控用 `FOLDERID_Downloads` 拼的**自己的**下载目录（实机值 `D:\Downloads`），
+    // 而且只有主控会发、被控端只收不用（GameViewerServer.exe 里没有 sent）。
+    // 官方的被控端同样只认请求里的 path（0x14069e390 那段没有判空也没有回退），
+    // 也就是「主控在非 Windows 被控端上根本没给出源路径」。所以这里不猜：拿不到就报错，
+    // 猜出来的路径只会把别的东西发出去。
+    let path = v.path.clone();
+    tracing::info!(
+        task = rpc.task,
+        path = %path,
+        list_bytes = v.list_data.len(),
+        "host file send request"
+    );
     let scan = tokio::task::spawn_blocking(move || -> Result<_> {
         ensure!(!path.is_empty(), "下载请求未给出源路径");
         let source = filesystem::local_path(&path)?;
-        // 官方主控点下载时发的 send_request 只有任务号、没有 path（实机抓到的 26 字节
-        // 就是这么回事），源路径只可能来自会话建立时那条「远端下载路径」。可那条只有
-        // 十几字节，装不下它随后浏览的 /home/clansty/Downloads，所以还不能认定它就是要
-        // 发的东西：指到单个文件就照用，指到目录宁可失败——凭一个猜出来的路径把整棵
-        // 目录推出去，比下载不动更糟。
-        ensure!(
-            !(advertised && source.is_dir()),
-            "主控只声明了下载路径而没有指名文件，不按目录整棵发送：{path}"
-        );
         let (root, folder, mut files) = storage::scan(&source, &stop)?;
         if !v.list_data.is_empty() {
             let requested = storage::decompress::<FileList>(&v.list_data)?.files;
