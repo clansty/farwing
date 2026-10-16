@@ -19,7 +19,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Condvar, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -122,6 +122,86 @@ struct State {
 ///
 /// 远端协议只有「整份发过来」，没有「从任意偏移读 N 字节」。所以读命中 `[0, valid)`
 /// 就从本地文件取；读到还没落盘的区间，才起一次拉取把后面的字节接着写进来。
+/// 本地已知的字节区间：升序、不重叠、相接即合并。
+///
+/// 远端文件是稀疏收下来的——冷读可以直接从某个偏移开始收，前面那段本地就没有。那种
+/// 洞在文件里是零，但零不是远端的内容，不能当数据给出去，所以「已知到哪」不能再当成
+/// 一个前缀长度。
+#[derive(Clone, Default)]
+struct Ranges(Vec<(u64, u64)>);
+
+impl Ranges {
+    /// 整段都是本地真源：写过的文件就是这样（写出来的洞里是零，那本来就是对的内容）。
+    fn whole(length: u64) -> Self {
+        if length == 0 {
+            Self::default()
+        } else {
+            Self(vec![(0, length)])
+        }
+    }
+
+    fn end(&self) -> u64 {
+        self.0.last().map_or(0, |(_, end)| *end)
+    }
+
+    fn insert(&mut self, start: u64, end: u64) {
+        if start >= end {
+            return;
+        }
+        // 按起点插入，保持升序——顺序错了会把中间真实的洞当邻居合并掉。
+        let position = self.0.partition_point(|(existing, _)| *existing < start);
+        self.0.insert(position, (start, end));
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(self.0.len());
+        for (start, end) in self.0.drain(..) {
+            match merged.last_mut() {
+                Some(last) if start <= last.1 => {
+                    last.0 = last.0.min(start);
+                    last.1 = last.1.max(end);
+                }
+                _ => merged.push((start, end)),
+            }
+        }
+        self.0 = merged;
+    }
+
+    fn covers(&self, start: u64, end: u64) -> bool {
+        start >= end
+            || self
+                .0
+                .iter()
+                .any(|(from, to)| *from <= start && end <= *to)
+    }
+
+    /// 包含 `offset` 的那一段的结尾；`offset` 落在洞或末尾之外就是 `None`。
+    fn covering_end(&self, offset: u64) -> Option<u64> {
+        self.0
+            .iter()
+            .find(|(from, to)| *from <= offset && offset < *to)
+            .map(|(_, to)| *to)
+    }
+
+    /// 紧挨在 `offset` 下面那一段的长度：续传校验要拿它当重叠区。
+    fn probe_below(&self, offset: u64) -> u64 {
+        self.0
+            .iter()
+            .find(|(_, end)| *end == offset)
+            .map_or(0, |(start, end)| end - start)
+    }
+
+    /// `offset` 所在（或其后最近）的那个洞的起点。取洞的头而不是 `offset` 自己，
+    /// 是为了让一次拉取填出尽量长的一整段连续已知区。
+    fn gap_start(&self, offset: u64) -> u64 {
+        if let Some(end) = self.covering_end(offset) {
+            return end;
+        }
+        self.0
+            .iter()
+            .take_while(|(from, _)| *from <= offset)
+            .last()
+            .map_or(0, |(_, end)| *end)
+    }
+}
+
 struct CacheEntry {
     path: PathBuf,
     state: Mutex<CacheState>,
@@ -129,8 +209,10 @@ struct CacheEntry {
 }
 
 struct CacheState {
-    /// `[0, valid)` 已经落盘、可以当真；以外是稀疏文件里的洞，读出来是零，不能给。
-    valid: u64,
+    /// 本地已经当真收下来的字节区间。
+    known: Ranges,
+    /// 对端已经把这文件发到头了。之后超出已知区间的读就是 EOF，不再去要。
+    complete: bool,
     /// 正在跑的拉取：`None` 表示没人在拉。里面是它自己的「停」令牌——中止不能用
     /// `Rpc` 的 stop（那会让收尾的 Complete 也发不出去，被控端就会一直挂着一个
     /// 等确认的发送任务），所以拉取循环自己 `select` 这个令牌。
@@ -169,6 +251,9 @@ struct RemoteFs {
     /// 待上传的 inode。写侧只管把 inode 丢进来，传的事交给后台任务——本地写是
     /// 磁盘速度，传是网络速度，让文件管理器等网络就等于整个卷卡住。
     uploads: mpsc::UnboundedSender<u64>,
+    /// 本次会话是否已经确认过对端遵守 `resume_point`。确认过之后，冷读（本地一个
+    /// 字节都没有的那种）才敢直接要目标偏移——不然只能从 0 把前面整段搬一遍。
+    resume_trusted: std::sync::Arc<AtomicBool>,
     uid: u32,
     gid: u32,
 }
@@ -181,6 +266,7 @@ impl RemoteFs {
         state: std::sync::Arc<Mutex<State>>,
         cache: std::sync::Arc<Cache>,
         uploads: mpsc::UnboundedSender<u64>,
+        resume_trusted: std::sync::Arc<AtomicBool>,
     ) -> Self {
         // 树与本地副本都建在外面：上传任务也要看同一份（它得知道文件现在叫什么名字）。
         {
@@ -209,6 +295,7 @@ impl RemoteFs {
             state,
             cache,
             uploads,
+            resume_trusted,
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
         }
@@ -343,28 +430,37 @@ impl RemoteFs {
         Ok((node.path.clone(), node.size))
     }
 
-    /// 等到本地副本覆盖 `need` 字节（或远端声明的大小整份到位），返回有效长度。
+    /// 等到本地副本覆盖 `[offset, offset + length)`（或对端说到头了）。
     ///
     /// 本地有改动（`dirty`）时**不联网**：本地那份才是真源，远端那份已经旧了。
     fn wait_until(
         &self,
         entry: &std::sync::Arc<CacheEntry>,
         remote: String,
-        remote_size: u64,
-        need: u64,
-    ) -> Result<u64> {
+        offset: u64,
+        length: u64,
+    ) -> Result<()> {
         let mut state = lock(&entry.state);
         state.used = self.cache.clock.fetch_add(1, Ordering::Relaxed);
         loop {
             if let Some(error) = &state.error {
                 bail!("远端读取失败：{error}");
             }
-            // 要的字节已经在本地；或者远端声明的大小已经整份落盘，那之后就是 EOF。
-            if need <= state.valid || state.valid >= remote_size || state.dirty.is_some() {
-                return Ok(state.valid);
+            if state.dirty.is_some() || state.known.covers(offset, offset + length) {
+                return Ok(());
+            }
+            // 对端说到头了：只有「要的范围整个在已知末尾之外」才算 EOF；落在冷读留下
+            // 的洞里还是得去要（那里本地是零，不是远端的内容）。
+            if state.complete && offset >= state.known.end() {
+                return Ok(());
             }
             if state.fetch.is_none() {
-                self.start_fetch(entry, remote.clone(), &mut state);
+                let from = Self::fetch_from(
+                    &state.known,
+                    offset,
+                    self.resume_trusted.load(Ordering::Relaxed),
+                );
+                self.start_fetch(entry, remote.clone(), from, &mut state);
             }
             // 用带超时的等待：拉取可能因为连接结束被中断，那时不会再有人 notify，
             // 无限等待会让卸载卡在 join 上。
@@ -379,14 +475,30 @@ impl RemoteFs {
         }
     }
 
+    /// 这次拉取该从哪儿（`resume_point`）要。
+    ///
+    /// 对端已经确认过遵守续传位置（`trusted`）时，直接要读者要的那个偏移——冷读大文件
+    /// 的尾部才不用把前半段也搬一遍，这也是「能随机读」的关键。没确认过就只能从缺口
+    /// 起点往后续：只有紧挨在起点**下面**的字节能拿来校验对端到底有没有照做，而缺口
+    /// 起点正好是已知段的结尾，能拿它当重叠区。
+    fn fetch_from(known: &Ranges, offset: u64, trusted: bool) -> u64 {
+        if trusted {
+            return offset;
+        }
+        // 从缺口起点往后续：那里紧挨着的就是已知段，拿它当重叠区能校验对端有没有照做。
+        known.gap_start(offset)
+    }
+
     /// 写已有文件之前把本地副本补全：远端协议只能整份上传，本地不完整就上传等于把
     /// 文件截断。大文件会在这里等整份下载完——这是「本地是写缓存」的代价。
     fn ensure_local_complete(&self, ino: u64) -> Result<()> {
         let (path, remote_size) = self.node_file(ino)?;
         let entry = self.cache_entry(ino)?;
-        let available = self.wait_until(&entry, path, remote_size, remote_size)?;
-        if available < remote_size {
-            bail!("本地副本不完整（{available}/{remote_size}），不能改写远端文件");
+        self.wait_until(&entry, path, 0, remote_size)?;
+        let state = lock(&entry.state);
+        if state.dirty.is_none() && !state.known.covers(0, remote_size) {
+            let have = state.known.end();
+            bail!("本地副本不完整（{have}/{remote_size}），不能改写远端文件");
         }
         Ok(())
     }
@@ -406,7 +518,9 @@ impl RemoteFs {
         let entry = self.cache_entry(ino)?;
         Self::local_write(&entry)?.set_len(0)?;
         let mut state = lock(&entry.state);
-        state.valid = 0;
+        // 截断后整份文件就是 [0, 0)（空的），写下来多少本地就有多少。
+        state.known = Ranges::default();
+        state.complete = false;
         state.dirty = Some(0);
         drop(state);
         if let Some(node) = lock(&self.state).nodes.get_mut(&ino) {
@@ -508,14 +622,17 @@ impl RemoteFs {
         let end = offset
             .checked_add(data.len() as u64)
             .context("文件偏移溢出")?;
-        {
+        let length = {
             let mut state = lock(&entry.state);
-            // 本地这份文件就是真源：写到的字节算已知，文件长度算待传。
-            state.valid = state.valid.max(end);
+            // 写过的文件整份都是本地的真源（写出来的洞里是零，那本来就是对的内容），
+            // 长度按「已有的文件长度」与「写到的位置」取大。
+            let length = state.known.end().max(end);
+            state.known = Ranges::whole(length);
             state.dirty = Some(state.dirty.unwrap_or(0).max(end));
-        }
+            length
+        };
         if let Some(node) = lock(&self.state).nodes.get_mut(&ino) {
-            node.size = node.size.max(end);
+            node.size = node.size.max(length);
         }
         Ok(data.len())
     }
@@ -535,7 +652,8 @@ impl RemoteFs {
         Self::local_write(&entry)?.set_len(size)?;
         {
             let mut state = lock(&entry.state);
-            state.valid = size;
+            state.known = Ranges::whole(size);
+            state.complete = false;
             state.dirty = Some(size);
         }
         if let Some(node) = lock(&self.state).nodes.get_mut(&ino) {
@@ -745,17 +863,19 @@ impl RemoteFs {
         }
         let wanted = u64::from(size.min(MAX_READ)).min(remote_size - offset);
         let entry = self.cache_entry(ino)?;
-        let available = self.wait_until(&entry, path, remote_size, offset + wanted)?;
+        self.wait_until(&entry, path, offset, wanted)?;
         if self.stop.is_cancelled() {
             bail!("远端连接已结束");
         }
-        // 远端声明的大小与实际内容可能不一致，用 saturating 保证越界读退化成空读。
+        // 已知区间可能比要的短（读到文件末尾、或对端说发到头了）：给短的那个，内核
+        // 会把它当 EOF。远端声明的大小与实际内容也可能不一致，用 saturating 兜底。
+        let available = lock(&entry.state).known.covering_end(offset).unwrap_or(0);
         let take = usize::try_from(available.saturating_sub(offset).min(wanted)).unwrap_or(0);
         if take == 0 {
             return Ok(Some(Vec::new()));
         }
         // `~/.cache` 下的东西会被系统清理工具、tmpfiles 之流删掉，而我们记着的
-        // `valid` 还在——那种情况交给调用方清掉记忆再拉一遍。
+        // 已知区间还在——那种情况交给调用方清掉记忆再拉一遍。
         let file = match std::fs::File::open(&entry.path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -771,7 +891,8 @@ impl RemoteFs {
         let entry = lock(&self.cache.entries).get(&ino).cloned();
         if let Some(entry) = entry {
             let mut state = lock(&entry.state);
-            state.valid = 0;
+            state.known = Ranges::default();
+            state.complete = false;
             state.error = None;
         }
     }
@@ -789,7 +910,8 @@ impl RemoteFs {
         let entry = std::sync::Arc::new(CacheEntry {
             path: cache_path,
             state: Mutex::new(CacheState {
-                valid: 0,
+                known: Ranges::default(),
+                complete: false,
                 fetch: None,
                 readers: 0,
                 error: None,
@@ -813,11 +935,16 @@ impl RemoteFs {
         &self,
         entry: &std::sync::Arc<CacheEntry>,
         remote: String,
+        from: u64,
         state: &mut CacheState,
     ) {
         let abort = CancellationToken::new();
         state.fetch = Some(abort.clone());
-        let known = state.valid;
+        // 校验重叠区：紧挨在 `from` 下面那段已知字节，请对端**重发**一遍，跟本地比。
+        // 对端说它从 `request` 开始发——比中了才说明这个偏移是真的。
+        let probe = state.known.probe_below(from).min(RESUME_PROBE);
+        let request = from - probe;
+        let trusted = self.resume_trusted.clone();
         let wire = self.wire.clone();
         let stop = self.stop.clone();
         let cache = self.cache.clone();
@@ -829,14 +956,22 @@ impl RemoteFs {
                 remote,
                 stop,
                 abort,
-                known,
+                request,
+                probe,
                 cache_path,
                 task_entry.clone(),
+                trusted,
             )
             .await;
             let mut state = lock(&task_entry.state);
             match result {
-                Ok(received) => state.valid = state.valid.max(received),
+                Ok((end, finished)) => {
+                    state.known.insert(request, end);
+                    // 对端说发到头了：再往后的读就是 EOF，不必一遍遍去要。
+                    if finished {
+                        state.complete = true;
+                    }
+                }
                 Err(error) => state.error = Some(format!("{error:#}")),
             }
             state.fetch = None;
@@ -858,7 +993,7 @@ impl Cache {
                 let entries = lock(&self.entries);
                 for (&ino, entry) in entries.iter() {
                     let state = lock(&entry.state);
-                    total += state.valid;
+                    total += state.known.end();
                     if state.readers > 0 || state.fetch.is_some() {
                         continue;
                     }
@@ -897,10 +1032,16 @@ async fn stream_to_cache(
     remote: String,
     stop: CancellationToken,
     abort: CancellationToken,
-    known: u64,
+    // 请对端从哪个偏移开始发（`FileConfirm.resume_point`）。
+    request: u64,
+    // `[request, request + probe)` 这段本地已经有了，请它重发一遍来校验「对端到底
+    // 有没有按这个偏移发」；0 表示没法校验（从 0 起，或已确认过对端时的直接跳偏移）。
+    probe: u64,
     cache_path: PathBuf,
     entry: std::sync::Arc<CacheEntry>,
-) -> Result<u64> {
+    // 会话内是否已经确认过对端遵守续传位置：这次校验成功就置上，失败就撤掉。
+    trusted: std::sync::Arc<AtomicBool>,
+) -> Result<(u64, bool)> {
     let mut rpc = Rpc::new(wire, stop, contract::Owner::Transfer)?;
     rpc.req(
         Req::SendRequest(FileTransferSendRequest {
@@ -935,9 +1076,6 @@ async fn stream_to_cache(
         .write(true)
         .open(&cache_path)
         .with_context(|| format!("打开缓存文件 {} 失败", cache_path.display()))?;
-    // 已经有这么多字节是可信的；请求它从 `request_from` 开始发。
-    let probe = known.min(RESUME_PROBE);
-    let request_from = known - probe;
     // 流从文件里的哪个偏移开始：第一块到手才能定（拿本地已有的那段比对）。
     let mut stream_start: Option<u64> = None;
     let mut received = 0u64;
@@ -957,7 +1095,7 @@ async fn stream_to_cache(
                         false,
                     )
                     .await;
-                return Ok(stream_start.unwrap_or(request_from) + received);
+                return Ok((stream_start.unwrap_or(request) + received, false));
             }
             incoming = rpc.next() => incoming?,
         };
@@ -972,7 +1110,7 @@ async fn stream_to_cache(
                     id: rpc.task(index),
                     skip: false,
                     err: 1,
-                    resume_point: request_from,
+                    resume_point: request,
                 }))
                 .await?;
             }
@@ -983,19 +1121,26 @@ async fn stream_to_cache(
                     Some(start) => start,
                     None => {
                         let start = if probe == 0 {
-                            request_from
+                            // 没有可校验的本地字节：要么本来就从 0 要（不需要校验），
+                            // 要么是已经确认过对端遵守续传位置之后的一次直接跳偏移。
+                            request
                         } else {
                             let compare = usize::try_from(probe.min(value.data.len() as u64))?;
                             let mut local = vec![0u8; compare];
-                            file.read_exact_at(&mut local, request_from)?;
+                            file.read_exact_at(&mut local, request)?;
                             if local == value.data[..compare] {
-                                request_from
+                                // 对端确实按 resume_point 发的：这一会话里记下来，
+                                // 之后冷读（没有任何本地字节可校验）才敢直接跳偏移，
+                                // 而不是从 0 把前面整段搬一遍。
+                                trusted.store(true, Ordering::Relaxed);
+                                request
                             } else {
-                                // 它没按续传位置发（或者发的是别的东西）：按从 0 头
-                                // 处理，错位的字节会被下面跳过。
+                                // 它没按续传位置发（或者发的是别的东西）：按从流首
+                                // 对齐，同一会话里也不再信任它。
+                                trusted.store(false, Ordering::Relaxed);
                                 tracing::warn!(
                                     remote_size = size,
-                                    resume_point = request_from,
+                                    resume_point = request,
                                     "被控端未按续传位置发送，改按流首对齐"
                                 );
                                 0
@@ -1007,19 +1152,12 @@ async fn stream_to_cache(
                 };
                 let position = start + received;
                 let end = contract::received_bytes(position, value.data.len(), size)?;
-                if end > known {
-                    let skip = usize::try_from(known.saturating_sub(position))
-                        .unwrap_or(usize::MAX)
-                        .min(value.data.len());
-                    file.write_all_at(&value.data[skip..], position + skip as u64)?;
+                file.write_all_at(&value.data, position)?;
+                {
                     let mut state = lock(&entry.state);
-                    state.valid = state.valid.max(end);
-                    let valid = state.valid;
-                    drop(state);
-                    if valid > 0 {
-                        entry.ready.notify_all();
-                    }
+                    state.known.insert(position, end);
                 }
+                entry.ready.notify_all();
                 received += value.data.len() as u64;
                 rpc.res(Res::BlockConfirm(FileTransferBlockConfirm {
                     id: rpc.task(1),
@@ -1041,7 +1179,7 @@ async fn stream_to_cache(
                         err_msg: String::new(),
                     }))
                     .await?;
-                    return Ok(stream_start.unwrap_or(request_from) + received);
+                    return Ok((stream_start.unwrap_or(request) + received, true));
                 }
                 ensure!(index == 1, "远端完成了未预期的文件");
                 rpc.res(Res::Result(FileTransferResult {
@@ -2024,6 +2162,7 @@ fn session_thread(
         });
         let state = std::sync::Arc::new(Mutex::new(State::default()));
         let (uploads, jobs) = mpsc::unbounded_channel();
+        let resume_trusted = std::sync::Arc::new(AtomicBool::new(false));
         tokio::spawn(upload_worker(
             state.clone(),
             cache.clone(),
@@ -2038,6 +2177,7 @@ fn session_thread(
             state,
             cache,
             uploads,
+            resume_trusted,
         );
         let session = fuser::spawn_mount2(filesystem, &mountpoint, &mount_options())
             .with_context(|| format!("挂载 {} 失败", mountpoint.display()))?;
@@ -2155,6 +2295,58 @@ mod tests {
         // 离谱的未来值也不能溢出。
         assert_eq!(mtime(u64::MAX), UNIX_EPOCH);
         assert_eq!(mtime(253_402_300_800), UNIX_EPOCH);
+    }
+
+    /// 已知区间的合并/覆盖判断：冷读会留下洞，读洞必须重新去要，不能拿零当数据。
+    #[test]
+    fn ranges_track_holes() {
+        let mut ranges = Ranges::default();
+        assert!(!ranges.covers(0, 1));
+        ranges.insert(100, 200);
+        assert!(ranges.covers(100, 200));
+        assert!(!ranges.covers(0, 100));
+        assert!(!ranges.covers(199, 201));
+        // 相接/重叠的段合并
+        ranges.insert(200, 300);
+        assert_eq!(ranges.0, vec![(100, 300)]);
+        ranges.insert(50, 150);
+        assert_eq!(ranges.0, vec![(50, 300)]);
+        // 中间挖一段：洞两侧都还在
+        let mut split = Ranges::default();
+        split.insert(0, 10);
+        split.insert(20, 30);
+        assert!(!split.covers(5, 25));
+        assert_eq!(split.covering_end(5), Some(10));
+        assert_eq!(split.covering_end(15), None);
+        assert_eq!(split.end(), 30);
+        // 洞的起点（不是 offset 自己）：填出来才是一整段连续的
+        assert_eq!(split.gap_start(15), 10);
+        // 在已知段里：往后最近的洞从这段结尾开始
+        assert_eq!(split.gap_start(0), 10);
+        assert_eq!(split.gap_start(25), 30);
+        // 20 正下方是洞，没有可校验的字节；10 正下方是已知段，能校验
+        assert_eq!(split.probe_below(20), 0);
+        assert_eq!(split.probe_below(10), 10);
+        assert_eq!(split.probe_below(0), 0);
+    }
+
+    /// 拉取起点：没确认过对端就只敢从缺口起点往后续（那里下面有字节能校验），
+    /// 确认过才敢直接跳到读者要的偏移。
+    #[test]
+    fn fetch_origin_depends_on_trust() {
+        let mut known = Ranges::default();
+        known.insert(0, 1024);
+        known.insert(4096, 8192);
+        // 落在已知段里、只是要得更长 → 从这段结尾接着要
+        assert_eq!(RemoteFs::fetch_from(&known, 512, false), 1024);
+        // 落在洞里 → 从洞的起点开始（下面就是已知段，能校验）
+        assert_eq!(RemoteFs::fetch_from(&known, 2048, false), 1024);
+        // 起点就是 0 的情况（缺口在最前面）：从 0 要，本来也不需要校验
+        let mut head = Ranges::default();
+        head.insert(1024, 2048);
+        assert_eq!(RemoteFs::fetch_from(&head, 0, false), 0);
+        // 确认过对端 → 直接跳到读者要的位置
+        assert_eq!(RemoteFs::fetch_from(&known, 6000, true), 6000);
     }
 
     /// 名字校验：内核传来的名字必须是单段，否则我们拼出来的远端路径会写到别的目录去。
