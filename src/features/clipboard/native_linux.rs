@@ -23,6 +23,10 @@ pub(super) use super::formats::safe_name;
 const MAX_CLIP: usize = 32 * 1024 * 1024;
 const POLL: Duration = Duration::from_millis(400);
 
+/// 双方约定的剪贴板文件任务号。官方 Windows 客户端用它来发文件相关的请求，两个
+/// 方向都用这一个号，登记与查表必须一致。
+const CLIPBOARD_TASK: u32 = 0;
+
 pub(super) enum Command {
     Activate(Weak<Inner>),
     DropFiles(
@@ -432,25 +436,10 @@ impl LocalSnapshot {
                 })
                 .context("本地剪贴板没有文本"),
             8 => self.image.clone().context("本地剪贴板没有图片"),
-            // 这块按 Windows 标准语义放 FILETIME（ticks）。曾经以为官方主控粘我们的
-            // 文件时按名字来问的就是这一槽、而且按 Unix 秒读，于是这里也换成过秒——
-            // 2026-10-16 实测把它否掉了：官方取我们的文件走的是 `FileDescListRequest`
-            // （日志「剪贴板收到文件列表请求」连问四次），这条没被问过；当时那个「日期
-            // 空白」是**线上描述符**里发 ticks 造成的（见 `protocol::wire_seconds`）。
-            _ if format.wire.name == "FileGroupDescriptorW" => {
-                ensure!(!self.sources.is_empty(), "本地剪贴板没有文件");
-                let files = collect_files(&self.sources)?;
-                let descriptors: Vec<_> = files.items.iter().map(|f| f.desc.clone()).collect();
-                let blob = formats::descriptor_bytes(&descriptors, "不安全的文件名称")?;
-                tracing::info!(
-                    files = descriptors.len(),
-                    ticks = descriptors.first().map_or(0, |f| f.last_write_time),
-                    bytes = blob.len(),
-                    first = %descriptors.first().map_or(String::new(), |f| f.file_name.clone()),
-                    "剪贴板文件描述块已答出"
-                );
-                Ok(blob)
-            }
+            // 描述符块那条要展开整棵树、还要登记任务（对面可能按固定任务号直接来要
+            // `FileContents`），都得拿得到 `&mut State`，所以留在 `serve` 里做，见
+            // `descriptor_blob`。时间按 FILETIME（ticks）放，理由也在那里。
+            //
             // 只做复制（DROPEFFECT_COPY = 1）。答成移动会让文件管理器把被控端
             // 的原文件搬走——这条不是可选的礼貌，是安全线。
             _ if format
@@ -1012,8 +1001,7 @@ fn offer_files(
 /// through the filesystem, if and when something actually opens them.
 fn accept_files(state: &mut State, session: &Arc<Inner>, epoch: u64) -> Result<()> {
     // The task id the official Windows client uses for an inbound offer.
-    const TASK: u32 = 0;
-    let descriptors = session.descriptors(epoch, TASK)?;
+    let descriptors = session.descriptors(epoch, CLIPBOARD_TASK)?;
     ensure!(!descriptors.is_empty(), "远端剪贴板文件列表为空");
     let tree = super::fuse::Tree::build(&descriptors)?;
     let parent = super::fuse::mount_parent()?;
@@ -1021,7 +1009,14 @@ fn accept_files(state: &mut State, session: &Arc<Inner>, epoch: u64) -> Result<(
         let session = Arc::downgrade(session);
         Arc::new(move |index: u32, offset: u64, length: usize| {
             let session = session.upgrade().context("剪贴板会话已结束")?;
-            session.read_file(epoch, TASK, index, offset, length.min(FILE_BLOCK), 2)
+            session.read_file(
+                epoch,
+                CLIPBOARD_TASK,
+                index,
+                offset,
+                length.min(FILE_BLOCK),
+                2,
+            )
         })
     };
     let generation = super::fuse::generation();
@@ -1279,21 +1274,32 @@ fn poll_local(state: &mut State) -> Result<()> {
     } else {
         generation != 0 && generation != state.own_generation
     };
-    let (wayland_changed, x11_changed) = (
-        written || (!own_wayland && wayland != state.wayland),
-        written || (!own_x11 && x11 != state.x11),
-    );
-    if !own_wayland {
-        state.wayland = wayland.clone();
-    }
-    if !own_x11 {
-        state.x11 = x11.clone();
-    }
+    // 「哪一侧变了」只看内容本身：写次数只数 Wayland 那一侧，它前进了并不代表两侧
+    // 都换了内容——X11 那一侧可能还停着上一次的旧东西（先在 Wayland 复制 A、再到
+    // XWayland 程序里复制 B、又回 Wayland 复制一次 A，第三次不能把 X11 那侧的 B
+    // 当成变化抢先发出去）。X11 那一侧「没人持有选择区」是常态（在 Wayland 里复制
+    // 的东西那一侧就没有），空的对比不算变化。
+    let wayland_changed = !own_wayland && wayland != state.wayland;
+    let x11_changed = !own_x11 && !x11.is_empty() && x11 != state.x11;
+    // 各侧「上次看到的」当场推进到这一轮读到的值——自有副本（远端发来、我们挂上去
+    // 的那份）也照记：跳过它的话这一侧就停在挂载之前的值上，用户再复制一次挂载前
+    // 那份内容时两边一模一样，会被判成「没变」而发不出去。
+    state.wayland = wayland.clone();
+    state.x11 = x11.clone();
+    // 内容一个字节都没变、只是写次数前进了：有人把同一份又复制了一遍。`written` 见
+    // 上面，它已经把自有副本与远端刚写进来的那份排除掉了。
+    let repeat = written && !wayland_changed && !x11_changed && !wayland.is_empty();
     // 两边同一轮都变了时让给 X11：XWayland 里的程序只在那一侧看得见，而 Wayland
     // 那一侧的变化更可能是我们自己的东西在动。
-    let snapshot = if x11_changed && !x11.is_empty() {
+    let snapshot = if x11_changed {
         x11
     } else if wayland_changed {
+        wayland
+    } else if repeat {
+        // 重发的必须是这一轮从 Wayland 读到的那份，不能挑 X11——写次数只数 Wayland
+        // 那一侧，而 X11 那一侧可能还停在旧内容上，对端会因此拿到错的东西。对面
+        // （官方 Windows 客户端粘完就把 offer 放掉）要一次新的 FormatList 才会重新
+        // 武装，所以照这份再广播一遍。
         wayland
     } else {
         // 两侧都没报告变化：这一轮前进的写次数是我们自己写剪贴板引起的（读回来
@@ -1303,7 +1309,8 @@ fn poll_local(state: &mut State) -> Result<()> {
         state.own_generation = generation;
         return Ok(());
     };
-    if snapshot == state.local && !written {
+    // 内容一模一样就不必再发；`repeat` 那条要的正是「再发一遍」。
+    if !repeat && snapshot == state.local {
         return Ok(());
     }
     if !snapshot.sources.is_empty() || !state.local.sources.is_empty() {
@@ -1420,6 +1427,42 @@ fn read_wayland(state: &mut State) -> Result<LocalSnapshot> {
     }
 }
 
+/// 答一次 `FileGroupDescriptorW`。
+///
+/// 这个二进制块是官方 Windows 客户端会按名字来问的描述符形态（DWORD 个数 + N ×
+/// 592 字节的 FILEDESCRIPTORW）。它按名字问完就可能直接来要 `FileContents`——
+/// **可能**不走 `FileDescListRequest`，而且会用双方约定的固定任务号来要（对面那半
+/// 见 `accept_files`）。所以清单要在这里就登记成任务，否则下一步的
+/// `FileContentsRequest` 会答「文件任务已失效」，粘贴卡死。
+fn descriptor_blob(state: &mut State, session: &Arc<Inner>) -> Result<Vec<u8>> {
+    let key = (session.id, CLIPBOARD_TASK);
+    // 已经登记过的话即便任务表满了也照答——这一格是同一个请求问第二遍。
+    ensure!(
+        state.tasks.len() < 32 || state.tasks.contains_key(&key),
+        "文件任务过多"
+    );
+    ensure!(!state.local.sources.is_empty(), "本地剪贴板没有文件");
+    // 这块按 Windows 标准语义放 FILETIME（ticks）。曾经以为官方主控粘我们的文件时
+    // 按名字来问的就是这一槽、而且按 Unix 秒读，于是这里也换成过秒——2026-10-16 实测
+    // 把它否掉了：官方取我们的文件走的是 `FileDescListRequest`（那条走 `wire_seconds`
+    // 发 Unix 秒），这条没被问过；当时那个「日期空白」是**线上描述符**里发 ticks 造
+    // 成的，见 `protocol::wire_seconds`。
+    //
+    // 展开一次要整树遍历，对面按格式一个个来问、同一份清单还可能被问好几遍，展开结果
+    // 留着复用，见 `local_files`。
+    let files = state.local_files()?;
+    state.tasks.insert(key, files.clone());
+    let descriptors: Vec<_> = files.items.iter().map(|file| file.desc.clone()).collect();
+    let blob = formats::descriptor_bytes(&descriptors, "不安全的文件名称")?;
+    tracing::debug!(
+        files = descriptors.len(),
+        ticks = descriptors.first().map_or(0, |f| f.last_write_time),
+        bytes = blob.len(),
+        "剪贴板文件描述块已答出"
+    );
+    Ok(blob)
+}
+
 fn serve(
     state: &mut State,
     session: &Arc<Inner>,
@@ -1437,8 +1480,16 @@ fn serve(
                         format.wire.id == ask.format_id
                             && (ask.format_name.is_empty() || ask.format_name == format.wire.name)
                     })
-                    .context("未发布该剪贴板格式")?;
-                let data = state.local.data(format).inspect_err(|error| {
+                    .context("未发布该剪贴板格式")?
+                    .clone();
+                // 官方 Windows 客户端会按名字来问这个二进制块，答不上就不再往下问
+                // FileContents。这条要登记任务、还要复用已展开的清单，都得拿得到
+                // `&mut State`，所以从 `LocalSnapshot::data` 挪到了这里，见
+                // `descriptor_blob`。
+                if format.wire.name == "FileGroupDescriptorW" {
+                    return descriptor_blob(state, session);
+                }
+                let data = state.local.data(&format).inspect_err(|error| {
                     // 官方客户端是逐个格式来问的，答不上哪一条只在这里看得出来；
                     // 之前这里一声不吭，「粘贴不动」在日志里什么都没有。
                     tracing::info!(
@@ -1448,7 +1499,12 @@ fn serve(
                         "剪贴板格式答不上"
                     );
                 })?;
-                formats::convert(data, format, session.platform.load(Ordering::Acquire), true)
+                formats::convert(
+                    data,
+                    &format,
+                    session.platform.load(Ordering::Acquire),
+                    true,
+                )
             })();
             match result {
                 Ok(data) if !data.is_empty() => {
