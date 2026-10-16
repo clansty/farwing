@@ -16,7 +16,8 @@
 # 是同一套文件，和本包不能共存，因此三者 provides 同一个名字、再互相 conflicts。
 _pkgname=openuuyc
 pkgname=$_pkgname-clansty
-# 基准版本来自 Cargo.toml 的 [package].version，pkgver() 会再读一次并追加 .r<rev>.g<hash>。
+# 基准版本来自 Cargo.toml 的 [package].version，pkgver() 会再读一次：正好在 tag 上就是
+# 这个版本号，tag 之后再提交才追加 .r<提交数>.g<hash>（数的是离最近那个 tag 的提交数）。
 # 版本号里的 `-`（-clansty 这种预发布后缀）要换成 `.`：pacman 的 pkgver 里不能有连字符。
 pkgver=1.0.2.beta.5.clansty1
 pkgrel=1
@@ -106,13 +107,20 @@ _src_dir() {
 
 pkgver() {
   cd "$(_src_dir)"
-  local base rev hash
+  local base count hash
   base=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
   # `-` 是 PKGBUILD 里 pkgver 与 pkgrel 的分隔符，不能出现在版本号里。
   base=${base//-/.}
-  rev=$(git rev-list --count HEAD 2>/dev/null || echo 0)
   hash=$(git rev-parse --short=7 HEAD 2>/dev/null || echo nogit)
-  printf '%s.r%s.g%s' "$base" "$rev" "$hash"
+  # 发布用的包从 tag 上打，版本号保持干净；分支往前走了才在版本号里带上它离
+  # 最近那个 tag 有多少个提交（`rev-list --count HEAD` 数的是整个仓库的提交总数，
+  # 那样发布版也会拖着一串 .r<几百>，不是这里想要的语义）。
+  if git describe --exact-match --tags HEAD >/dev/null 2>&1; then
+    printf '%s' "$base"
+  else
+    count=$(git rev-list --count "$(git describe --tags --abbrev=0)"..HEAD 2>/dev/null || echo 0)
+    printf '%s.r%s.g%s' "$base" "$count" "$hash"
+  fi
 }
 
 build() {
