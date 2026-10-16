@@ -1,5 +1,8 @@
 //! Input injection through `/dev/uinput`: virtual devices the kernel hands to
-//! whatever session is running, Xorg or Wayland alike.
+//! whatever session is running. Only a Wayland session opens them by default —
+//! an Xorg session keeps X Test, which positions the pointer absolutely and
+//! needs no permission, while a uinput pointer there would only add libinput's
+//! acceleration. `OPENUUYC_INPUT=uinput` still forces it anywhere.
 //!
 //! This is the backend that works where X Test does not — a Wayland session,
 //! and a locked screen, which X clients cannot reach at all. It costs one
@@ -71,8 +74,6 @@ const BTN_RIGHT: u16 = 0x111;
 const BTN_MIDDLE: u16 = 0x112;
 const BTN_SIDE: u16 = 0x113;
 const BTN_EXTRA: u16 = 0x114;
-/// The highest key code the kernel defines, `KEY_MAX`.
-const KEY_MAX: u16 = 0x2ff;
 const INPUT_PROP_POINTER: u32 = 0;
 const INPUT_PROP_DIRECT: u32 = 1;
 const BUS_USB: u16 = 0x03;
@@ -736,7 +737,10 @@ impl Injector {
         );
         let keyboard = Device::create("OpenUUYC 虚拟键盘", |device| {
             device.event_type(EV_KEY)?;
-            for code in 1..=KEY_MAX {
+            // 键盘键（`evdev` 能映射到的都在 256 以下）之外什么也不声明：声明
+            // BTN_TOUCH、BTN_TOOL_* 或手柄那一段会让 udev 与 libinput 把这台设备
+            // 判成别的东西。鼠标按键不在这台设备上，它们归相对指针。
+            for code in 1..0x100u16 {
                 device.key(code)?;
             }
             device.event_type(EV_LED)?;
@@ -832,6 +836,14 @@ impl Injector {
     /// 有没有虚拟绝对指针。有它，引擎才可能按合成器布局定位。
     pub(super) fn has_absolute_pointer(&self) -> bool {
         self.absolute.is_some()
+    }
+
+    /// 有没有虚拟多点触摸屏。没有 `/dev/uinput` 写权限、设备建失败、或者写入失败
+    /// 后被丢掉时都没有；auto 选的 Xorg 会话根本不建 uinput，见 `Injector::open`。
+    /// 触摸选路先问它（见 `engine_linux` 的 `choose_route`），好让选出来的路与
+    /// 日志属实。
+    pub(super) fn has_touchscreen(&self) -> bool {
+        self.touchscreen.is_some()
     }
 
     pub(super) fn key(&mut self, key: u16, down: bool) -> Result<()> {

@@ -1,10 +1,12 @@
 //! Controlled-session input injection on Linux.
 //!
-//! Two backends sit behind one set of calls. On Wayland, and on a locked
-//! screen, only a virtual device will do, and that is what `uinput` creates.
-//! X Test is the fallback: it needs no permission at all, but it can only
-//! reach an Xorg session's clients, which is why it is no longer the default
-//! once `/dev/uinput` is writable.
+//! Two backends sit behind one set of calls. In a Wayland session X Test only
+//! reaches XWayland clients, so keys, buttons and motion go through a uinput
+//! device there, as Sunshine does (it needs write access to `/dev/uinput`,
+//! granted by the udev rule the packages ship). An Xorg session keeps X Test
+//! alone: it needs no permission and positions the pointer absolutely, while a
+//! uinput pointer there would only add libinput's acceleration and drift the
+//! landing point.
 //!
 //! `OPENUUYC_INPUT` picks between them explicitly (`uinput`, `xtest`), and
 //! any other value is an error rather than a silent choice: a session that
@@ -100,13 +102,21 @@ impl Injector {
         match chosen.trim() {
             "uinput" => Ok(Self::UInput(uinput::Injector::open()?)),
             "xtest" => Ok(Self::XTest(xtest::Injector::open()?)),
-            "auto" => match uinput::Injector::open() {
-                Ok(injector) => Ok(Self::UInput(injector)),
-                Err(error) => {
-                    tracing::info!(%error, "uinput unavailable, falling back to XTest");
-                    Ok(Self::XTest(xtest::Injector::open()?))
+            "auto" => {
+                // Xorg 会话里 XTest 本来就把指针绝对定位，而且不需要任何权限；
+                // 换成 uinput 只会让位移经 libinput 加速，落点飘移。所以非 Wayland
+                // 会话直接走 XTest，uinput 只在 Wayland 建。
+                if !super::capture::wayland_session() {
+                    return Ok(Self::XTest(xtest::Injector::open()?));
                 }
-            },
+                match uinput::Injector::open() {
+                    Ok(injector) => Ok(Self::UInput(injector)),
+                    Err(error) => {
+                        tracing::info!(%error, "uinput unavailable, falling back to XTest");
+                        Ok(Self::XTest(xtest::Injector::open()?))
+                    }
+                }
+            }
             other => {
                 bail!("OPENUUYC_INPUT 中有未知的注入方式：{other}（可选 uinput、xtest、auto）")
             }
@@ -118,6 +128,15 @@ impl Injector {
     /// layout; X Test is resolved by X, in X's rectangles.
     pub fn has_absolute_pointer(&self) -> bool {
         matches!(self, Self::UInput(injector) if injector.has_absolute_pointer())
+    }
+
+    /// 有没有虚拟多点触摸屏。触摸选路先问它，好让选出来的路与日志属实（见
+    /// `features::host::input::engine_linux` 的 `choose_route`）。
+    pub fn has_touchscreen(&self) -> bool {
+        match self {
+            Self::XTest(_) => false,
+            Self::UInput(injector) => injector.has_touchscreen(),
+        }
     }
 
     /// What the diagnostics page calls this session's injector.
