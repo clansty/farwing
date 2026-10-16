@@ -256,3 +256,221 @@ impl Pool {
             .for_each(|reserved| *reserved = false);
     }
 }
+
+#[cfg(test)]
+mod dmabuf_probe {
+    use super::*;
+    use cros_libva::{Image, VA_FOURCC_NV12};
+
+    /// 观看端零拷贝唯一的未知数：解出来的 surface 导出成 dma-buf 之后，能不能按
+    /// 「单平面 R8 / R8G8 + 显式平面布局」重新导进 Vulkan，导出来的纹素又对不对。
+    /// surface 上的修饰符是驱动自己挑的（AMD 上是带 DCC 的），radv 未必肯按同一个
+    /// 修饰符把单平面视图导回来，而导错了的样子是花屏不是报错，所以要真的比像素。
+    ///
+    /// `cargo test --release --lib -- --ignored --nocapture vaapi_surface_exports_into_wgpu`
+    #[test]
+    #[ignore = "需要 render node 上与 wgpu 同一张卡，且驱动支持 VK_EXT_image_drm_format_modifier"]
+    fn vaapi_surface_exports_into_wgpu() {
+        const WIDTH: u32 = 256;
+        const HEIGHT: u32 = 128;
+        let display = display().expect("VA-API 打不开");
+        let format = display
+            .query_image_formats()
+            .expect("查不到图像格式")
+            .into_iter()
+            .find(|format| format.fourcc == VA_FOURCC_NV12)
+            .expect("驱动不提供 NV12");
+        let surfaces = display
+            .create_surfaces(
+                RT_FORMAT_YUV420,
+                None,
+                WIDTH,
+                HEIGHT,
+                // 解码器现在只报 DECODER。EXPORT 这一位是给 Mesa 看的：带上它驱动
+                // 就不会分配 DCC 这类导出去也没法采样的布局。
+                Some(UsageHint::USAGE_HINT_DECODER | UsageHint::USAGE_HINT_EXPORT),
+                vec![(); 1],
+            )
+            .expect("分配 surface 失败");
+        let surface = &surfaces[0];
+
+        // 图案同时依赖 x 与 y：行距猜错、原点偏移都会读出来不对。
+        let expected: Vec<u8> = (0..HEIGHT)
+            .flat_map(|y| (0..WIDTH).map(move |x| (x.wrapping_mul(3).wrapping_add(y)) as u8))
+            .collect();
+        {
+            let mut image = Image::create_from(surface, format, (WIDTH, HEIGHT), (WIDTH, HEIGHT))
+                .expect("vaCreateImage 失败");
+            let info = *image.image();
+            let (offset, pitch) = (info.offsets[0] as usize, info.pitches[0] as usize);
+            let (chroma_offset, chroma_pitch) = (info.offsets[1] as usize, info.pitches[1] as usize);
+            let data = image.as_mut();
+            for y in 0..HEIGHT as usize {
+                let row = offset + y * pitch;
+                data[row..row + WIDTH as usize]
+                    .copy_from_slice(&expected[y * WIDTH as usize..][..WIDTH as usize]);
+            }
+            for y in 0..(HEIGHT as usize).div_ceil(2) {
+                let row = chroma_offset + y * chroma_pitch;
+                data[row..row + WIDTH as usize].fill(0x80);
+            }
+        }
+
+        let prime = surface.export_prime().expect("导出 dma-buf 失败");
+        eprintln!(
+            "导出：fourcc=0x{:08x} {}x{} 对象={} 层={}",
+            prime.fourcc,
+            prime.width,
+            prime.height,
+            prime.objects.len(),
+            prime.layers.len()
+        );
+        for (index, object) in prime.objects.iter().enumerate() {
+            eprintln!(
+                "  对象 {index}：修饰符 0x{:x}，{} 字节",
+                object.drm_format_modifier, object.size
+            );
+        }
+        let layer = &prime.layers[0];
+        eprintln!(
+            "  层：drm_format=0x{:08x} 平面数={}",
+            layer.drm_format, layer.num_planes
+        );
+        for plane in 0..layer.num_planes as usize {
+            eprintln!(
+                "    平面 {plane}：偏移 {} 行距 {}",
+                layer.offset[plane], layer.pitch[plane]
+            );
+        }
+
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            ..wgpu::InstanceDescriptor::new_without_display_handle_from_env()
+        });
+        let adapter =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+                .expect("没有 Vulkan 适配器");
+        eprintln!("适配器：{:?}", adapter.get_info());
+        let features = adapter.features() & wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF;
+        eprintln!("导入特性：{features:?}");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("dmabuf-probe"),
+            required_features: features,
+            required_limits: wgpu::Limits::downlevel_defaults(),
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
+            trace: wgpu::Trace::Off,
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+        }))
+        .expect("创建 Vulkan 设备失败");
+
+        // 一块 dma-buf 可以导出多次，每次导入都会接管 fd，所以要一份一份 dup。
+        let import = |plane: usize,
+                      size: (u32, u32),
+                      format: wgpu::TextureFormat|
+         -> Result<wgpu::Texture, String> {
+            let object = &prime.objects[layer.object_index[plane] as usize];
+            let descriptor = wgpu::hal::TextureDescriptor {
+                label: Some("dmabuf-plane"),
+                size: wgpu::Extent3d {
+                    width: size.0,
+                    height: size.1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUses::COPY_SRC,
+                memory_flags: wgpu::hal::MemoryFlags::empty(),
+                view_formats: Vec::new(),
+            };
+            let handle = unsafe { device.as_hal::<wgpu::hal::api::Vulkan>() }
+                .ok_or("设备不是 Vulkan")?;
+            let hal = unsafe {
+                handle.texture_from_dmabuf_fd(
+                    object.fd.try_clone().map_err(|e| e.to_string())?,
+                    &descriptor,
+                    object.drm_format_modifier,
+                    layer.pitch[plane] as u64,
+                    layer.offset[plane] as u64,
+                )
+            }
+            .map_err(|error| format!("texture_from_dmabuf_fd: {error:?}"))?;
+            Ok(unsafe {
+                device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(
+                    hal,
+                    &wgpu::TextureDescriptor {
+                        label: Some("dmabuf-plane"),
+                        size: descriptor.size,
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format,
+                        usage: wgpu::TextureUsages::COPY_SRC,
+                        view_formats: &[],
+                    },
+                    // 内容由 VA-API 写好了、布局也已经是对的，跳过首次转换以免
+                    // wgpu 按「未初始化」把这一份丢掉。
+                    wgpu::TextureUses::COPY_SRC,
+                )
+            })
+        };
+
+        let luma = import(0, (WIDTH, HEIGHT), wgpu::TextureFormat::R8Unorm)
+            .unwrap_or_else(|error| panic!("Y 平面导入失败：{error}"));
+        eprintln!("Y 平面导入成功：R8");
+        match import(
+            1,
+            (WIDTH / 2, HEIGHT / 2),
+            wgpu::TextureFormat::Rg8Unorm,
+        ) {
+            Ok(_) => eprintln!("色度平面导入成功：R8G8"),
+            Err(error) => eprintln!("色度平面导入失败（Y 能导就还能走单平面的路）：{error}"),
+        }
+
+        let bytes_per_row = WIDTH.div_ceil(256) * 256;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: u64::from(bytes_per_row) * u64::from(HEIGHT),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &luma,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(HEIGHT),
+                },
+            },
+            wgpu::Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([encoder.finish()]);
+        let slice = buffer.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("等待 GPU 失败");
+        let mapped = slice.get_mapped_range().expect("映射回读缓冲失败");
+        let wrong = (0..HEIGHT as usize)
+            .filter(|y| {
+                mapped[y * bytes_per_row as usize..][..WIDTH as usize]
+                    != expected[y * WIDTH as usize..][..WIDTH as usize]
+            })
+            .count();
+        eprintln!("读回 Y 平面：{} 行与图案不符（共 {HEIGHT} 行）", wrong);
+        assert_eq!(wrong, 0, "导入的纹理内容不对，说明平面布局或修饰符没对上");
+    }
+}
