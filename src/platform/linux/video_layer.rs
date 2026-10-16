@@ -29,6 +29,11 @@ struct Uniform {
     extent: [f32; 2],
     /// Texture-space rotation matrix, column major.
     rotation: [f32; 4],
+    /// 采样用的子矩形：`xy` 是原点、`zw` 是缩放（都是纹理空间的 0..1）。
+    /// 零拷贝那条路拿到的纹理是解码用的 **coded** 尺寸（1080p 实际是 1088 高，
+    /// 左边/上边还可能被 SPS 裁掉），可见区只是它的一块，得按这个矩形取。
+    /// CPU 那条路拷出来的就是紧致的可见区，恒为 (0, 0, 1, 1)。
+    source: [f32; 4],
     /// Affine YUV to RGB rows, one per colour component.
     transform: [[f32; 4]; 3],
 }
@@ -52,7 +57,12 @@ struct Frame {
     bind_group: wgpu::BindGroup,
     width: u32,
     height: u32,
+    /// 采样矩形，见 `Uniform::source`。
+    source: [f32; 4],
 }
+
+/// 紧致纹理的采样矩形：整张。
+const FULL_SOURCE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
 
 impl Frame {
     const fn is_nv12(&self) -> bool {
@@ -82,6 +92,7 @@ impl VideoLayer {
                 offset: [0.0, 0.0],
                 extent: [1.0, 1.0],
                 rotation: [1.0, 0.0, 0.0, 1.0],
+                source: FULL_SOURCE,
                 transform: [[0.0; 4]; 3],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
@@ -152,6 +163,7 @@ impl VideoLayer {
                 bind_group,
                 width,
                 height,
+                source: FULL_SOURCE,
             });
         }
         let Some(Frame {
@@ -225,6 +237,7 @@ impl VideoLayer {
                 bind_group,
                 width,
                 height,
+                source: FULL_SOURCE,
             });
         }
         let Some(Frame {
@@ -270,6 +283,7 @@ impl VideoLayer {
                 offset: [center_x, center_y],
                 extent: [placement.width / width, placement.height / height],
                 rotation,
+                source: frame.source,
                 transform,
             }),
         );
@@ -445,6 +459,7 @@ struct Uniform {
     offset: vec2<f32>,
     extent: vec2<f32>,
     rotation: vec4<f32>,
+    source: vec4<f32>,
     transform0: vec4<f32>,
     transform1: vec4<f32>,
     transform2: vec4<f32>,
@@ -473,7 +488,9 @@ fn vs_main(@builtin(vertex_index) index: u32) -> VertexOutput {
         settings.rotation.z, settings.rotation.w,
     );
     let rotated = matrix * (corner - vec2<f32>(0.5, 0.5));
-    out.uv = rotated + vec2<f32>(0.5, 0.5);
+    let unit = rotated + vec2<f32>(0.5, 0.5);
+    // coded 纹理上只取可见的那一块（见 Rust 侧 `Uniform::source`）。
+    out.uv = settings.source.xy + unit * settings.source.zw;
     return out;
 }
 
