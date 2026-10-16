@@ -22,6 +22,12 @@ use winit::window::{Window, WindowId};
 const HIDDEN_TICK: Duration = Duration::from_millis(250);
 /// The shortest, so an animation request cannot spin a window-less pass.
 const HIDDEN_MIN_TICK: Duration = Duration::from_millis(50);
+/// 通知区域的主人（面板、状态栏）常常比程序晚起来，服务随会话启动时尤其如此，
+/// 所以托盘没建出来就按这个间隔接着试，直到它出现。
+const TRAY_RETRY: Duration = Duration::from_secs(2);
+/// 等这么久还没有通知区域就不再干等：`--background` 也要把窗口建出来，否则
+/// 界面藏在一个够不着的地方，而进程还占着实例锁。
+const TRAY_GRACE: Duration = Duration::from_secs(15);
 
 pub(super) fn run(config: WindowConfig, factory: AppFactory) -> Result<()> {
     #[cfg_attr(not(windows), allow(unused_mut))]
@@ -76,6 +82,58 @@ fn sync_tray(tray: Option<&super::tray::Tray>, controlled: bool) {
     }
 }
 
+/// 图形会话还在不在。合成器没了的时候窗口建不出来，而 [`Runner::create`] 的失败
+/// 会连着应用一起析构，那条路可能僵在后台 worker 的收尾上，所以建窗口之前先看一眼。
+/// 看的是窗口系统自己的连接点，不是 D-Bus 上的服务。
+#[cfg(unix)]
+fn graphical_session_ready() -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    fn is_socket(path: &std::path::Path) -> bool {
+        std::fs::metadata(path)
+            .map(|meta| meta.file_type().is_socket())
+            .unwrap_or(false)
+    }
+    if let Some(display) = std::env::var_os("WAYLAND_DISPLAY") {
+        let display = std::path::PathBuf::from(display);
+        return if display.is_absolute() {
+            is_socket(&display)
+        } else {
+            std::env::var_os("XDG_RUNTIME_DIR")
+                .map(|dir| is_socket(&std::path::Path::new(&dir).join(display)))
+                .unwrap_or(false)
+        };
+    }
+    // X11 的 DISPLAY 要连上才能确认，这里至少看它有没有人设置。
+    std::env::var_os("DISPLAY").is_some()
+}
+
+#[cfg(not(unix))]
+fn graphical_session_ready() -> bool {
+    true
+}
+
+/// 把迟到的托盘接回来，返回是否刚建出来。通知区域的主人是桌面会话里的另一个
+/// 进程，比程序先起来不是它能保证的事（systemd 那边也只能等到图形会话），而
+/// 托盘的有无决定窗口关闭是「收进托盘」还是「结束程序」，所以它得是能恢复的
+/// 状态，不是启动时的一次判定。
+fn retry_tray(tray: &mut Option<super::tray::Tray>, wanted: bool, next: &mut Instant) -> bool {
+    if !wanted || tray.is_some() || Instant::now() < *next {
+        return false;
+    }
+    *next = Instant::now() + TRAY_RETRY;
+    match super::tray::Tray::new() {
+        Ok(new) => {
+            tracing::info!("通知区域可用了，窗口关闭改为收进托盘");
+            *tray = Some(new);
+            true
+        }
+        Err(error) => {
+            tracing::debug!(error = %format!("{error:#}"), "通知区域仍不可用");
+            false
+        }
+    }
+}
+
 struct Runner {
     root: bool,
     closed: bool,
@@ -105,6 +163,11 @@ struct Hidden {
     app: AppSession,
     context: egui::Context,
     tray: Option<super::tray::Tray>,
+    /// 托盘还没建出来时在这里接着试，见 [`retry_tray`]。
+    wants_tray: bool,
+    next_tray_attempt: Instant,
+    /// 到这个时刻还没有通知区域就把窗口建出来；已经收进托盘的那种隐藏没有期限。
+    tray_deadline: Option<Instant>,
     /// egui 的纹理和管线都在绘制资源里，丢了就等于所有文字都要重新上载一遍。
     /// 以 `--background` 启动时还没建过窗口，第一份绘制资源要等窗口建出来才有。
     retained: Option<Retained>,
@@ -143,6 +206,21 @@ impl Hidden {
         let now = Instant::now();
         if now < self.next_pass {
             return HiddenPass::Wait(self.next_pass);
+        }
+        if retry_tray(&mut self.tray, self.wants_tray, &mut self.next_tray_attempt) {
+            sync_tray(self.tray.as_ref(), self.app.0.controlled());
+            // 托盘来了，就不用再拿窗口当退路。
+            self.tray_deadline = None;
+        }
+        if self.tray_deadline.is_some_and(|deadline| now >= deadline) {
+            if graphical_session_ready() {
+                self.tray_deadline = None;
+                tracing::warn!("等不到通知区域，改为把主窗口显示出来");
+                return HiddenPass::Show;
+            }
+            // 图形会话不在了：窗口这会儿建不出来，等下一次再看。
+            self.tray_deadline = Some(now + TRAY_GRACE);
+            tracing::info!("图形会话不在了，先不建窗口");
         }
         let mut input = egui::RawInput {
             screen_rect: self.screen,
@@ -244,6 +322,9 @@ struct DesktopWindow {
     /// Only where the window cannot be hidden in place (Wayland).
     hide_requested: bool,
     tray: Option<super::tray::Tray>,
+    /// 托盘还没建出来时在这里接着试，见 [`retry_tray`]。
+    wants_tray: bool,
+    next_tray_attempt: Instant,
     exiting: bool,
     show_after_present: bool,
     /// Read only on Windows; see its use after the first present.
@@ -300,6 +381,8 @@ impl Runner {
             app,
             context,
             tray,
+            wants_tray,
+            next_tray_attempt,
             presenter,
             input,
             mut viewport,
@@ -318,6 +401,10 @@ impl Runner {
             app,
             context,
             tray,
+            wants_tray,
+            next_tray_attempt,
+            // 收进托盘的前提就是托盘在，这里没有等待的期限。
+            tray_deadline: None,
             retained,
             size,
             position,
@@ -343,7 +430,7 @@ impl Runner {
 
     /// 后台启动：只把应用、egui 上下文与托盘立起来，窗口、surface 与绘制资源都不建。
     /// 托盘里点「打开」再走 [`Runner::create`]，那是同一个窗口的正常创建路径。
-    fn start_hidden(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
+    fn start_hidden(&mut self) -> Result<()> {
         let context = egui::Context::default();
         super::fonts::install(&context);
         context.set_embed_viewports(true);
@@ -354,24 +441,25 @@ impl Runner {
         let mut app = AppSession(factory(&context, None));
         app.0.on_focus_changed(false);
         let wants_tray = self.root && app.0.uses_tray();
-        // 没有通知区域就把窗口建出来：否则界面被藏在一个够不着的地方，
-        // 而进程还占着实例锁，用户再点一次图标也打不开。
-        let tray = wants_tray.then(super::tray::Tray::new).and_then(|tray| {
-            tray.inspect_err(
-                |error| tracing::warn!(error = %format!("{error:#}"), "tray unavailable"),
-            )
-            .ok()
-        });
+        let mut tray = None;
+        let mut next_tray_attempt = Instant::now();
+        retry_tray(&mut tray, wants_tray, &mut next_tray_attempt);
         tracing::info!(
             tray = tray.is_some(),
             "以不显示主窗口的方式启动（--background）"
         );
         sync_tray(tray.as_ref(), app.0.controlled());
-        let missing_tray = wants_tray && tray.is_none();
+        // 通知区域这会儿不在，多半是面板还没起来：等它一会儿，而不是立刻把窗口
+        // 摆出来。真没有通知区域的桌面（没有状态栏）才走建窗口那条路——界面藏在
+        // 一个够不着的地方，进程又占着实例锁，那样才更糟。
+        let tray_deadline = (wants_tray && tray.is_none()).then(|| Instant::now() + TRAY_GRACE);
         self.hidden = Some(Hidden {
             app,
             context,
             tray,
+            wants_tray,
+            next_tray_attempt,
+            tray_deadline,
             retained: None,
             size: None,
             position: None,
@@ -383,9 +471,6 @@ impl Runner {
             next_pass: Instant::now() + HIDDEN_TICK,
             deferred: None,
         });
-        if missing_tray {
-            return self.create(event_loop);
-        }
         if self.root {
             crate::application::bootstrap::ready();
         }
@@ -397,7 +482,7 @@ impl Runner {
             return Ok(());
         }
         // 收进托盘过的主窗口沿用原来的应用、egui 上下文与绘制资源重建，其余才新建。
-        let (context, app, tray, retained, restore, deferred) = match self.hidden.take() {
+        let (context, app, mut tray, retained, restore, deferred) = match self.hidden.take() {
             Some(Hidden {
                 app,
                 context,
@@ -532,20 +617,18 @@ impl Runner {
             }
         };
         let uses_tray = self.root && app.0.uses_tray();
-        // Without a notification area the window keeps its ordinary close
-        // behaviour rather than hiding where it cannot be reached.
-        let tray = match tray {
-            Some(tray) => Some(tray),
-            None if uses_tray => {
-                crate::application::app::instance::register_window(&window)?;
-                super::tray::Tray::new()
-                    .inspect_err(
-                        |error| tracing::warn!(error = %format!("{error:#}"), "tray unavailable"),
-                    )
-                    .ok()
-            }
-            None => None,
-        };
+        // 再点一次图标要能找到这个窗口（Windows 按 HWND 找进程）。
+        if uses_tray && tray.is_none() {
+            crate::application::app::instance::register_window(&window)?;
+        }
+        // 没有通知区域时窗口保留普通的关闭行为，而不是藏到一个够不着的地方；
+        // 但托盘可能只是还没起来，所以交给 retry_tray 接着试：它起来了，关闭
+        // 就又是收进托盘。托盘建不出来不该拦着窗口本身。
+        let mut next_tray_attempt = Instant::now();
+        retry_tray(&mut tray, uses_tray, &mut next_tray_attempt);
+        if uses_tray && tray.is_none() {
+            tracing::warn!("通知区域不可用，先按没有托盘运行");
+        }
         // 恢复出来的窗口可能正被别人看/控着，角标要当场对上，别等下一次渲染。
         sync_tray(tray.as_ref(), app.0.controlled());
         let refresh = window
@@ -553,13 +636,6 @@ impl Runner {
             .and_then(|monitor| monitor.refresh_rate_millihertz())
             .filter(|rate| *rate != 0)
             .unwrap_or(60_000);
-        let tray = if uses_tray {
-            Some(super::tray::Tray::new()?)
-        } else {
-            None
-        };
-        // 主窗口可能一上来就是收进托盘的状态，角标要当场对上。
-        sync_tray(tray.as_ref(), app.0.controlled());
         self.state = Some(DesktopWindow {
             hide_on_drop: HideOnDrop(window.clone()),
             app,
@@ -570,6 +646,8 @@ impl Runner {
             close_requested: false,
             hide_requested: false,
             tray,
+            wants_tray: uses_tray,
+            next_tray_attempt,
             exiting: false,
             // 重建出来的窗口总是要显示的。
             show_after_present: restore.is_some() || self.config.viewport.visible.unwrap_or(true),
@@ -674,6 +752,9 @@ impl DesktopWindow {
         // 标题栏提示与托盘角标共用这一次判定。
         let alert = self.app.0.title_bar_alert();
         let controlled = alert.is_some();
+        retry_tray(&mut self.tray, self.wants_tray, &mut self.next_tray_attempt);
+        // 收进托盘后窗口不再呈现，但这一趟 UI 照跑，角标跟着走。
+        sync_tray(self.tray.as_ref(), controlled);
         let output = self.context.run_ui(input, |ui| {
             let ctx = ui.ctx().clone();
             super::chrome::resize_regions(ui, &self.window, |response, direction| {
@@ -710,8 +791,6 @@ impl DesktopWindow {
             self.app.0.ui(ui);
             super::controls::show_notices(ui.ctx());
         });
-        // 收进托盘后窗口不再呈现，但这一趟 UI 照跑，角标跟着走。
-        sync_tray(self.tray.as_ref(), controlled);
         let (drawing, platform, mut viewports) = split_output(output);
         self.input.handle_platform_output(&self.window, platform);
         if let Some(root) = viewports.remove(&egui::ViewportId::ROOT) {
@@ -817,7 +896,7 @@ impl DesktopWindow {
 impl ApplicationHandler<Event> for Runner {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let result = if self.starts_hidden() {
-            self.start_hidden(event_loop)
+            self.start_hidden()
         } else {
             self.create(event_loop)
         };
