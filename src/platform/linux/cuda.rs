@@ -56,6 +56,29 @@ struct Api {
     get_error_string: unsafe extern "C" fn(CuResult, *mut *const c_char) -> CuResult,
 }
 
+/// 打开任何 VA-API 显示之前先调一次。
+///
+/// nvidia-vaapi-driver 在库构造器里就调 `cuInit`，而构造器是在 `dlopen` 内、
+/// 动态加载器的锁里跑的；进程的首次 `cuInit` 自己又会 `dlopen` 一批库。于是 VA
+/// 解码在 NVIDIA 节点上点名那个驱动时，若另一线程（NvFBC / NVENC）正同时跑首次
+/// `cuInit`，两边就永久互等——没有 panic 也没有日志，现场只表现为卡死。这里提前把
+/// CUDA 的初始化走完，构造器再进 `cuInit` 就没什么可等的了。没有 NVIDIA render
+/// node 的机器根本不会加载那个驱动。
+pub(crate) fn initialize_before_va() {
+    let nvidia = std::fs::read_dir("/sys/class/drm")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("renderD"))
+        .any(|entry| {
+            std::fs::read_to_string(entry.path().join("device/vendor"))
+                .is_ok_and(|vendor| vendor.trim() == "0x10de")
+        });
+    if nvidia && let Err(error) = api() {
+        tracing::debug!(%error, "CUDA 在 VA-API 初始化前不可用");
+    }
+}
+
 fn api() -> Result<&'static Api> {
     static API: OnceLock<Result<Api, String>> = OnceLock::new();
     API.get_or_init(|| load().map_err(|error| format!("{error:#}")))

@@ -187,6 +187,9 @@ pub(crate) fn display_node() -> Option<(String, u16)> {
 }
 
 fn open_display() -> Option<Rc<Display>> {
+    // 显示节点可能是 NVIDIA，下面会 dlopen 出 nvidia VA 驱动；先把 CUDA 初始化
+    // 走完，免得驱动构造器里的首次 cuInit 和 NvFBC/NVENC 互等（见 cuda.rs）。
+    super::cuda::initialize_before_va();
     if let Some((path, vendor)) = display_node() {
         if let Ok(display) = Display::open_drm_display(&path) {
             return Some(display);

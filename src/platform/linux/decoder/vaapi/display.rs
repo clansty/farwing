@@ -33,6 +33,9 @@ pub(super) fn display() -> Result<Rc<Display>, DecodeError> {
 }
 
 fn open_display() -> Result<Rc<Display>, DecodeError> {
+    // 这里的 `Display::open` 会扫到 NVIDIA 节点并 dlopen 出 nvidia VA 驱动，
+    // 先把 CUDA 初始化走完，免得驱动构造器里的首次 cuInit 和 NvFBC/NVENC 互等。
+    crate::platform::linux::cuda::initialize_before_va();
     // `Display::open` walks the render nodes itself; the explicit loop is the
     // fallback for systems where the first node is not the decoding one.
     if let Some(display) = Display::open()

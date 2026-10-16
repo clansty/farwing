@@ -60,6 +60,11 @@ fn get_va_version(va_h_path: &str) -> (u32, u32) {
 }
 
 fn main() {
+    // 这些 cfg 由本脚本按构建机头文件版本发出，但消费者在别处按名引用，
+    // 得先声明，否则新版工具链报 unexpected_cfgs。
+    for version in [16, 19, 20, 21] {
+        println!("cargo::rustc-check-cfg=cfg(libva_1_{version}_or_higher)");
+    }
     // Do not require dependencies when generating docs.
     if std::env::var("CARGO_DOC").is_ok() || std::env::var("DOCS_RS").is_ok() {
         return;
