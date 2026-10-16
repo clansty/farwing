@@ -53,7 +53,8 @@ pub(crate) fn receive(uri: &str) {
             queue.link = Some(link);
         }
         Err(error) => {
-            tracing::warn!(uri, "无法处理的协助链接：{error:#}");
+            // 链接里带着验证码，日志只留失败理由，不留原文。
+            tracing::warn!("无法处理协助链接：{error:#}");
             if queue.failed.len() >= MAX_FAILED {
                 queue.failed.pop_front();
             }

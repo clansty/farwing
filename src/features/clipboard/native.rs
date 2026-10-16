@@ -1457,7 +1457,12 @@ fn parse_descriptors(bytes: &[u8]) -> Result<Vec<ClipboardFileDescriptor>> {
         out.push(ClipboardFileDescriptor {
             file_name: name,
             file_attributes: u32at(36),
-            last_write_time: u32at(56) as u64 | ((u32at(60) as u64) << 32),
+            // FD_WRITESTIME 没置位就是这个槽里没有时间，别当成 1601 年用。
+            last_write_time: if u32at(0) & 0x20 != 0 {
+                u32at(56) as u64 | ((u32at(60) as u64) << 32)
+            } else {
+                0
+            },
             file_size: u32at(68) as u64 | ((u32at(64) as u64) << 32),
         });
     }

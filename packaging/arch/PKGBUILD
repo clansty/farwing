@@ -18,7 +18,7 @@ _pkgname=openuuyc
 pkgname=$_pkgname-clansty
 # 基准版本来自 Cargo.toml 的 [package].version，pkgver() 会再读一次并追加 .r<rev>.g<hash>。
 # 版本号里的 `-`（-clansty 这种预发布后缀）要换成 `.`：pacman 的 pkgver 里不能有连字符。
-pkgver=1.0.2.beta.3.clansty
+pkgver=1.0.2.beta.5.clansty1
 pkgrel=1
 pkgdesc='UU 远程（UU Remote）协议的第三方 Rust 客户端：远控别人，或被本机远控'
 arch=('x86_64')
