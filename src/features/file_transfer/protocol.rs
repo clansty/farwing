@@ -494,5 +494,23 @@ pub(crate) struct Header {
     #[prost(int64, tag = "1")]
     pub id: i64,
 }
+// 官方主控在会话里发这条顶层通知（main.proto 的 Message 26 号 oneof 分支，指向
+// general.proto 的 RemoteDownloadPath）声明它的下载路径；官方被控端会收下它。
+// 官方主控随后的 send_request 只带任务号、path 为空，所以被控端要么收下这条，
+// 要么就没有源路径可用。字段名与号来自官方二进制内嵌的 proto 描述符，不是猜的。
+#[derive(Clone, PartialEq, Message)]
+pub(crate) struct RemoteDownloadPath {
+    #[prost(string, tag = "1")]
+    pub download_path: String,
+}
+#[derive(Clone, PartialEq, Message)]
+pub(crate) struct DownloadPathEnvelope {
+    #[prost(int64, tag = "1")]
+    pub sequence: i64,
+    #[prost(int64, tag = "2")]
+    pub timestamp: i64,
+    #[prost(message, optional, tag = "26")]
+    pub download: Option<RemoteDownloadPath>,
+}
 pub(crate) use FileTransferFtpRequestKind as Req;
 pub(crate) use FileTransferFtpResponseKind as Res;

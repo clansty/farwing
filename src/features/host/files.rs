@@ -76,7 +76,7 @@ impl Receiver {
     // Admit only file envelopes and never block ACK/input delivery on disk or IPC.
     pub fn receive_control(&self, bytes: &[u8]) -> Result<bool> {
         let decoded = executor::decode(bytes)?;
-        if decoded.is_none() && !executor::settings_requested(bytes)? {
+        if decoded.is_none() && !executor::addressed(bytes)? {
             return Ok(false);
         }
         let delivery = {
@@ -98,7 +98,7 @@ impl Receiver {
     }
     pub async fn receive(&self, channel: &Arc<RTCDataChannel>, bytes: &[u8]) -> Result<bool> {
         let decoded = executor::decode(bytes)?;
-        if decoded.is_none() && !executor::settings_requested(bytes)? {
+        if decoded.is_none() && !executor::addressed(bytes)? {
             return Ok(false);
         }
         if decoded.is_some_and(|v| v.is_directory()) {

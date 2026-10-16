@@ -9,7 +9,10 @@ mod transfer;
 use super::{BLOCK, Payload, WIRE, protocol::*, storage};
 use anyhow::{Context, Result, ensure};
 use prost::Message;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -48,6 +51,32 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Option<Incoming>> {
 }
 pub(crate) fn settings_requested(bytes: &[u8]) -> Result<bool> {
     metrics::requested(bytes)
+}
+/// 顶层 Message 的 26 号 oneof 分支（general.proto 的 RemoteDownloadPath，编码
+/// `d2 01 <len> 0a <len> <path>`）：官方主控用它声明下载路径，官方被控端
+/// （GameViewerServer.exe，比较 oneof 序号 0x1a 后把路径交给一个虚函数）会收下它。
+/// 我们此前整条丢掉。只扫键与长度、不整份解码，因为这条判断跑在每个入站文件包上
+/// （含大块 FileBlock）。
+pub(crate) fn download_path(bytes: &[u8]) -> Result<Option<String>> {
+    let mut fields = bytes;
+    let mut payload = None;
+    while !fields.is_empty() {
+        let (tag, wire) = prost::encoding::decode_key(&mut fields)?;
+        if (3..=28).contains(&tag) {
+            payload = Some(tag);
+        }
+        prost::encoding::skip_field(wire, tag, &mut fields, Default::default())?;
+    }
+    if payload != Some(26) {
+        return Ok(None);
+    }
+    Ok(DownloadPathEnvelope::decode(bytes)?
+        .download
+        .map(|v| v.download_path))
+}
+/// 既不需要文件执行器之外的处理、又要送进执行器的消息（会话设置、下载源路径）。
+pub(crate) fn addressed(bytes: &[u8]) -> Result<bool> {
+    Ok(settings_requested(bytes)? || download_path(bytes)?.is_some())
 }
 pub(super) fn failure(error: &anyhow::Error) -> i32 {
     if let Some(code) = error.downcast_ref::<ErrorCode>() {
@@ -177,6 +206,9 @@ pub(crate) struct Engine {
     stop: CancellationToken,
     seen_requests: std::collections::HashSet<i64>,
     retired_tasks: std::collections::HashSet<i32>,
+    // 主控声明的下载源路径，供随后不带 path 的 send_request 使用；
+    // 与传输任务共享，因为两个通道的到达顺序不保证。
+    download_path: Arc<Mutex<Option<String>>>,
 }
 struct Task {
     generation: u64,
@@ -202,9 +234,17 @@ impl Engine {
             stop: CancellationToken::new(),
             seen_requests: Default::default(),
             retired_tasks: Default::default(),
+            download_path: Default::default(),
         })
     }
     pub async fn receive(&mut self, bytes: &[u8], capabilities: Capabilities) -> Result<()> {
+        if let Some(path) = download_path(bytes)? {
+            // 一次会话只来一条，而且它到底指什么还没定论（见 send() 里的判断），
+            // 所以留在 info 上：这条是查「官方主控的下载请求没有源路径」唯一的线索。
+            tracing::info!(path, len = path.len(), "host remote download path received");
+            *super::lock(&self.download_path) = Some(path);
+            return Ok(());
+        }
         while let Some(done) = self.work.try_join_next() {
             if let Ok(Some((id, generation))) = done
                 && self
@@ -324,6 +364,7 @@ impl Engine {
         let output = self.output.clone();
         let stop = self.stop.child_token();
         let journal = self.journal.clone();
+        let download_path = self.download_path.clone();
         if initial {
             ensure!(self.tasks.len() < 8, "同时传输的文件任务过多");
             let id = message.payload.task().context("文件任务缺少编号")?.task_id;
@@ -362,6 +403,7 @@ impl Engine {
                     discard,
                     capabilities,
                     journal,
+                    download_path,
                 )
                 .await;
                 Some((id, generation))
@@ -415,5 +457,52 @@ impl Engine {
 impl Drop for Engine {
     fn drop(&mut self) {
         self.stop.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prost::Message as _;
+
+    /// 官方主控点下载时先发的顶层消息：字段 26 = RemoteDownloadPath{path}。
+    fn download_path_message(path: &str) -> Vec<u8> {
+        DownloadPathEnvelope {
+            sequence: 0,
+            timestamp: 0,
+            download: Some(RemoteDownloadPath {
+                download_path: path.to_owned(),
+            }),
+        }
+        .encode_to_vec()
+    }
+    /// 实机抓到的官方主控下载请求（26 字节）：SendRequest 只带 TaskId，path 为空。
+    const SEND_REQUEST: &[u8] = &[
+        0xaa, 0x01, 0x17, 0x0a, 0x02, 0x08, 0x1c, 0x42, 0x11, 0x12, 0x0f, 0x0a, 0x0d, 0x08, 0x1c,
+        0x10, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01,
+    ];
+
+    #[test]
+    fn remote_download_path_is_read_from_the_envelope() {
+        let bytes = download_path_message("/home/clansty/Downloads/报告.pdf");
+        // 与实机日志里的 `d2 01 <len> 0a <len> ...` 前缀一致。
+        assert_eq!(&bytes[..2], &[0xd2, 0x01]);
+        assert_eq!(
+            download_path(&bytes).unwrap().as_deref(),
+            Some("/home/clansty/Downloads/报告.pdf")
+        );
+        assert!(addressed(&bytes).unwrap());
+    }
+
+    #[test]
+    fn a_transfer_request_is_not_a_download_path() {
+        assert_eq!(download_path(SEND_REQUEST).unwrap(), None);
+        assert!(!addressed(SEND_REQUEST).unwrap());
+        // 这条确实是我们要处理的空路径下载请求。
+        let decoded = decode(SEND_REQUEST).unwrap().unwrap();
+        assert!(matches!(
+            decoded.payload,
+            Payload::Request(Req::SendRequest(FileTransferSendRequest { ref path, .. })) if path.is_empty()
+        ));
     }
 }

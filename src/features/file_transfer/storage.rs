@@ -242,7 +242,7 @@ pub(super) fn local_path(value: &str) -> Result<PathBuf> {
             && bytes[0].is_ascii_alphabetic()
             && bytes[1] == b':'
             && matches!(bytes[2], b'/' | b'\\'),
-        "仅支持本地磁盘的绝对路径"
+        "仅支持本地磁盘的绝对路径：{text}"
     );
     let mut result = PathBuf::from(format!("{}:\\", bytes[0] as char));
     let tail = text[3..].trim_end_matches(['\\', '/']);
@@ -275,7 +275,9 @@ pub(super) fn local_path(value: &str) -> Result<PathBuf> {
         PathBuf::from(value)
     };
     let text = path.to_str().context("文件路径无效")?;
-    ensure!(text.starts_with('/'), "仅支持本地磁盘的绝对路径");
+    // 把收到的值带上：这条曾经只报「仅支持本地磁盘的绝对路径」，而对面（官方主控）
+    // 到底发了什么形式完全看不出来，排查时只能干瞪眼。
+    ensure!(text.starts_with('/'), "仅支持本地磁盘的绝对路径：{text}");
     let mut result = PathBuf::from("/");
     let tail = text.trim_matches('/');
     if !tail.is_empty() {

@@ -14,6 +14,7 @@ struct Rpc {
     stop: CancellationToken,
     capabilities: Capabilities,
     progress: notices::Progress,
+    download_path: Arc<Mutex<Option<String>>>,
 }
 impl Rpc {
     fn id(&self, index: i32) -> Option<TaskId> {
@@ -88,6 +89,7 @@ pub(super) async fn run(
     discard: Arc<std::sync::atomic::AtomicBool>,
     capabilities: Capabilities,
     journal: notices::Journal,
+    download_path: Arc<Mutex<Option<String>>>,
 ) {
     let task = first.payload.task().expect("checked initial task").task_id;
     let mut rpc = Rpc {
@@ -109,6 +111,7 @@ pub(super) async fn run(
             first.payload,
             Payload::Request(Req::ReceiveRequest(_))
         )),
+        download_path,
     };
     let key = match &first.payload {
         Payload::Request(Req::ReceiveRequest(v)) => Some(v.task_unique_id.clone()),
@@ -431,8 +434,39 @@ async fn receive(
 async fn send(rpc: &mut Rpc, v: FileTransferSendRequest) -> Result<()> {
     let stop = rpc.stop.clone();
     let id = v.id.clone();
+    // 官方主控的下载请求不带 path：源路径由先到的 RemoteDownloadPath 顶层消息给出，
+    // 而那条走 CONTROL、这条走 TEXT，两个通道的到达顺序不保证，因此留一小段等待窗口。
+    let mut path = v.path.clone();
+    // 这条路径是「主控在会话建立时声明的下载路径」，不是这一条请求指名要的文件：
+    // 我们记下来了，但它指到目录时不敢照发（见下面的判断）。
+    let mut advertised = false;
+    if path.is_empty() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(known) = super::super::lock(&rpc.download_path).clone() {
+                path = known;
+                advertised = true;
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tracing::info!(task = rpc.task, found = !path.is_empty(), "host file send without path");
+    }
     let scan = tokio::task::spawn_blocking(move || -> Result<_> {
-        let source = filesystem::local_path(&v.path)?;
+        ensure!(!path.is_empty(), "下载请求未给出源路径");
+        let source = filesystem::local_path(&path)?;
+        // 官方主控点下载时发的 send_request 只有任务号、没有 path（实机抓到的 26 字节
+        // 就是这么回事），源路径只可能来自会话建立时那条「远端下载路径」。可那条只有
+        // 十几字节，装不下它随后浏览的 /home/clansty/Downloads，所以还不能认定它就是要
+        // 发的东西：指到单个文件就照用，指到目录宁可失败——凭一个猜出来的路径把整棵
+        // 目录推出去，比下载不动更糟。
+        ensure!(
+            !(advertised && source.is_dir()),
+            "主控只声明了下载路径而没有指名文件，不按目录整棵发送：{path}"
+        );
         let (root, folder, mut files) = storage::scan(&source, &stop)?;
         if !v.list_data.is_empty() {
             let requested = storage::decompress::<FileList>(&v.list_data)?.files;
