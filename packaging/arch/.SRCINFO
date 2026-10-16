@@ -37,6 +37,8 @@ pkgbase = openuuyc-clansty
 	optdepends = ethtool: 远程开机时检查网卡的魔术包唤醒状态
 	optdepends = hwdata: 用 pci.ids 给上报的显卡取名（/usr/share/hwdata/pci.ids）
 	optdepends = gnome-shell-extension-appindicator: GNOME 下显示托盘图标（KDE/Xfce 等自带托盘）
+	optdepends = glib2: 被控端拼拖动预览图时用 gio 取文件图标（缺了就不带图）
+	optdepends = librsvg: 被控端拼拖动预览图时用 rsvg-convert 画矢量图标（缺了就不带图）
 	provides = openuuyc=1.0.2.beta.3.clansty
 	conflicts = openuuyc
 	conflicts = openuuyc-bin

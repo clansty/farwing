@@ -31,7 +31,9 @@ depends = """$auto, fuse3, libx11-6, libx11-xcb1, libxcursor1, libxrandr2, libxi
 libxfixes3, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, \
 libvulkan1 | libegl1, \
 fonts-noto-cjk | fonts-wqy-microhei | fonts-arphic-uming"""
-recommends = "libpulse0, libpipewire-0.3-0, gnome-keyring | kwalletmanager"
+# gio（libglib2.0-bin）与 rsvg-convert（librsvg2-bin）用来拼被控端的拖动预览图，
+# 缺了它们拖出去就没有预览图。
+recommends = "libpulse0, libpipewire-0.3-0, gnome-keyring | kwalletmanager, libglib2.0-bin, librsvg2-bin"
 suggests = "ethtool"
 assets = [
     ["target/release/OpenUUYC", "usr/bin/", "755"],
@@ -41,6 +43,7 @@ assets = [
     ["packaging/linux/openuuyc-vkms.service", "usr/lib/systemd/system/", "644"],
     ["packaging/linux/openuuyc.desktop", "usr/share/applications/", "644"],
     ["packaging/linux/70-openuuyc-uinput.rules", "usr/lib/udev/rules.d/", "644"],
+    ["packaging/linux/openuuyc.service", "usr/lib/systemd/user/", "644"],
     ["assets/icon-256.png", "usr/share/icons/hicolor/256x256/apps/openuuyc.png", "644"],
     ["README.md", "usr/share/doc/openuuyc/", "644"],
     ["THIRD_PARTY_NOTICES", "usr/share/doc/openuuyc/", "644"],

@@ -70,6 +70,8 @@ optdepends=(
   'ethtool: 远程开机时检查网卡的魔术包唤醒状态'
   'hwdata: 用 pci.ids 给上报的显卡取名（/usr/share/hwdata/pci.ids）'
   'gnome-shell-extension-appindicator: GNOME 下显示托盘图标（KDE/Xfce 等自带托盘）'
+  'glib2: 被控端拼拖动预览图时用 gio 取文件图标（缺了就不带图）'
+  'librsvg: 被控端拼拖动预览图时用 rsvg-convert 画矢量图标（缺了就不带图）'
 )
 
 # 带上版本是为了让「依赖 openuuyc>=x」的包能对上；不带也不影响互斥。
