@@ -138,15 +138,25 @@ impl LinuxVideoDecoder {
         }
         let decoder = match &mut self.backend {
             Backend::Hardware(session) => {
-                let frame = session.decode(payload, self.notification.cancellation())?;
-                self.pending
-                    .push_back(PlatformDecodedFrame::Cpu(CpuVideoFrame {
-                        pts: token,
-                        width: frame.width,
-                        height: frame.height,
-                        format: CpuFormat::Nv12,
-                        data: Bytes::from(frame.data),
-                    }));
+                match session.decode(payload, self.notification.cancellation())? {
+                    vaapi::Output::Cpu(frame) => {
+                        self.pending
+                            .push_back(PlatformDecodedFrame::Cpu(CpuVideoFrame {
+                                pts: token,
+                                width: frame.width,
+                                height: frame.height,
+                                format: CpuFormat::Nv12,
+                                data: Bytes::from(frame.data),
+                            }));
+                    }
+                    // 解码端的零拷贝这一半已经就绪，渲染端（纹理导入与采样子矩形）
+                    // 还没接上；眼下唯一能开它的方式是 `OPENUUYC_DECODER_ZEROCOPY=1`，
+                    // 那就明确报错，不要悄悄丢掉一帧。
+                    vaapi::Output::DmaBuf(_) => {
+                        tracing::error!("解码端零拷贝的渲染端尚未接上");
+                        return Err(DecodeError::Unsupported);
+                    }
+                }
                 return Ok(());
             }
             Backend::Software(decoder) => decoder,

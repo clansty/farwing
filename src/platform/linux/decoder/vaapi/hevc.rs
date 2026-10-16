@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use cros_libva::{
     BufferType, HevcLongSliceFlags, HevcPicFields, HevcSliceParsingFields, IQMatrix,
-    IQMatrixBufferHEVC, Picture, PictureHEVC, PictureParameter, PictureParameterBufferHEVC,
+    IQMatrixBufferHEVC, Image, Picture, PictureHEVC, PictureParameter, PictureParameterBufferHEVC,
     SliceParameter, SliceParameterBufferHEVC, VAProfile, VASurfaceID,
 };
 use openuuyc_codec::syntax::hevc::{
@@ -28,6 +28,7 @@ use openuuyc_codec::syntax::hevc::{
 
 use super::avc::Frame;
 use super::display::{self, Pool};
+use super::{Output, zero_copy_available, zero_copy_give_up};
 use super::hevc_ref_list::{RefPicListParams, ResolvedRps, build_ref_pic_lists};
 use super::output;
 use crate::media::decode_api::DecodeError;
@@ -94,7 +95,7 @@ impl Hevc {
         &mut self,
         data: &[u8],
         cancel: &AtomicBool,
-    ) -> Result<Frame, DecodeError> {
+    ) -> Result<Output, DecodeError> {
         let result = self.decode_inner(data, cancel);
         if result.is_err() {
             self.reset();
@@ -103,7 +104,7 @@ impl Hevc {
     }
 
     #[allow(clippy::too_many_lines, reason = "One access unit, start to finish.")]
-    fn decode_inner(&mut self, data: &[u8], cancel: &AtomicBool) -> Result<Frame, DecodeError> {
+    fn decode_inner(&mut self, data: &[u8], cancel: &AtomicBool) -> Result<Output, DecodeError> {
         if cancel.load(Ordering::Acquire) {
             return Err(DecodeError::Closed);
         }
@@ -363,6 +364,8 @@ impl Hevc {
         }
 
         let pool = self.pool.as_mut().ok_or(DecodeError::Backend)?;
+        // 渲染器放掉的那些 surface 先收回来，再挑一张空闲的。
+        pool.reclaim();
         let (index, surface) = pool.take()?;
         let surface_id = pool.id(index);
 
@@ -414,6 +417,7 @@ impl Hevc {
 
         self.timestamp = self.timestamp.wrapping_add(1);
         let context = pool.context.clone();
+        let zero_copy = pool.zero_copy && zero_copy_available();
         let decoded = submit_hevc(
             &context,
             surface,
@@ -422,8 +426,9 @@ impl Hevc {
             pool.nv12,
             (pool.width, pool.height),
             visible,
+            zero_copy,
         );
-        let (frame, surface) = match decoded {
+        let (output, surface) = match decoded {
             Ok(decoded) => decoded,
             Err(error) => {
                 self.pool = None;
@@ -431,7 +436,16 @@ impl Hevc {
             }
         };
         let pool = self.pool.as_mut().ok_or(DecodeError::Backend)?;
-        pool.put(index, surface);
+        // 零拷贝这一帧的 surface 借给渲染器，等它放下那一帧再收回来；其余照旧还回去。
+        let output = match output {
+            Output::DmaBuf(frame) => {
+                Output::DmaBuf(frame.with_lease(pool.check_out(index, surface)))
+            }
+            cpu => {
+                pool.put(index, surface);
+                cpu
+            }
+        };
 
         if nal.temporal_id == 0 && !(kind.is_rasl() || kind.is_radl() || kind.is_slnr()) {
             self.poc.update_prev_tid0(poc);
@@ -447,7 +461,7 @@ impl Hevc {
             .as_mut()
             .ok_or(DecodeError::Backend)?
             .reserve_only(&reserved);
-        Ok(frame)
+        Ok(output)
     }
 
     fn ensure_pool(
@@ -470,7 +484,16 @@ impl Hevc {
         if !display::supports(profile, width, height) {
             return Err(DecodeError::Unsupported);
         }
-        self.pool = Some(Pool::new(profile, width, height, dpb + 1)?);
+        // 零拷贝时多留几个槽位：渲染器可能同时握着两三帧，池子空一次就要
+        // 等它放回来。不导出时这几位不占显存。
+        let extra = if zero_copy_available() { 6 } else { 0 };
+        self.pool = Some(Pool::new(
+            profile,
+            width,
+            height,
+            dpb + 1 + extra,
+            zero_copy_available(),
+        )?);
         self.profile = profile;
         tracing::info!(profile, width, height, dpb, "VA-API HEVC session created");
         Ok(())
@@ -1014,7 +1037,8 @@ fn submit_hevc(
     format: cros_libva::VAImageFormat,
     coded: (u32, u32),
     visible: output::VisibleRect,
-) -> Result<(Frame, Surface), DecodeError> {
+    zero_copy: bool,
+) -> Result<(Output, Surface), DecodeError> {
     let backend = |stage: &'static str| {
         move |error: cros_libva::VaError| {
             tracing::debug!(%error, stage, "VA-API HEVC decode failed");
@@ -1040,20 +1064,35 @@ fn submit_hevc(
         .map_err(|(error, _)| backend("sync")(error))?;
     // 读回整幅 coded surface，裁剪交给 pack_nv12 按原点取，这样左边/上边的
     // 裁剪也能还原；vaCreateImage 表达不了原点。
-    let output::VisibleRect { width, height, .. } = visible;
-    let frame = picture
-        .create_image(format, coded, coded)
-        .map_err(backend("create_image"))
-        .and_then(|image| output::pack_nv12(&image, visible))?;
     let surface = picture
         .take_surface()
         .unwrap_or_else(|_| unreachable!("the picture owns its surface alone"));
-    Ok((
-        Frame {
-            width,
-            height,
-            data: frame,
-        },
-        surface,
-    ))
+    let output = decode_output(&surface, format, coded, visible, zero_copy);
+    Ok((output?, surface))
+}
+
+/// 同 `avc::decode_output`：优先导出 dma-buf，导不出来就退回 CPU 拷贝。
+fn decode_output(
+    surface: &Surface,
+    format: cros_libva::VAImageFormat,
+    coded: (u32, u32),
+    visible: output::VisibleRect,
+    zero_copy: bool,
+) -> Result<Output, DecodeError> {
+    if zero_copy {
+        match output::export_nv12(surface, visible) {
+            Ok(frame) => return Ok(Output::DmaBuf(frame)),
+            Err(error) => zero_copy_give_up(&error),
+        }
+    }
+    let output::VisibleRect { width, height, .. } = visible;
+    let image = Image::create_from(surface, format, coded, coded).map_err(|error| {
+        tracing::debug!(%error, "vaCreateImage 失败");
+        DecodeError::HardwareFailure
+    })?;
+    Ok(Output::Cpu(Frame {
+        width,
+        height,
+        data: output::pack_nv12(&image, visible)?,
+    }))
 }

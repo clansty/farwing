@@ -17,6 +17,46 @@ use crate::media::decode_api::{DecodeError, VideoDecoderConfig};
 
 pub(super) use avc::Frame;
 
+/// 一帧解码结果：要么已经拷回内存，要么是解码 surface 直接导出的 dma-buf。
+pub(super) enum Output {
+    Cpu(Frame),
+    DmaBuf(output::DmaBufFrame),
+}
+
+/// 解码端零拷贝是否开着。**目前默认关**：解码这一半（导出 dma-buf + surface 租约）已经
+/// 完成并验过（`display.rs` 里的 dmabuf 探测：导出的两个平面导进 radv 后像素逐字节一致），
+/// 但渲染端还没接上——纹理导入、采样子矩形（coded 与可见尺寸差着宏块填充）与图
+/// 形界面的开关是下一步。`OPENUUYC_DECODER_ZEROCOPY=1` 可以提前打开（当前会明确报错）。
+/// 导出失败一次之后整体不再试：这类失败基本是驱动或格式层面的。
+fn zero_copy_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("OPENUUYC_DECODER_ZEROCOPY").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
+
+fn zero_copy_given_up() -> bool {
+    static GIVEN_UP: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    GIVEN_UP.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// 导出失败：这一帧已经退回 CPU 拷贝了，以后不再试。
+pub(super) fn zero_copy_available() -> bool {
+    zero_copy_enabled() && !zero_copy_given_up()
+}
+
+pub(super) fn zero_copy_give_up(error: &DecodeError) {
+    static GIVEN_UP: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if !GIVEN_UP.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        tracing::info!(?error, "解码端零拷贝放弃，退回 CPU 拷贝");
+    }
+}
+
 pub(super) struct Session {
     codec: Codec,
     /// The parameter sets from the negotiation, prepended to the first access
@@ -71,7 +111,7 @@ impl Session {
         &mut self,
         payload: &[u8],
         cancel: &std::sync::atomic::AtomicBool,
-    ) -> Result<Frame, DecodeError> {
+    ) -> Result<Output, DecodeError> {
         let extra = self.extra.take().filter(|extra| !extra.is_empty());
         let combined;
         let data = match extra {

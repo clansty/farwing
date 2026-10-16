@@ -8,9 +8,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use cros_libva::{
-    BufferType, H264PicFields, H264SeqFields, IQMatrix, IQMatrixBufferH264, Picture, PictureH264,
-    PictureParameter, PictureParameterBufferH264, SliceParameter, SliceParameterBufferH264,
-    VAProfile, VASurfaceID,
+    BufferType, H264PicFields, H264SeqFields, IQMatrix, IQMatrixBufferH264, Image, Picture,
+    PictureH264, PictureParameter, PictureParameterBufferH264, SliceParameter,
+    SliceParameterBufferH264, VAProfile, VASurfaceID,
 };
 use openuuyc_h264::headers::Headers;
 use openuuyc_h264::syntax::{
@@ -23,6 +23,7 @@ use openuuyc_h264::syntax::{
 };
 
 use super::display::{self, Pool};
+use super::{Output, zero_copy_available, zero_copy_give_up};
 use super::output;
 use super::ref_list::{RplmOp, init_ref_pic_list_p, init_ref_pic_lists_b, modify_ref_pic_list};
 use crate::media::decode_api::DecodeError;
@@ -94,7 +95,7 @@ impl Avc {
         &mut self,
         data: &[u8],
         cancel: &AtomicBool,
-    ) -> Result<Frame, DecodeError> {
+    ) -> Result<Output, DecodeError> {
         let result = self.decode_inner(data, cancel);
         if result.is_err() {
             self.reset();
@@ -103,7 +104,7 @@ impl Avc {
     }
 
     #[allow(clippy::too_many_lines, reason = "One access unit, start to finish.")]
-    fn decode_inner(&mut self, data: &[u8], cancel: &AtomicBool) -> Result<Frame, DecodeError> {
+    fn decode_inner(&mut self, data: &[u8], cancel: &AtomicBool) -> Result<Output, DecodeError> {
         if cancel.load(Ordering::Acquire) {
             return Err(DecodeError::Closed);
         }
@@ -211,6 +212,8 @@ impl Avc {
         .map_err(|_| DecodeError::InvalidInput)?;
 
         let pool = self.pool.as_mut().ok_or(DecodeError::Backend)?;
+        // 渲染器放掉的那些 surface 先收回来，再挑一张空闲的。
+        pool.reclaim();
         let (index, surface) = pool.take()?;
         let surface_id = pool.id(index);
         let max_frame_num = 1u32 << (sps.log2_max_frame_num_minus4 + 4);
@@ -256,8 +259,9 @@ impl Avc {
             coded: (pool.width, pool.height),
             visible,
         };
-        let decoded = submit(&context, surface, buffers, self.timestamp, readback);
-        let (frame, surface) = match decoded {
+        let zero_copy = pool.zero_copy && zero_copy_available();
+        let decoded = submit(&context, surface, buffers, self.timestamp, readback, zero_copy);
+        let (output, surface) = match decoded {
             Ok(decoded) => decoded,
             Err(error) => {
                 // The failed picture took the surface with it, so the pool can
@@ -267,7 +271,16 @@ impl Avc {
             }
         };
         let pool = self.pool.as_mut().ok_or(DecodeError::Backend)?;
-        pool.put(index, surface);
+        // 零拷贝这一帧的 surface 借给渲染器，等它放下那一帧再收回来；其余照旧还回去。
+        let output = match output {
+            Output::DmaBuf(frame) => {
+                Output::DmaBuf(frame.with_lease(pool.check_out(index, surface)))
+            }
+            cpu => {
+                pool.put(index, surface);
+                cpu
+            }
+        };
 
         self.poc = poc_state;
         self.mmco5 = false;
@@ -327,7 +340,7 @@ impl Avc {
             .ok_or(DecodeError::Backend)?
             .reserve_only(&reserved);
         self.need_idr = false;
-        Ok(frame)
+        Ok(output)
     }
 
     fn ensure_pool(
@@ -351,7 +364,16 @@ impl Avc {
             return Err(DecodeError::Unsupported);
         }
         // One extra surface for the picture being decoded right now.
-        self.pool = Some(Pool::new(profile, width, height, dpb + 1)?);
+        // 零拷贝时多留几个槽位：渲染器可能同时握着两三帧，池子空一次就要
+        // 等它放回来。不导出时这几位不占显存。
+        let extra = if zero_copy_available() { 6 } else { 0 };
+        self.pool = Some(Pool::new(
+            profile,
+            width,
+            height,
+            dpb + 1 + extra,
+            zero_copy_available(),
+        )?);
         self.profile = profile;
         tracing::info!(profile, width, height, dpb, "VA-API H.264 session created");
         Ok(())
@@ -842,7 +864,7 @@ fn visible_rect(
     })
 }
 
-/// Hand the picture to the driver and copy the result out.
+/// Hand the picture to the driver and take the result out.
 ///
 /// A failure before the sync point consumes the surface with the picture, so
 /// the caller must drop the whole pool rather than return the surface to it.
@@ -852,7 +874,8 @@ fn submit(
     buffers: Vec<BufferType>,
     timestamp: u64,
     readback: Readback,
-) -> Result<(Frame, Surface), DecodeError> {
+    zero_copy: bool,
+) -> Result<(Output, Surface), DecodeError> {
     // A driver-level failure is not worth retrying on the next keyframe; the
     // pool switches decoders immediately on HardwareFailure.
     let backend = |stage: &'static str| {
@@ -882,22 +905,37 @@ fn submit(
     // one, refuse it; vaCreateImage + vaGetImage is the portable readback.
     // 读回整幅 coded surface，裁剪交给 pack_nv12 按原点取，这样左边/上边的
     // 裁剪也能还原；vaCreateImage 表达不了原点。
-    let output::VisibleRect { width, height, .. } = readback.visible;
-    let frame = picture
-        .create_image(readback.format, readback.coded, readback.coded)
-        .map_err(backend("create_image"))
-        .and_then(|image| output::pack_nv12(&image, readback.visible));
     let surface = picture
         .take_surface()
         .unwrap_or_else(|_| unreachable!("the picture owns its surface alone"));
-    Ok((
-        Frame {
-            width,
-            height,
-            data: frame?,
-        },
-        surface,
-    ))
+    let output = decode_output(&surface, readback, zero_copy);
+    Ok((output?, surface))
+}
+
+/// 把已经解码好的 surface 变成交给渲染器的那一份：优先导出 dma-buf（零拷贝），
+/// 导不出来就退回 `vaCreateImage` + `pack_nv12` 的 CPU 拷贝。
+fn decode_output(
+    surface: &Surface,
+    readback: Readback,
+    zero_copy: bool,
+) -> Result<Output, DecodeError> {
+    if zero_copy {
+        match output::export_nv12(surface, readback.visible) {
+            Ok(frame) => return Ok(Output::DmaBuf(frame)),
+            Err(error) => zero_copy_give_up(&error),
+        }
+    }
+    let output::VisibleRect { width, height, .. } = readback.visible;
+    let image = Image::create_from(surface, readback.format, readback.coded, readback.coded)
+        .map_err(|error| {
+            tracing::debug!(%error, "vaCreateImage 失败");
+            DecodeError::HardwareFailure
+        })?;
+    Ok(Output::Cpu(Frame {
+        width,
+        height,
+        data: output::pack_nv12(&image, readback.visible)?,
+    }))
 }
 
 #[cfg(test)]
@@ -908,12 +946,17 @@ mod crop_tests {
     #[test]
     #[ignore = "requires a VA-API H.264 decoder and render-node access"]
     fn vaapi_decodes_1080p_cropped_fixture() {
-        let frame = Avc::new()
+        // 这个测试看的是拷回内存那一路；零拷贝默认是关的，所以这里必定是 Cpu。
+        let frame = match Avc::new()
             .decode(
                 include_bytes!("testdata/crop-1080.h264"),
                 &AtomicBool::new(false),
             )
-            .expect("VA-API decode");
+            .expect("VA-API decode")
+        {
+            Output::Cpu(frame) => frame,
+            Output::DmaBuf(_) => panic!("零拷贝不应该在默认设置下打开"),
+        };
         assert_eq!((frame.width, frame.height), (1920, 1080));
         let plane = 1920 * 1080;
         assert_eq!(frame.data.len(), plane * 3 / 2);

@@ -201,3 +201,81 @@ mod tests {
         .is_err());
     }
 }
+
+/// 导出成 dma-buf 的一个平面。渲染器按单平面把它导成一张纹理。
+pub(crate) struct DmaBufPlane {
+    /// 原件。每次导入 Vulkan 都会接管 fd，所以渲染器那边要 dup 一份。
+    pub(crate) fd: std::os::fd::OwnedFd,
+    pub(crate) modifier: u64,
+    pub(crate) offset: u64,
+    pub(crate) pitch: u64,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
+/// 一帧直接从解码 surface 交出去的 NV12。
+///
+/// 实测（`display.rs` 里的 dmabuf 探测）radv 能按 radeonsi 给的修饰符把 `R8` / `R8G8`
+/// 两个单平面视图导回来、像素与写进去的一致，所以渲染器沿用现有那两张 NV12 纹理，只是
+/// 不再经 CPU 拷一遍。纹理是 **coded** 尺寸（带宏块填充），采样要按 `origin`/可见尺寸取子矩形。
+pub(crate) struct DmaBufFrame {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) origin: (u32, u32),
+    pub(crate) planes: [DmaBufPlane; 2],
+    /// surface 的租约，跟着这一帧走到渲染器放掉它为止。渲染端只当它是「别提前析构」
+    /// 的把手，不需要认识里面的类型，所以这个字段本身不对外。
+    lease: Option<super::display::SurfaceLease>,
+}
+
+impl DmaBufFrame {
+    pub(super) fn with_lease(mut self, lease: super::display::SurfaceLease) -> Self {
+        self.lease = Some(lease);
+        self
+    }
+}
+
+/// 把一张 NV12 surface 的两个平面导出成 dma-buf。
+///
+/// 只认 `vaExportSurfaceHandle` 给的 NV12（单层两平面）：平面 0 是 R8、平面 1 是
+/// R8G8，各自的偏移与行距都照搬。任何一步不符合就返回错误，让调用方退回 CPU 那条路。
+pub(crate) fn export_nv12(
+    surface: &cros_libva::Surface<()>,
+    rect: VisibleRect,
+) -> Result<DmaBufFrame, DecodeError> {
+    let failed = |error: cros_libva::VaError| {
+        tracing::debug!(%error, "导出解码 surface 的 dma-buf 失败");
+        DecodeError::HardwareFailure
+    };
+    let prime = surface.export_prime().map_err(failed)?;
+    if prime.fourcc != cros_libva::VA_FOURCC_NV12 || prime.layers.len() != 1 {
+        tracing::debug!(fourcc = prime.fourcc, "解码 surface 不是 NV12，不能零拷贝");
+        return Err(DecodeError::Unsupported);
+    }
+    let layer = &prime.layers[0];
+    if layer.num_planes != 2 {
+        return Err(DecodeError::Unsupported);
+    }
+    let coded = (prime.width, prime.height);
+    let plane = |index: usize| -> Result<DmaBufPlane, DecodeError> {
+        let object = prime
+            .objects
+            .get(usize::from(layer.object_index[index]))
+            .ok_or(DecodeError::HardwareFailure)?;
+        Ok(DmaBufPlane {
+            fd: object.fd.try_clone().map_err(|_| DecodeError::HardwareFailure)?,
+            modifier: object.drm_format_modifier,
+            offset: u64::from(layer.offset[index]),
+            pitch: u64::from(layer.pitch[index]),
+            width: coded.0 >> index,
+            height: coded.1 >> index,
+        })
+    };
+    Ok(DmaBufFrame {
+        width: rect.width,
+        height: rect.height,
+        origin: (rect.x, rect.y),
+        planes: [plane(0)?, plane(1)?],
+        lease: None,
+    })
+}

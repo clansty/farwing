@@ -4,6 +4,8 @@
 //! the driver and is far too expensive to repeat per session.
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use cros_libva::{
     Config, Context, Display, Surface, UsageHint, VAConfigAttrib, VAConfigAttribType, VAEntrypoint,
@@ -150,12 +152,35 @@ pub(super) struct Pool {
     pub(super) height: u32,
     /// The NV12 image format used to copy pictures out of their surfaces.
     pub(super) nv12: VAImageFormat,
+    /// 这池子的 surface 是否按「要导出成 dma-buf」分配（带上 `USAGE_HINT_EXPORT`，
+    /// 驱动据此避开 DCC 这类导出去也没法采样的布局），以及解码后是否真的导出。
+    pub(super) zero_copy: bool,
     surfaces: Vec<Option<Surface<()>>>,
     ids: Vec<VASurfaceID>,
     /// Surfaces still needed as references, by index.
     reserved: Vec<bool>,
+    /// 已经借给渲染器、还没还回来的 surface。`Surface` 不是 `Send`（里头是
+    /// `Rc<Display>`），所以它一步都不离开解码线程；跨线程走的只有租约里的释放标志。
+    checked_out: Vec<(usize, Surface<()>, Arc<LeaseState>)>,
     #[allow(dead_code, reason = "Owns the config for the context's lifetime.")]
     config: Config,
+}
+
+/// 一帧借出去的 surface 的租约。
+///
+/// 解码器把 surface 导成 dma-buf 交给渲染器之后，**不能**立刻把它还给池子：下一帧
+/// 可能就解到同一张 surface 上，正在显示的那一帧会跟着变。渲染器握着这把租约，直到
+/// 那一帧被换掉才放手；解码线程在下一次解码前用 [`Pool::reclaim`] 收回来。
+pub(super) struct SurfaceLease(Arc<LeaseState>);
+
+struct LeaseState {
+    released: AtomicBool,
+}
+
+impl Drop for SurfaceLease {
+    fn drop(&mut self) {
+        self.0.released.store(true, Ordering::Release);
+    }
 }
 
 impl Pool {
@@ -164,6 +189,7 @@ impl Pool {
         width: u32,
         height: u32,
         count: usize,
+        zero_copy: bool,
     ) -> Result<Self, DecodeError> {
         let display = display()?;
         let config = display
@@ -179,15 +205,15 @@ impl Pool {
                 tracing::debug!(%error, "VA-API config unavailable");
                 DecodeError::Unsupported
             })?;
+        // EXPORT 这一位只在真要导出时才带：驱动（Mesa）据此避开 DCC 这类布局，
+        // 但也可能因此少一点解码优化，不导出时没必要付这份代价。
+        let hint = if zero_copy {
+            UsageHint::USAGE_HINT_DECODER | UsageHint::USAGE_HINT_EXPORT
+        } else {
+            UsageHint::USAGE_HINT_DECODER
+        };
         let surfaces = display
-            .create_surfaces(
-                RT_FORMAT_YUV420,
-                None,
-                width,
-                height,
-                Some(UsageHint::USAGE_HINT_DECODER),
-                vec![(); count],
-            )
+            .create_surfaces(RT_FORMAT_YUV420, None, width, height, Some(hint), vec![(); count])
             .map_err(|error| {
                 tracing::debug!(%error, count, "VA-API surface allocation failed");
                 DecodeError::HardwareFailure
@@ -216,6 +242,8 @@ impl Pool {
             width,
             height,
             nv12,
+            zero_copy,
+            checked_out: Vec::new(),
             reserved: vec![false; surfaces.len()],
             surfaces: surfaces.into_iter().map(Some).collect(),
             ids,
@@ -241,6 +269,26 @@ impl Pool {
 
     pub(super) fn put(&mut self, index: usize, surface: Surface<()>) {
         self.surfaces[index] = Some(surface);
+    }
+
+    /// 把渲染器已经放掉的 surface 收回来。每次解码前调一次。
+    pub(super) fn reclaim(&mut self) {
+        for (index, surface, lease) in std::mem::take(&mut self.checked_out) {
+            if lease.released.load(Ordering::Acquire) {
+                self.surfaces[index] = Some(surface);
+            } else {
+                self.checked_out.push((index, surface, lease));
+            }
+        }
+    }
+
+    /// 借出一张 surface，返回给渲染器跟着的那把租约。
+    pub(super) fn check_out(&mut self, index: usize, surface: Surface<()>) -> SurfaceLease {
+        let state = Arc::new(LeaseState {
+            released: AtomicBool::new(false),
+        });
+        self.checked_out.push((index, surface, Arc::clone(&state)));
+        SurfaceLease(state)
     }
 
     /// Mark exactly the surfaces the reference lists still name.
