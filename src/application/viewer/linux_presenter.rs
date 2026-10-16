@@ -1558,7 +1558,8 @@ impl Player {
             toggle_fullscreen(window);
         }
 
-        // 1:1 那格在 Wayland 下没有可写的地方（合成器不给客户端摆窗口）。
+        // 1:1 也还没做：Windows 那边只是往右下 request_inner_size，不挪窗口，
+        // Wayland 上也做得到。
         row.add_enabled_ui(false, |ui| {
             caption_button(ui, ViewerCaptionIcon::OneToOne, false, "")
         })
@@ -2117,22 +2118,26 @@ impl Player {
                 if down && (self.switching() || self.local_input_blocked) {
                     return false;
                 }
-                if consumed_by_ui || self.input().mode() == MouseMode::View {
-                    return false;
-                }
                 let Some(key) =
                     crate::application::viewer_shortcuts::physical_key(event.physical_key)
                 else {
                     return false;
                 };
-                if down {
-                    if !self.held_keys.contains(&key) {
-                        self.held_keys.push(key);
-                    }
-                } else {
+                // 松开一律放行，且要抢在下面那条 consumed_by_ui/View 守卫之前：远端
+                // 只对它在按着的键有反应，让本机 UI 吞掉一次松开会在远端卡住这个键。
+                // `input().key` 只对仍持有该键的 owner 放行，越权的释放是空操作。
+                if !down {
                     self.held_keys.retain(|held| *held != key);
+                    return self.input().key(self.owner, key, false, None);
                 }
-                self.input().key(self.owner, key, down, None)
+                if consumed_by_ui || self.input().mode() == MouseMode::View {
+                    return false;
+                }
+                // 到这里一定是按下，且本机 UI 没接管：按住/记账。
+                if !self.held_keys.contains(&key) {
+                    self.held_keys.push(key);
+                }
+                self.input().key(self.owner, key, true, None)
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.last_position = Some(*position);
@@ -2171,18 +2176,24 @@ impl Player {
                     relative = self.input().relative_mode(),
                     neutral_wait = self.input().waiting_for_neutral(),
                     "mouse button");
+                let Some(code) = mouse_button(*button) else {
+                    return false;
+                };
+                // 松开一律放行，且要抢在下面那些守卫之前：远端只对它在按着的键有
+                // 反应，让本机弹出层吞掉一次松开会在远端卡住这个键。`input().button`
+                // 只对仍持有该键的 owner 放行，越权的释放是空操作。
+                if !pressed {
+                    self.input().button(self.owner, code, false);
+                    return true;
+                }
                 if dragging || self.local_input_blocked || self.input().mode() == MouseMode::View
                 {
                     return false;
                 }
-                // 松开一律放行：远端只对它在按着的按键有反应。
-                if pressed && (self.switching() || !self.pointer_in_video || ui_dragging) {
+                if self.switching() || !self.pointer_in_video || ui_dragging {
                     return false;
                 }
-                let Some(code) = mouse_button(*button) else {
-                    return false;
-                };
-                self.input().button(self.owner, code, pressed);
+                self.input().button(self.owner, code, true);
                 true
             }
             WindowEvent::MouseWheel { delta, .. } => {
