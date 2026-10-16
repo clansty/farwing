@@ -93,3 +93,5 @@ secrets.json
 !/assets/drivers/display/OpenUUYCDisplay.cat
 !/assets/drivers/audio/OpenUUYCAudio.sys
 !/assets/drivers/audio/OpenUUYCAudio.cat
+# 各血统自己的 cargo target 目录（跨 fork 比对时用，见 AGENTS_QA.md）
+.farwing-*target/
