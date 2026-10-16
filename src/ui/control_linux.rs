@@ -6,14 +6,15 @@
 //! [`crate::application::app::instance`]），Wayland 与 X11 都没有对应的窗口属性，
 //! 这里用 `$XDG_RUNTIME_DIR` 下的一个 unix socket 代替。
 //!
-//! The request is one line, `show`, optionally followed by the launcher's
-//! startup-notification tokens (`wayland=<token>`, `x11=<token>`), which the
-//! running process uses to raise its window past focus-stealing prevention
-//! and to end the launcher's busy feedback. The answer is `ok` or `error`.
+//! The request is one line: `show`, or `open <协助链接>`, optionally followed
+//! by the launcher's startup-notification tokens (`wayland=<token>`,
+//! `x11=<token>`), which the running process uses to raise its window past
+//! focus-stealing prevention and to end the launcher's busy feedback. The
+//! answer is `ok` or `error`.
 //! Both ends give up after [`TIMEOUT`], and every connection is served on its
 //! own thread, so a client that never finishes cannot hold up a later start.
 use crate::platform::linux::startup_notify::{LaunchToken, valid};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -24,6 +25,8 @@ use std::time::Duration;
 const TIMEOUT: Duration = Duration::from_secs(2);
 /// The longest line either end reads.
 const MAX_LINE: u64 = 2048;
+/// 链接本身的上限：给 `open ` 前缀、启动令牌和换行留出余地。
+const MAX_URI: usize = MAX_LINE as usize - 128;
 
 /// 控制通道的生命周期：`run` 结束或进程退出时把 socket 文件清掉。
 pub(crate) struct Control {
@@ -50,34 +53,62 @@ fn socket_path() -> Result<PathBuf> {
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     Show(LaunchToken),
+    /// 系统按 `uuremote://` 协议注册拉起的协助链接：既要把窗口叫出来，也要把
+    /// 链接本身带过去。
+    Open { token: LaunchToken, uri: String },
 }
 
 impl Command {
+    /// 构造打开请求。这里只挡住会撕裂这一行、或撑破一行的链接；链接本身能不能
+    /// 处理由接手的那个进程判断，坏链接也该在它的界面上报出来，而不是死在第二个
+    /// 进程没有控制台的 stderr 里。
+    fn open(uri: &str, token: LaunchToken) -> Result<Self> {
+        ensure!(
+            crate::account::assist::AssistLink::transportable(uri),
+            "协助链接包含空白字符"
+        );
+        ensure!(uri.len() <= MAX_URI, "协助链接过长");
+        Ok(Self::Open {
+            token,
+            uri: uri.to_owned(),
+        })
+    }
+
     fn parse(line: &str) -> Result<Self> {
         let mut words = line.split_ascii_whitespace();
-        match words.next() {
-            Some("show") => {
-                let mut token = LaunchToken::default();
-                for word in words {
-                    // Unknown or malformed fields are dropped: an activation
-                    // without a token still shows the window.
-                    match word.split_once('=') {
-                        Some(("wayland", value)) if valid(value) => {
-                            token.wayland = Some(value.to_owned())
-                        }
-                        Some(("x11", value)) if valid(value) => token.x11 = Some(value.to_owned()),
-                        _ => tracing::debug!(field = word, "控制请求里有无法识别的字段"),
-                    }
-                }
-                Ok(Self::Show(token))
-            }
+        let mut command = match words.next() {
+            Some("show") => Self::Show(LaunchToken::default()),
+            Some("open") => Self::open(
+                words.next().context("打开请求缺少链接")?,
+                LaunchToken::default(),
+            )?,
             _ => bail!("未知的控制请求 {}", line.trim()),
+        };
+        let token = match &mut command {
+            Self::Show(token) | Self::Open { token, .. } => token,
+        };
+        for word in words {
+            // Unknown or malformed fields are dropped: an activation
+            // without a token still shows the window.
+            match word.split_once('=') {
+                Some(("wayland", value)) if valid(value) => {
+                    token.wayland = Some(value.to_owned())
+                }
+                Some(("x11", value)) if valid(value) => token.x11 = Some(value.to_owned()),
+                _ => tracing::debug!(field = word, "控制请求里有无法识别的字段"),
+            }
         }
+        Ok(command)
     }
 
     fn line(&self) -> String {
-        let Self::Show(token) = self;
-        let mut line = "show".to_owned();
+        let mut line = match self {
+            Self::Show(_) => "show".to_owned(),
+            Self::Open { uri, .. } => format!("open {uri}"),
+        };
+        let token = match self {
+            Self::Show(token) | Self::Open { token, .. } => token,
+        };
         if let Some(value) = token.wayland.as_deref().filter(|value| valid(value)) {
             line.push_str(" wayland=");
             line.push_str(value);
@@ -95,6 +126,12 @@ impl Command {
 pub(crate) fn listen() -> Result<Control> {
     listen_at(socket_path()?, |command| match command {
         Command::Show(token) => {
+            super::window_manager::send(super::window_manager::Request::ActivateMain(token))
+        }
+        Command::Open { token, uri } => {
+            // 先入队再叫窗口：窗口（重新）建好后的第一帧就能取到这条链接，
+            // 而不是等下一个超时。
+            crate::application::app::assist_link::receive(&uri);
             super::window_manager::send(super::window_manager::Request::ActivateMain(token))
         }
     })
@@ -185,6 +222,13 @@ pub(crate) fn activate() -> Result<()> {
     activate_at(&socket_path()?, &Command::Show(LaunchToken::from_env()))
 }
 
+/// 第二个进程：把系统拉起的协助链接交给已经在跑的那个实例，并顺便把它的窗口
+/// 叫到前台。链接由接手的一方解析，这里原样搬运。
+pub(crate) fn open_link(uri: &str) -> Result<()> {
+    let command = Command::open(uri, LaunchToken::from_env())?;
+    activate_at(&socket_path()?, &command)
+}
+
 fn activate_at(path: &Path, command: &Command) -> Result<()> {
     let mut stream = UnixStream::connect(path)
         .with_context(|| format!("连接控制通道失败：{}", path.display()))?;
@@ -263,6 +307,33 @@ mod tests {
         );
         assert!(Command::parse("hide\n").is_err());
         assert!(Command::parse("").is_err());
+    }
+
+    #[test]
+    fn assistance_links_travel_whole() {
+        let uri = "uuremote://external/assistance?deviceId=654677613&code=Z4TFVC3K&controlledLogin=1";
+        let command = Command::open(uri, LaunchToken::default()).unwrap();
+        assert_eq!(Command::parse(&command.line()).unwrap(), command);
+        // 链接后面照样跟得上启动令牌。
+        let mut line = command.line();
+        line.insert_str(line.len() - 1, " x11=host-1-0_TIME42");
+        assert_eq!(
+            Command::parse(&line).unwrap(),
+            Command::Open {
+                token: LaunchToken {
+                    wayland: None,
+                    x11: Some("host-1-0_TIME42".into()),
+                },
+                uri: uri.into(),
+            }
+        );
+        // 只挡会撕裂或撑破这一行的链接；语义留给接手的进程判断。
+        assert!(Command::open("uuremote://external/assistance?deviceId=1 2", LaunchToken::default()).is_err());
+        let long = format!(
+            "uuremote://external/assistance?deviceId=654677613&code={}",
+            "A".repeat(MAX_URI)
+        );
+        assert!(Command::open(&long, LaunchToken::default()).is_err());
     }
 
     #[test]

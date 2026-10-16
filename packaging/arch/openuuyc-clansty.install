@@ -13,6 +13,16 @@ OpenUUYC 被远程控制时，键鼠经 /dev/uinput 注入，需要该设备的�
 NOTE
 }
 
+# 协助邀请链接（uuremote://）用哪个程序打开由用户决定：包只把本程序登记成候选，
+# 免得悄悄抢掉官方客户端或 wine 里的那份。
+_openuuyc_assist_link_note() {
+  cat <<'NOTE'
+协助邀请链接（uuremote://external/assistance?...）现在也能交给 OpenUUYC 打开。
+让它成为默认打开方式：
+    xdg-mime default openuuyc.desktop x-scheme-handler/uuremote
+NOTE
+}
+
 # 用户级单元不能由包替用户 enable（要在那个用户的会话里做），所以只提示。
 _openuuyc_service_note() {
   cat <<'NOTE'
@@ -37,10 +47,12 @@ post_install() {
   _openuuyc_uinput_note
   _openuuyc_service_note
   _openuuyc_virtual_display_note
+  _openuuyc_assist_link_note
 }
 
 post_upgrade() {
   _openuuyc_uinput_note
   _openuuyc_service_note
   _openuuyc_virtual_display_note
+  _openuuyc_assist_link_note
 }
