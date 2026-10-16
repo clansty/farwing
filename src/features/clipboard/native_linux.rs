@@ -441,15 +441,26 @@ impl LocalSnapshot {
             _ if format.wire.name == "FileGroupDescriptorW" => {
                 ensure!(!self.sources.is_empty(), "本地剪贴板没有文件");
                 let files = collect_files(&self.sources)?;
-                let descriptors: Vec<_> = files.items.iter().map(|f| f.desc.clone()).collect();
-                let blob = formats::descriptor_bytes(&descriptors, "不安全的文件名称")?;
                 // 官方主控把我们的文件粘到 Windows 上走的就是这一条（它按名字来问这个
-                // 二进制块）。它把 ftLastWriteTime 当什么读还没定论——我们写进去的是
-                // ticks，而官方**自己发的**线上时间戳是 Unix 秒。这条把「答了什么」和
-                // 「槽里放了什么」一起留证，免得再靠猜。
+                // 二进制块），而它按 **Unix 秒** 读这一槽，不是 Windows 标准的 FILETIME：
+                // 一处一秒地实测证据是——我们以前放 ticks（约 1.34e17），它做「秒→FILETIME」
+                // 的 ×10^7 时溢出，粘出来的文件「修改日期」就是空白；它也从不发 11644473600
+                // 这个纪元常数（客户端二进制里 0 命中），×10^7 却出现 45 次。
+                // `formats::descriptor_bytes` 的语义保持标准 FILETIME 不动：Windows 侧那份
+                // 同名调用是给本地应用（Explorer）看的，必须是 ticks，所以只在这里换。
+                let descriptors: Vec<_> = files
+                    .items
+                    .iter()
+                    .map(|f| {
+                        let mut desc = f.desc.clone();
+                        desc.last_write_time = wire_seconds(desc.last_write_time);
+                        desc
+                    })
+                    .collect();
+                let blob = formats::descriptor_bytes(&descriptors, "不安全的文件名称")?;
                 tracing::info!(
                     files = descriptors.len(),
-                    slot = descriptors.first().map_or(0, |f| f.last_write_time),
+                    seconds = descriptors.first().map_or(0, |f| f.last_write_time),
                     bytes = blob.len(),
                     first = %descriptors.first().map_or(String::new(), |f| f.file_name.clone()),
                     "剪贴板文件描述块已答出"
@@ -1385,6 +1396,10 @@ fn serve(
             }
         }
         ClipboardRequestKind::FileDescListRequest(ask) => {
+            // 「官方把我们的文件粘到 Windows 上」走哪条路是个岔口：走这条答出去的是
+            // **线上描述符**（时间是 Unix 秒），另一条是按名字要 FileGroupDescriptorW
+            // 那个二进制块（槽里现在是 ticks）。两条各留一条日志才分得清。
+            tracing::info!(task = ask.task_id, "剪贴板收到文件列表请求");
             let explicit = drag_list(state, session, ask.task_id);
             let dragged = explicit.is_some() || session.file_offers.is_some();
             let result = (|| -> Result<Arc<LocalFiles>> {
