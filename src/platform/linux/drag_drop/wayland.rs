@@ -306,8 +306,19 @@ fn run(
         None => {
             // 名字对不上只能按尺寸认，而尺寸要在逻辑与物理两套单位里比一遍，所以先把
             // 逻辑尺寸等齐。正常一轮 roundtrip 就到，`SETUP` 只是兜底。
+            //
+            // 等的是「每块屏的逻辑尺寸都非 0」，不是「每块屏收到过事件」：
+            // `LogicalPosition` 与 `LogicalSize` 是两个独立事件，只收到位置时那条已由 None
+            // 变 Some、尺寸却还是 `(0, 0)`，于是 `pick` 会把它从按逻辑尺寸那一轮跳过 ——
+            // 可能选中同尺寸的另一块屏，或者直接报「没有这个尺寸的屏」把整次接取判死。
+            let known = |state: &State| {
+                state
+                    .logical
+                    .iter()
+                    .all(|entry| entry.is_some_and(|(_, (width, height))| width > 0 && height > 0))
+            };
             let deadline = Instant::now() + SETUP;
-            while state.logical.iter().any(Option::is_none) && Instant::now() < deadline {
+            while !known(&state) && Instant::now() < deadline {
                 dispatch(&mut queue, &mut state, &connection)?;
                 wait(&mut queue, &mut state, &connection, POLL)?;
             }
