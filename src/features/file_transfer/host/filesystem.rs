@@ -292,13 +292,7 @@ pub(super) fn operation(
                 };
                 Res::FileDirectory(FileDirectory {
                     id: v.id.clone(),
-                    // The official directory producer echoes the requested directory;
-                    // only its virtual default-directory alias resolves to a real path.
-                    path: if v.path == ":/Default" {
-                        path
-                    } else {
-                        v.path.clone()
-                    },
+                    path: reply_directory(&v.path, &path),
                     entries,
                     dir_data,
                     file_error: 1,
@@ -435,6 +429,17 @@ pub(super) fn operation(
         }
     }
 }
+/// 一条 `FileDirectory` 回复里写的那个目录。官方主控是把请求里的目录原样回给我们的，
+/// 只有它那个虚拟的「默认目录」别名会落到一个真路径上——那条得像我们交出去的每个路径
+/// 一样走反斜杠形状（见 `storage::wire_path`），否则官方主控会拿一个它拆不动、也上不去
+/// 的 POSIX 路径当当前目录来浏览和上传。
+fn reply_directory(requested: &str, resolved: &str) -> String {
+    if requested == ":/Default" {
+        storage::wire_path(resolved)
+    } else {
+        requested.to_owned()
+    }
+}
 fn remove_tree(path: &Path, stop: &CancellationToken, depth: usize) -> Result<()> {
     ensure!(
         !stop.is_cancelled() && depth < 128,
@@ -474,5 +479,68 @@ mod tests {
         assert!(within("/home", "/"));
         // Linux names are case-sensitive.
         assert!(!within("/home/A", "/home/a"));
+    }
+
+    #[test]
+    fn default_directory_replies_in_wire_shape() {
+        assert_eq!(
+            reply_directory(":/Default", "/home/u/Downloads"),
+            "\\home\\u\\Downloads"
+        );
+        // 别的请求原样回给对端。
+        assert_eq!(reply_directory("\\home\\u", "/home/u"), "\\home\\u");
+        assert_eq!(reply_directory("/home/u", "/home/u"), "/home/u");
+        // Windows 被控端解出来的下载目录本来就是反斜杠形状。
+        assert_eq!(
+            reply_directory(":/Default", "C:\\Users\\u\\Downloads"),
+            "C:\\Users\\u\\Downloads"
+        );
+    }
+}
+
+/// Windows 主控也跑 [`storage::wire_path`]，这里钉住它对这些路径一个字都不改。
+///
+/// 只能在 Windows 上跑（要在真机上看 `local_list`、`canonical_dir` 和 shell 的已知
+/// 文件夹长什么样），交叉检查里会编译。
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    fn unchanged(path: &str) {
+        assert_eq!(storage::wire_path(path), path, "{path}");
+    }
+
+    #[test]
+    fn host_replies_keep_their_shape() {
+        for entry in super::super::super::service::local_list(":/").unwrap() {
+            unchanged(&entry.full_path);
+        }
+        if let Ok(downloads) = directory(":/Default") {
+            let downloads = downloads.to_string_lossy();
+            assert_eq!(reply_directory(":/Default", &downloads), downloads);
+        }
+
+        let root = storage::canonical_dir(&std::env::temp_dir()).unwrap();
+        let dir = root.join(format!("openuuyc-wire-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a b.txt"), b"x").unwrap();
+        // 对端可能发任一种分隔符过来；我们解出来、列出来的都是反斜杠。
+        let sent = dir.to_str().unwrap().replace('\\', "/");
+        let resolved = directory(&sent).unwrap();
+        unchanged(&resolved.to_string_lossy());
+        let entries =
+            super::super::super::service::local_list(&resolved.to_string_lossy()).unwrap();
+        assert_eq!(entries.len(), 2);
+        for entry in entries {
+            unchanged(&entry.full_path);
+        }
+        // DirCreate 与 Rename 回的路径来自 `directory` / `local_path`。
+        unchanged(&resolved.join("新建文件夹").to_string_lossy());
+        unchanged(
+            &local_path(&format!("{sent}/sub/renamed"))
+                .unwrap()
+                .to_string_lossy(),
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

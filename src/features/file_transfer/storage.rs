@@ -281,10 +281,15 @@ pub(super) fn wire_path(value: &str) -> String {
 #[cfg(not(windows))]
 pub(super) fn local_path(value: &str) -> Result<PathBuf> {
     let text = if value == ":/Default" {
+        // 名字不是 UTF-8 的下载目录没法和官方主控说：`to_string_lossy` 会造出一个
+        // 带 U+FFFD 的假路径，之后当成普通路径去查、报成「找不到」，离真正的原因很远。
+        // 在这里就说清楚。
         known_folder(KnownFolder::Downloads)
             .context("用户下载目录不可用")?
-            .to_string_lossy()
-            .into_owned()
+            .into_os_string()
+            .into_string()
+            .ok()
+            .context("文件路径无效")?
     } else {
         // 对端按 [`wire_path`] 的形状回话：反斜杠是分隔符，先换回 POSIX 再校验。
         value.replace('\\', "/")
@@ -720,6 +725,10 @@ mod tests {
         // 下载请求的源路径），回来时换回 POSIX。
         assert_eq!(wire_path("/home/clansty/Downloads"), "\\home\\clansty\\Downloads");
         assert_eq!(wire_path("/"), "\\");
+        // Windows 形状在两侧都必须原样交出去（Windows 主控也跑这个函数）。
+        for windows in ["C:\\", "D:\\Users\\u\\a b.txt", "\\\\srv\\share\\x"] {
+            assert_eq!(wire_path(windows), windows);
+        }
         assert_eq!(
             local_path("\\home\\clansty\\Downloads").unwrap(),
             PathBuf::from("/home/clansty/Downloads")
