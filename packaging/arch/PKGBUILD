@@ -60,18 +60,18 @@ makedepends=(
 
 # 只影响部分功能，缺了也能跑，但缺哪一项就少哪一块，因此都写清楚用途。
 optdepends=(
-  'vulkan-icd-loader: 首选渲染后端（Vulkan）；缺失时回退 libglvnd 的 OpenGL'
-  'mesa: Intel/AMD/软件 Vulkan 驱动（VA-API 硬解与渲染都需要厂商驱动）'
-  'nvidia-utils: NVIDIA 驱动；NVENC 硬编、NvFBC 采集与 Vulkan 都靠它'
-  'libpulse: 被控端用 PulseAudio 客户端接口采集桌面声音（PipeWire 的音源也可）'
-  'libpipewire: Wayland/XDG 门户画面采集（wlroots screencopy 与 X11 采集不需要）'
-  'gnome-keyring: 用 Secret Service 保存登录态（与 kwallet 二选一，缺了两者无法保存登录）'
-  'kwallet: 用 Secret Service 保存登录态（与 gnome-keyring 二选一）'
+  'vulkan-icd-loader: 首选渲染后端，缺失时回退 OpenGL'
+  'mesa: VA-API 硬解与渲染'
+  'nvidia-utils: NVENC 硬编、NvFBC 采集与 Vulkan'
+  'libpulse: 采集桌面声音'
+  'libpipewire: Wayland/XDG Portal 采集桌面画面'
+  'gnome-keyring: 保存登录态'
+  'kwallet: 保存登录态'
   'ethtool: 远程开机时检查网卡的魔术包唤醒状态'
-  'hwdata: 用 pci.ids 给上报的显卡取名（/usr/share/hwdata/pci.ids）'
-  'gnome-shell-extension-appindicator: GNOME 下显示托盘图标（KDE/Xfce 等自带托盘）'
-  'glib2: 被控端拼拖动预览图时用 gio 取文件图标（缺了就不带图）'
-  'librsvg: 被控端拼拖动预览图时用 rsvg-convert 画矢量图标（缺了就不带图）'
+  'hwdata: 获取显卡名称'
+  'gnome-shell-extension-appindicator: GNOME 下显示托盘图标'
+  'glib2: 获取文件图标'
+  'librsvg: 拼接拖放预览图'
 )
 
 # 带上版本是为了让「依赖 openuuyc>=x」的包能对上；不带也不影响互斥。
