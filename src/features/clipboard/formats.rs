@@ -182,6 +182,12 @@ pub(super) fn file_format(id: u32, name: &str) -> bool {
         .iter()
         .any(|s| s.eq_ignore_ascii_case(name))
 }
+/// 某个格式能不能放行——广告出去（`outgoing`）和接受进来（`incoming`）都看它。
+///
+/// `Preferred DropEffect` 是唯一被挡在门外的文件格式：Windows 生产端从来不把它放上线
+/// （Windows 侧那套枚举在 `native.rs` 里同样把它滤掉），只有 Linux 广告它就成了没有
+/// 依据的平台差异。真被问到照样按 `DROPEFFECT_COPY` 答，见 `LocalSnapshot::data`——
+/// 那条是安全线，答成「移动」会让对端把被控端的文件搬走。
 pub(super) fn supported(id: u32, name: &str, files: bool) -> bool {
     if name.eq_ignore_ascii_case("OpenUUYC.Clipboard.Remote")
         || name.eq_ignore_ascii_case("DataObject")
@@ -191,10 +197,10 @@ pub(super) fn supported(id: u32, name: &str, files: bool) -> bool {
     }
     if file_format(id, name) {
         return files
-            && (matches!(
+            && matches!(
                 name,
                 "FileGroupDescriptorW" | "FileContents" | "public.file-url"
-            ) || name.eq_ignore_ascii_case("Preferred DropEffect"));
+            );
     }
     matches!(
         id,

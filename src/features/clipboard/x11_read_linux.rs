@@ -27,6 +27,15 @@ const POLL: Duration = Duration::from_millis(2);
 /// 一次最多搬多少字节。
 const MAX: usize = 32 * 1024 * 1024;
 
+/// 这个会话里要不要自己接管 X11 的选择区——把远端发来的文本也挂上去。
+///
+/// 两个变量都在：XWayland 在（`DISPLAY`），而且 arboard 落在 Wayland 那一侧
+/// （`WAYLAND_DISPLAY`）。纯 X11 会话里 arboard 写的就是 X11 那一份，再挂一遍是
+/// 多此一举；没有 XWayland 时更没有 X11 可供接管。
+pub(super) fn wanted() -> bool {
+    std::env::var_os("DISPLAY").is_some() && std::env::var_os("WAYLAND_DISPLAY").is_some()
+}
+
 /// 读一次。读不到（没人持有选择区、对端不支持我们要的类型、超时）就是空的。
 pub(super) fn read() -> LocalSnapshot {
     // 纯 Wayland 会话（没有 XWayland）连 DISPLAY 都没有，不必每 400 毫秒去试一次
@@ -147,9 +156,9 @@ fn fetch(
     let Some(property) = convert(connection, window, atoms, target)? else {
         return Ok(None);
     };
-    // 一开始必须删掉：INCR 期间每次 PropertyNotify 都要能看出「又有新的一段」。
+    // 先只看类型。
     let reply = connection
-        .get_property(true, window, property, AtomEnum::ANY, 0, 0)?
+        .get_property(false, window, property, AtomEnum::ANY, 0, 0)?
         .reply()
         .context("读取剪贴板属性失败")?;
     if reply.type_ != atoms.incr {
@@ -161,8 +170,20 @@ fn fetch(
     }
     // INCR：对端每写好一段就删掉属性再设一次，我们每见到一次新值读一段，
     // 读到空的那次为止。
-    let deadline = Instant::now() + WAIT;
+    //
+    // 传输从我们删掉 `INCR` 那个记号开始，对端看到删除才写第一段。删除要单独发：
+    // `GetProperty` 只在一次读完整个属性时才顺手删掉它，上面那次只读了零个字节，
+    // 对端看不到删除，第一段就永远不来——整次读最后超时收场，大块内容当成空的。
+    connection
+        .delete_property(window, property)?
+        .check()
+        .context("开始分段读取剪贴板失败")?;
+    // `WAIT` 是「两段之间最多等多久」，每收到一段就从那一刻重新算起——不是整次
+    // 传输的总时限。一整块几十 MB 传上几秒是正常的，按整次计时会在中途超时，而
+    // 这里的超时是直接放弃：上层拿到的是一份空快照，用户看到的是「复制了却什么都
+    // 没过来」，连截断都不是。总量另有 `MAX` 管着。
     let mut data = Vec::new();
+    let mut deadline = Instant::now() + WAIT;
     loop {
         let Some(event) = next(connection, deadline)? else {
             anyhow::bail!("对端没有把数据送完");
@@ -172,6 +193,7 @@ fn fetch(
             && notify.atom == property
             && notify.state == Property::NEW_VALUE
         {
+            deadline = Instant::now() + WAIT;
             let reply = connection
                 .get_property(true, window, property, AtomEnum::ANY, 0, MAX as u32 / 4)?
                 .reply()
