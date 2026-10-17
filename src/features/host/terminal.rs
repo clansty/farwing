@@ -394,6 +394,9 @@ impl Ended {
 pub(crate) struct Sessions {
     sessions: HashMap<(String, u32), Session>,
     next_name: u64,
+    /// 会话列表的版本。任何增删改都递增，已附着的连接据此主动补推列表，
+    /// 手机/Windows 客户端的列表页不用再等它自己轮询。
+    generation: u64,
 }
 
 /// 本机侧看到的会话，给侧边栏与 CLI 用。
@@ -490,11 +493,10 @@ impl Sessions {
             existing.detached_since = None;
             existing.apply_size();
             existing.last_active_ms = now_ms();
-            return Ok((
-                handle,
-                existing.name.clone(),
-                existing.screen.screen().state_formatted(),
-            ));
+            let name = existing.name.clone();
+            let replay = existing.screen.screen().state_formatted();
+            self.touch();
+            return Ok((handle, name, replay));
         }
         if self.owned(owner).count() >= MAX_SESSIONS || self.sessions.len() >= MAX_TOTAL {
             return Err(SessionError::TooMany);
@@ -526,6 +528,7 @@ impl Sessions {
                 detached_since: None,
             },
         );
+        self.touch();
         Ok((handle, name, Vec::new()))
     }
 
@@ -573,7 +576,18 @@ impl Sessions {
                 detached_since: None,
             },
         );
+        self.touch();
         Ok(handle)
+    }
+
+    /// 列表变了。
+    fn touch(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// 会话列表的当前版本。
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 
     fn owned<'a>(&'a self, owner: &'a str) -> impl Iterator<Item = (u32, &'a Session)> + 'a {
@@ -699,6 +713,7 @@ impl Sessions {
             return Err(SessionError::DuplicateName);
         }
         self.get_mut(owner, handle)?.name = name;
+        self.touch();
         Ok(())
     }
 
@@ -710,27 +725,36 @@ impl Sessions {
             .filter(|(who, _)| who == owner)
             .cloned()
             .collect();
-        Ended::forced(
-            keys.iter()
-                .filter_map(|key| self.sessions.remove(key))
-                .collect(),
-        )
+        let ended: Vec<_> = keys
+            .iter()
+            .filter_map(|key| self.sessions.remove(key))
+            .collect();
+        if !ended.is_empty() {
+            self.touch();
+        }
+        Ended::forced(ended)
     }
 
     /// Ends every session, whoever opened it.
     pub(crate) fn kill_all(&mut self) -> Ended {
-        Ended::forced(self.sessions.drain().map(|(_, session)| session).collect())
+        let all: Vec<_> = self.sessions.drain().map(|(_, session)| session).collect();
+        if !all.is_empty() {
+            self.touch();
+        }
+        Ended::forced(all)
     }
 
     /// Removes one of `owner`'s sessions; finishing the result ends the shell.
     pub(crate) fn kill(&mut self, owner: &str, handle: u32) -> Result<Ended, SessionError> {
         let key = self.resolve(owner, handle).ok_or(SessionError::Gone)?;
         let session = self.sessions.remove(&key).ok_or(SessionError::Gone)?;
+        self.touch();
         Ok(Ended::forced(vec![session]))
     }
 
     /// Lets go of one of `owner`'s sessions without ending the shell.
     pub(crate) fn detach(&mut self, owner: &str, handle: u32) -> Result<(), SessionError> {
+        self.touch();
         let session = self.get_mut(owner, handle)?;
         let remotes: Vec<_> = session
             .output
@@ -973,12 +997,14 @@ impl Sessions {
             })
             .map(|(key, _)| key.clone())
             .collect();
-        Ended::exited(
-            exited
-                .iter()
-                .filter_map(|key| self.sessions.remove(key))
-                .collect(),
-        )
+        let ended: Vec<_> = exited
+            .iter()
+            .filter_map(|key| self.sessions.remove(key))
+            .collect();
+        if !ended.is_empty() {
+            self.touch();
+        }
+        Ended::exited(ended)
     }
 
     /// Takes out the shells nobody is attached to that have exited, and ends
@@ -1001,12 +1027,31 @@ impl Sessions {
                 .filter_map(|key| self.sessions.remove(key))
                 .collect()
         };
-        (Ended::exited(take(exited)), Ended::forced(take(abandoned)))
+        let exited = take(exited);
+        let abandoned = take(abandoned);
+        if !exited.is_empty() || !abandoned.is_empty() {
+            self.touch();
+        }
+        (Ended::exited(exited), Ended::forced(abandoned))
     }
 
     #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.sessions.is_empty()
+    }
+}
+
+/// 把 Signal 帧翻译成终端控制字符。
+///
+/// 官方主控的 payload 是 JSON，形如 `{"sig":"SIGINT"}`。只有终端驱动愿意
+/// 接的那几个信号有对应的按键字节；其余返回 `None`，由调用方记录后丢弃。
+fn signal_keystroke(payload: &[u8]) -> Option<u8> {
+    let value: Value = serde_json::from_slice(payload).ok()?;
+    match value.get("sig")?.as_str()? {
+        "SIGINT" => Some(0x03),
+        "SIGQUIT" => Some(0x1c),
+        "SIGTSTP" => Some(0x1a),
+        _ => None,
     }
 }
 
@@ -1283,6 +1328,8 @@ pub(crate) fn bind(
     let pump_channel = Arc::downgrade(channel);
     let table = shared();
     tokio::spawn(async move {
+        // 初值保证第一拍就推一次列表，之后只在版本变化时补推。
+        let mut listed_generation = u64::MAX;
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(20));
         loop {
             ticker.tick().await;
@@ -1296,13 +1343,33 @@ pub(crate) fn bind(
             // (`end_login`); a lease that merely went stale (signalling
             // reconnected) only closes this connection, so the shells wait
             // for the reattach.
-            let allowed = pump_screens.lock().await.authorization().terminal_allowed();
+            let (allowed, account) = {
+                let state = pump_screens.lock().await;
+                let lease = state.authorization();
+                (lease.terminal_allowed(), lease.account().to_owned())
+            };
             if !allowed {
                 tracing::info!("host terminal grant ended; closing the terminal connection");
                 pump_stop.cancel();
                 cancel.cancel();
                 let _ = channel.close().await;
                 break;
+            }
+            // 列表变了就主动补推一份：客户端的会话列表页只会自己请求一次，
+            // 手机/Windows 端新建终端后不等它轮询就能看到。
+            let generation = lock_table(&table).generation();
+            if generation != listed_generation {
+                let payload = {
+                    let sessions = lock_table(&table);
+                    serde_json::to_vec(&Value::Array(sessions.list(&account)))
+                        .unwrap_or_else(|_| b"[]".to_vec())
+                };
+                let frame = Frame::encode(FrameType::ListSessionsResp, 0, &payload);
+                if channel.send(&Bytes::from(frame)).await.is_err() {
+                    pump_stop.cancel();
+                    break;
+                }
+                listed_generation = generation;
             }
             let room = OUTPUT_HIGH_WATER.saturating_sub(channel.buffered_amount().await);
             if room == 0 {
@@ -1569,20 +1636,36 @@ async fn handle_frame(
                 ));
             }
             FrameType::Signal => {
-                // 官方主控把 Ctrl-C 放在 Signal 帧里发，不走 stdin 字节；
-                // payload 的布局还没确认，先只记下来。把它当未知信号去杀
-                // shell 会丢会话，所以在弄清之前不执行。
-                let payload: String = frame
-                    .payload
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect();
-                tracing::debug!(
-                    session = frame.session,
-                    bytes = frame.payload.len(),
-                    payload,
-                    "host terminal signal ignored"
-                );
+                // 实际帧是 `{"sig":"SIGINT"}`（16 字节）。翻译成终端控制
+                // 字符写进 pty 最稳妥：终端驱动会把它变成给前台进程组的
+                // SIGINT，和本机键盘按 Ctrl-C 走同一条路；直接杀进程会丢
+                // 掉程序自己的处理（比如 vim 想先问你）。
+                match signal_keystroke(&frame.payload) {
+                    Some(byte) => {
+                        if let Err(error) =
+                            lock_table(&table).write(&account, frame.session, &[byte])
+                        {
+                            tracing::debug!(
+                                %error,
+                                session = frame.session,
+                                "host terminal signal dropped"
+                            );
+                        }
+                    }
+                    None => {
+                        let payload: String = frame
+                            .payload
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect();
+                        tracing::debug!(
+                            session = frame.session,
+                            bytes = frame.payload.len(),
+                            payload,
+                            "host terminal signal ignored"
+                        );
+                    }
+                }
             }
             other => {
                 tracing::debug!(?other, "host terminal frame ignored");
@@ -2245,6 +2328,37 @@ mod tests {
             .expect("attach local");
         let local = local_output_until(&mut sessions, 100, "MOBILE-TO-LOCAL");
         assert!(local.contains("MOBILE-TO-LOCAL"));
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", windows)),
+        ignore = "no terminal backend on this platform"
+    )]
+    fn the_list_generation_moves_with_the_table() {
+        let mut sessions = Sessions::default();
+        let before = sessions.generation();
+        let handle = sessions
+            .create_local(Some("generation".into()))
+            .expect("create");
+        let created = sessions.generation();
+        assert_ne!(created, before, "creating a session bumps the list");
+        sessions
+            .rename(LOCAL_OWNER, handle, "renamed")
+            .expect("rename");
+        let renamed = sessions.generation();
+        assert_ne!(renamed, created, "renaming bumps the list");
+        sessions.kill(LOCAL_OWNER, handle).expect("kill").finish();
+        assert_ne!(sessions.generation(), renamed, "killing bumps the list");
+    }
+
+    #[test]
+    fn a_signal_frame_becomes_a_keystroke() {
+        assert_eq!(signal_keystroke(br#"{"sig":"SIGINT"}"#), Some(0x03));
+        assert_eq!(signal_keystroke(br#"{"sig":"SIGQUIT"}"#), Some(0x1c));
+        assert_eq!(signal_keystroke(br#"{"sig":"SIGTSTP"}"#), Some(0x1a));
+        assert_eq!(signal_keystroke(br#"{"sig":"SIGUSR1"}"#), None);
+        assert_eq!(signal_keystroke(b""), None);
     }
 
     #[test]
