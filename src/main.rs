@@ -108,6 +108,14 @@ enum Commands {
     },
     #[command(hide = true)]
     DisplayRecovery { token: String },
+    /// 列出或接上本机正在运行的被控终端会话
+    Terminal {
+        /// 会话名或编号；省略时列出
+        session: Option<String>,
+        /// 只列出会话，不接入
+        #[arg(long)]
+        list: bool,
+    },
     #[command(hide = true)]
     PluginVideoHost,
 
@@ -311,6 +319,9 @@ fn main() -> Result<()> {
             openuuyc::application::capture_agent(&pipe, parent)
         }
         Commands::DisplayRecovery { token } => openuuyc::application::display_recovery(&token),
+        Commands::Terminal { session, list } => {
+            openuuyc::application::terminal_attach(session.as_deref(), list)
+        }
         Commands::PluginVideoHost => openuuyc::plugins::video::host(),
         #[cfg(windows)]
         Commands::Notification { .. } => {
