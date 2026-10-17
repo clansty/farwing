@@ -376,7 +376,11 @@ mod device {
         }
     }
 
-    pub(crate) fn create_device() -> Result<Graphics> {
+    /// 参数只为与 Linux 那边对齐：D3D11 设备经 DXGI 能向任意窗口呈现。
+    pub(crate) fn create_device(
+        _event_loop: &winit::event_loop::ActiveEventLoop,
+        _window: &winit::window::Window,
+    ) -> Result<Graphics> {
         let mut last_error = None;
         for driver in [D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP] {
             let mut device = None;

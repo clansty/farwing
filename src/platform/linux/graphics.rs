@@ -6,6 +6,7 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use winit::dpi::PhysicalSize;
+use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
 
 /// Where the video layer lands in the window, which the player decides.
@@ -74,21 +75,27 @@ impl Graphics {
 
 /// One adapter and device for the whole process: windows open and close, but
 /// re-creating a Vulkan device per window would stall each one on startup.
-pub(crate) fn create_device() -> Result<Graphics> {
+///
+/// 第一个窗口挑它：只有能向这个窗口呈现的适配器才作数。混合显卡机器上，X 屏幕
+/// 挂在其中一块 GPU 上，另一块 GPU 的 Vulkan 设备（或者没拿到窗口 display 的
+/// EGL 设备）照样能被枚举出来，却在那里绘制不了。
+pub(crate) fn create_device(event_loop: &ActiveEventLoop, window: &Window) -> Result<Graphics> {
     static SHARED: std::sync::OnceLock<std::result::Result<Graphics, String>> =
         std::sync::OnceLock::new();
     SHARED
-        .get_or_init(|| create_graphics().map_err(|error| format!("{error:#}")))
+        .get_or_init(|| create_graphics(event_loop, window).map_err(|error| format!("{error:#}")))
         .clone()
         .map_err(anyhow::Error::msg)
 }
 
-fn create_graphics() -> Result<Graphics> {
+fn create_graphics(event_loop: &ActiveEventLoop, window: &Window) -> Result<Graphics> {
     // Vulkan first, GL as the fallback for drivers or VMs without it.
-    let mut desc = wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
-        ..wgpu::InstanceDescriptor::new_without_display_handle_from_env()
-    };
+    // GL 后端要拿到窗口系统的 display：否则 EGL 会自己挑一个设备，那个设备无法
+    // 向 X11 或 Wayland 窗口呈现。
+    let mut desc = wgpu::InstanceDescriptor::new_with_display_handle_from_env(Box::new(
+        event_loop.owned_display_handle(),
+    ));
+    desc.backends = wgpu::Backends::VULKAN | wgpu::Backends::GL;
     // Haswell/Broadwell 的 HasVK 驱动上报 conformance_version.major == 0（未通过
     // Vulkan 认证），wgpu 会据此把整个适配器藏起来，request_adapter 便静默回落到
     // llvmpipe 软渲染：Haswell 上空闲就烧掉一整个核心，8 个 llvmpipe 线程。除非
@@ -107,12 +114,24 @@ fn create_graphics() -> Result<Graphics> {
         }
     }
     let instance = wgpu::Instance::new(desc);
+    let probe = instance
+        .create_surface(window)
+        .context("创建窗口绘制表面失败")?;
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: Some(&probe),
         ..Default::default()
     }))
-    .context("没有可用的 GPU 适配器（需要 Vulkan 或 OpenGL）")?;
+    .context("没有能在这个窗口上绘制的 GPU 适配器（需要 Vulkan 或 OpenGL）")?;
+    drop(probe);
     let info = adapter.get_info();
+    tracing::info!(
+        adapter = %info.name,
+        backend = ?info.backend,
+        device_type = ?info.device_type,
+        driver = %info.driver,
+        "UI GPU adapter selected"
+    );
     let (device, queue) = pollster::block_on(
         adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("openuuyc-ui"),
@@ -437,6 +456,13 @@ fn create_surface(
         .instance
         .create_surface(Arc::clone(window))
         .context("创建窗口绘制表面失败")?;
+    // 设备是按第一个窗口挑的；这个窗口所在的屏它到不了的话，configure() 会直接
+    // abort，先给出能看懂的错误。
+    anyhow::ensure!(
+        graphics.adapter.is_surface_supported(&surface),
+        "所选 GPU（{}）无法在这个窗口上绘制",
+        graphics.label
+    );
     let capabilities = surface.get_capabilities(&graphics.adapter);
     let config = wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
