@@ -90,6 +90,11 @@ pub(crate) fn screen_states(
     .encode_to_vec()
 }
 
+/// 调试日志里用的十六进制；只在 debug 级别才会被格式化。
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn response(
     message: &PbControlMessage,
     header: Option<PbResponseHeader>,
@@ -189,6 +194,12 @@ pub(crate) async fn receive_session(
                         retry: u64,
                     }
                     let _ = CheckEnvReq::decode(bytes.as_slice())?;
+                    // 客户端版本不一致时，先看它发来的结构：tag 对不上就会
+                    // 落在别的分支，字节对不上就是字段解释错了。
+                    tracing::debug!(
+                        request = %hex(&bytes),
+                        "host terminal environment check request"
+                    );
                     // A platform without a terminal backend says so; otherwise
                     // the answer is the host's permission.
                     let refusal = crate::platform::terminal::unavailable().or_else(|| {
@@ -197,8 +208,11 @@ pub(crate) async fn receive_session(
                     let allowed = refusal.is_none();
                     #[derive(Clone, PartialEq, prost::Message)]
                     struct CheckEnvResp {
-                        #[prost(int32, tag = "1")]
-                        code: i32,
+                        // optional 不是协议要求，是为了让 0 也真的写进
+                        // wire：proto3 默认跳过默认值，`code: 0` 编出来是
+                        // 空 payload，客户端会当成没有回复而一直重试。
+                        #[prost(int32, optional, tag = "1")]
+                        code: Option<i32>,
                         #[prost(string, tag = "2")]
                         detail: String,
                     }
@@ -206,7 +220,7 @@ pub(crate) async fn receive_session(
                     // reported so the client can show its own message rather
                     // than waiting for a reply that never comes.
                     let resp = CheckEnvResp {
-                        code: if allowed { 0 } else { 1 },
+                        code: Some(if allowed { 0 } else { 1 }),
                         detail: refusal.unwrap_or_default().to_owned(),
                     };
                     // 客户端超时会重发；把 request_id 记下来，失败时能对上
@@ -215,6 +229,10 @@ pub(crate) async fn receive_session(
                         allowed,
                         request_id = header.as_ref().map(|header| header.request_id),
                         "host terminal environment check answered"
+                    );
+                    tracing::debug!(
+                        reply = %hex(&resp.encode_to_vec()),
+                        "host terminal environment check reply"
                     );
                     return Ok(response(
                         &message,
