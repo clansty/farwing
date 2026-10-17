@@ -135,6 +135,8 @@ pub(crate) struct ConnectingWindowsRunner {
     request_rx: std_mpsc::Receiver<WindowRequest>,
     /// 把屏拖出得到的独立窗口。窗口创建与销毁都留在事件循环线程上。
     detached: Vec<DetachedWindow>,
+    /// 主窗口要求关闭。还有屏窗口在播时它只是关掉自己，由其中一个接替。
+    primary_close: bool,
 }
 
 enum Stage {
@@ -193,6 +195,7 @@ impl ConnectingWindowsRunner {
             requests,
             request_rx,
             detached: Vec::new(),
+            primary_close: false,
         }
     }
 
@@ -470,6 +473,67 @@ impl ConnectingWindowsRunner {
         }
     }
 
+    /// 关掉主窗口：还有屏窗口在播时，把「主窗口」这个角色交给其中一个，连接
+    /// 继续；一个都不剩才真正结束。Windows 那边所有观看窗口本来就是平级的，
+    /// 关掉任意一个都只是合并，这里跟着它走。
+    fn close_primary(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(index) = self
+            .detached
+            .iter()
+            .position(|slot| matches!(slot.stage, DetachedStage::Playing(_)))
+        else {
+            self.exit(event_loop);
+            return;
+        };
+        // 旧主窗口的屏交给接替者，别让它们随着窗口一起消失。
+        let mut tabs = Vec::new();
+        if let Stage::Playing(player) = &mut self.stage {
+            // 它已经交出了正在直播的那块屏，析构时不能再关整个解码器池。
+            player.input_owns_connection = false;
+            tabs = std::mem::take(&mut player.tabs);
+        }
+        let DetachedWindow {
+            stage,
+            pending,
+            shell,
+            window,
+            tabs: _,
+            close: _,
+            next_repaint,
+            last_frame,
+            interval,
+        } = self.detached.remove(index);
+        drop(pending);
+        let DetachedStage::Playing(mut player) = stage else {
+            self.exit(event_loop);
+            return;
+        };
+        player.input_owns_connection = true;
+        for id in tabs {
+            if !player.tabs.contains(&id) {
+                player.tabs.push(id);
+            }
+        }
+        // 旧主窗口离场。Player 的唤醒只撤销自己那份登记。
+        if let Some(old) = self.window.take() {
+            old.set_visible(false);
+        }
+        let old_stage = std::mem::replace(&mut self.stage, Stage::Playing(player));
+        let old_shell = self.shell.take();
+        drop(old_stage);
+        drop(old_shell);
+        self.window = Some(window);
+        self.shell = Some(shell);
+        self.last_frame = last_frame;
+        self.ui_frame_interval = interval;
+        self.next_repaint = earliest(self.next_repaint, next_repaint);
+        // 音频视图属于被关掉的那个窗口，多窗口时本来也不会在。
+        self.audio = None;
+        self.audio_restore_geometry = None;
+        self.schedule(Instant::now());
+        tracing::debug!("主窗口已关闭，由一个屏窗口接替");
+    }
+
     fn close_detached(&mut self, index: usize) {
         if index >= self.detached.len() {
             return;
@@ -503,7 +567,13 @@ impl ConnectingWindowsRunner {
                     position,
                 } => self.detach_screen(event_loop, screen_id, position),
                 WindowRequest::Close { window } => {
-                    if let Some(index) = self
+                    if self
+                        .window
+                        .as_ref()
+                        .is_some_and(|primary| primary.id() == window)
+                    {
+                        self.primary_close = true;
+                    } else if let Some(index) = self
                         .detached
                         .iter()
                         .position(|slot| slot.window.id() == window)
@@ -1098,7 +1168,7 @@ impl ConnectingWindowsRunner {
                 presented,
             );
         }
-        self.close_requested |= close_requested;
+        self.primary_close |= close_requested;
         if let Some(when) = repaint_at {
             self.schedule(when);
         }
@@ -1211,7 +1281,7 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
         }
         match event {
             WindowEvent::CloseRequested | WindowEvent::Destroyed => {
-                self.exit(event_loop);
+                self.primary_close = true;
                 return;
             }
             WindowEvent::Focused(focused) => {
@@ -1297,6 +1367,13 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
             return;
         }
         self.handle_requests(event_loop);
+        if self.primary_close {
+            self.primary_close = false;
+            self.close_primary(event_loop);
+            if self.close_requested {
+                return;
+            }
+        }
         self.poll_detached();
         self.sync_visible();
         if let Stage::Playing(player) = &mut self.stage {
@@ -3208,13 +3285,8 @@ impl Player {
             ViewerShortcut::Fullscreen => toggle_fullscreen(window),
             ViewerShortcut::Close => {
                 self.release_keys();
-                if self.input_owns_connection {
-                    window.set_visible(false);
-                    self.session.close_handle().close();
-                } else {
-                    // 独立窗口只关自己，连接和别的窗口留着。
-                    self.request_close(window);
-                }
+                // 和窗口按钮一样只关这个窗口；连接还有别的窗口在播就留着。
+                self.request_close(window);
             }
             ViewerShortcut::Performance => {
                 self.set_performance_mode(self.performance_mode.next());
