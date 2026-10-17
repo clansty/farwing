@@ -104,6 +104,41 @@ pub(crate) struct Session {
     state: Arc<Mutex<State>>,
     closed: Arc<AtomicBool>,
 }
+
+/// 本进程里还活着的被控显示会话。诊断页的「移除虚拟屏」要能碰到它们，但这里不
+/// 持有所有权（Weak），连接结束就自然消失。
+#[cfg(not(windows))]
+static LIVE_SESSIONS: std::sync::LazyLock<Mutex<Vec<std::sync::Weak<Session>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+#[cfg(not(windows))]
+fn register(session: &Arc<Session>) {
+    let mut live = lock(&LIVE_SESSIONS);
+    live.retain(|entry| entry.strong_count() > 0);
+    live.push(Arc::downgrade(session));
+}
+
+/// 一键移除本机当前创建的所有虚拟屏：兜底屏，加上各活动会话自己加的扩展屏。
+///
+/// 同步、阻塞（要跟辅助程序与合成器打交道），诊断页会把它放到后台线程。
+#[cfg(not(windows))]
+pub(crate) fn remove_all_virtual() -> Result<usize> {
+    let _serial = display::recovery::Serial::acquire()?;
+    let sessions: Vec<_> = lock(&LIVE_SESSIONS)
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .collect();
+    let mut removed = 0;
+    for session in sessions {
+        let mut state = lock(&session.state);
+        removed += state.remove_owned_virtuals()?;
+    }
+    if fallback::remove()? {
+        removed += 1;
+    }
+    Ok(removed)
+}
+
 impl Session {
     pub(crate) fn new(lease: Lease, remote: &str) -> Result<Arc<Self>> {
         ensure!(
@@ -127,7 +162,7 @@ impl Session {
         let mut preferences = preferences.unwrap_or_default();
         preferences.physical.clear();
         fallback::start_background();
-        Ok(Arc::new(Self {
+        let session = Arc::new(Self {
             lease,
             closed: Arc::new(AtomicBool::new(false)),
             state: Arc::new(Mutex::new(State {
@@ -159,7 +194,10 @@ impl Session {
                 #[cfg(not(windows))]
                 virtual_display: None,
             })),
-        }))
+        });
+        #[cfg(not(windows))]
+        register(&session);
+        Ok(session)
     }
     async fn run<T: Send + 'static>(
         &self,
@@ -1165,6 +1203,49 @@ impl State {
             .virtual_display
             .as_mut()
             .context("虚拟显示器辅助程序不可用")?)
+    }
+
+    /// 把本次会话创建的所有虚拟屏还回去。诊断页的「移除虚拟屏」用；不经过主控，
+    /// 所以删掉的屏如果被重建偏好记着（kind 3）要顺手关掉自动建屏，否则下次连接
+    /// 它又回来了。
+    #[cfg(not(windows))]
+    fn remove_owned_virtuals(&mut self) -> Result<usize> {
+        if self.journal.owned.is_empty() {
+            return Ok(0);
+        }
+        let mut removed = 0;
+        for owned in std::mem::take(&mut self.journal.owned) {
+            if !matches!(owned.kind, 1 | 3) {
+                self.journal.owned.push(owned);
+                continue;
+            }
+            if owned.kind == 3 {
+                self.preferences.default_virtual = false;
+            }
+            let Some(identity) = owned.identity.as_deref() else {
+                removed += 1;
+                continue;
+            };
+            // 辅助程序认的是连接器名，identity 只是我们这边的说法。
+            let connector = topology::output_name(identity).to_owned();
+            let result = self
+                .virtual_display
+                .as_mut()
+                .map(|session| session.remove(&connector));
+            match result {
+                Some(Ok(())) => removed += 1,
+                Some(Err(error)) => {
+                    tracing::warn!(%error, %connector, "移除虚拟屏失败");
+                    // 放回记账：连接收尾时还会再试一次。
+                    self.journal.owned.push(owned);
+                }
+                // 到辅助程序的连接已经断了：屏在断开时就被收回了。
+                None => removed += 1,
+            }
+        }
+        self.save()?;
+        self.update_preferences()?;
+        Ok(removed)
     }
 
     /// 重建上次连接时保存下来的虚拟屏。

@@ -570,6 +570,32 @@ pub(super) fn retire(token: &str, replacement_identity: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// 诊断页的「移除虚拟屏」：不管有没有别的显示器、有没有连接在用，直接收回兜底屏。
+///
+/// 和 [`retire`] 的区别只在于不要求替代屏存在——这是用户在本机显式要求的动作，
+/// 被控会话如果因此没有画面了，headless 那套会按需要再建回来。
+#[cfg(not(windows))]
+pub(super) fn remove() -> Result<bool> {
+    let mut machine = lock(&MACHINE);
+    let Some(mut current) = machine.take() else {
+        clear_record()?;
+        return Ok(false);
+    };
+    // 辅助程序重启过的话屏已经被收回，记录清掉就算完成。
+    if current.present()?.is_none() {
+        clear_record()?;
+        return Ok(true);
+    }
+    if let Err(error) = current.session.remove(&current.connector) {
+        tracing::warn!(%error, "兜底虚拟屏移除失败");
+        *machine = Some(current);
+        return Err(error);
+    }
+    clear_record()?;
+    tracing::info!("persistent headless display removed on request");
+    Ok(true)
+}
+
 /// 一条连接开始使用已经存在的兜底屏时登记使用权。
 #[cfg(not(windows))]
 pub(super) fn claim(token: &str) {

@@ -32,6 +32,13 @@ pub(super) struct ViewState {
         Option<std::sync::mpsc::Receiver<crate::platform::virtual_display::Availability>>,
     #[cfg(not(windows))]
     virtual_display_checked: Option<std::time::Instant>,
+    /// 「移除虚拟屏」的后台任务与结果。删屏要和辅助程序、合成器打交道，放后台线程。
+    #[cfg(not(windows))]
+    virtual_display_cleanup: Option<std::sync::mpsc::Receiver<Result<usize, String>>>,
+    #[cfg(not(windows))]
+    virtual_display_cleanup_error: Option<String>,
+    #[cfg(not(windows))]
+    virtual_display_cleanup_note: Option<String>,
 }
 
 impl DeviceCenterApp {
@@ -217,6 +224,31 @@ impl DeviceCenterApp {
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
         }
+        if let Some(rx) = &state.virtual_display_cleanup {
+            match rx.try_recv() {
+                Ok(Ok(removed)) => {
+                    state.virtual_display_cleanup = None;
+                    state.virtual_display_cleanup_error = None;
+                    state.virtual_display_cleanup_note = Some(if removed == 0 {
+                        "没有找到可移除的虚拟屏".to_owned()
+                    } else {
+                        format!("已移除 {removed} 块虚拟屏")
+                    });
+                    // 让探活下一帧重新读一次「已在使用」。
+                    state.virtual_display_checked = None;
+                }
+                Ok(Err(error)) => {
+                    state.virtual_display_cleanup = None;
+                    state.virtual_display_cleanup_note = None;
+                    state.virtual_display_cleanup_error = Some(error);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    state.virtual_display_cleanup = None;
+                    state.virtual_display_cleanup_error = Some("移除任务中断".into());
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
         let due = state
             .virtual_display_checked
             .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(5));
@@ -230,16 +262,64 @@ impl DeviceCenterApp {
                 context.request_repaint();
             });
         }
-        let row = match &state.virtual_display {
-            Some(availability) => diagnostics_row(ui, "虚拟显示器", availability.label()),
-            None => diagnostics_row(ui, "虚拟显示器", "正在读取…"),
-        };
-        if let Some(detail) = state
-            .virtual_display
-            .as_ref()
-            .and_then(|availability| availability.detail())
-        {
-            row.on_hover_text(detail.to_owned());
+        let action_width = theme::DIAGNOSTICS_ACTION_WIDTH + 8.0;
+        ui.horizontal(|ui| {
+            ui.allocate_ui_with_layout(
+                vec2(
+                    (ui.available_width() - action_width).max(0.0),
+                    theme::DIAGNOSTICS_ROW_HEIGHT,
+                ),
+                egui::Layout::left_to_right(Align::Center),
+                |ui| {
+                    let row = match &state.virtual_display {
+                        Some(availability) => {
+                            diagnostics_row(ui, "虚拟显示器", availability.label())
+                        }
+                        None => diagnostics_row(ui, "虚拟显示器", "正在读取…"),
+                    };
+                    if let Some(detail) = state
+                        .virtual_display
+                        .as_ref()
+                        .and_then(|availability| availability.detail())
+                    {
+                        row.on_hover_text(detail.to_owned());
+                    }
+                },
+            );
+            let busy = state.virtual_display_cleanup.is_some();
+            let response = crate::ui::controls::diagnostics_action(
+                ui,
+                !busy,
+                if busy {
+                    "移除中…"
+                } else {
+                    "移除虚拟屏"
+                },
+            );
+            if response
+                .on_hover_text(
+                    "移除本机当前创建的所有虚拟屏：兜底屏，以及本次被控会话添加的扩展屏。\
+                     没有别的显示器时，正在进行的被控会话会按需要重新建立兜底屏。",
+                )
+                .clicked()
+            {
+                let (sender, receiver) = std::sync::mpsc::channel();
+                state.virtual_display_cleanup = Some(receiver);
+                state.virtual_display_cleanup_error = None;
+                state.virtual_display_cleanup_note = None;
+                let context = ui.ctx().clone();
+                std::thread::spawn(move || {
+                    let result = crate::features::host::displays::remove_all_virtual()
+                        .map_err(|error| format!("{error:#}"));
+                    let _ = sender.send(result);
+                    context.request_repaint();
+                });
+            }
+        });
+        if let Some(error) = &state.virtual_display_cleanup_error {
+            ui.colored_label(theme::RED, error);
+        } else if let Some(note) = &state.virtual_display_cleanup_note {
+            ui.label(RichText::new(note).small().color(MUTED));
         }
     }
 
