@@ -1,7 +1,6 @@
 # 用户级单元不能由包替用户 enable（要在那个用户的会话里做），所以只提示。
 _openuuyc_service_note() {
   cat <<'NOTE'
-
 >>> 使用以下命令在登录时自动启动：
     systemctl --user enable openuuyc.service
 NOTE
@@ -11,7 +10,6 @@ NOTE
 # 时才由套接字拉起。装完不开启也一切照旧，只是诊断页里那一行会显示「服务未启用」。
 _openuuyc_virtual_display_note() {
   cat <<'NOTE'
-
 >>> 要使用虚拟显示器功能，请启用：
     sudo systemctl enable --now openuuyc-vkms.socket
 NOTE
@@ -20,9 +18,11 @@ NOTE
 post_install() {
   _openuuyc_service_note
   _openuuyc_virtual_display_note
+  echo
 }
 
 post_upgrade() {
   _openuuyc_service_note
   _openuuyc_virtual_display_note
+  echo
 }
