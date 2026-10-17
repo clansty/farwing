@@ -41,7 +41,7 @@ pub(crate) fn probe(
         }
     }
     if let Some(backend) = super::vaapi::hardware_backend() {
-        for codec in [Codec::H264] {
+        for codec in [Codec::H264, Codec::H265, Codec::Av1] {
             let format = Format {
                 codec,
                 chroma: 1,
@@ -356,6 +356,59 @@ impl Encoder {
 
 #[cfg(test)]
 mod tests {
+    /// 不需要桌面：给每个 VA-API 编码器灌十帧合成画面，把码流写出来交给
+    /// ffmpeg 验。`cargo test --release --lib -- --ignored vaapi_encodes_each_codec`
+    #[test]
+    #[ignore]
+    fn vaapi_encodes_each_codec() {
+        use super::super::capture::{Device, Image};
+        use crate::media::encoding::{Codec, Color, Format, QualityTarget, Rate};
+        use std::sync::Arc;
+        let size = (1280, 720);
+        let rate = Rate {
+            target: 4_000_000,
+            peak: 4_000_000,
+            fps: 30,
+            quality: 1,
+            quality_target: QualityTarget {
+                bitrate: 4_000_000,
+                fps: 30,
+            },
+        };
+        let mut pixels = vec![0u8; (size.0 * size.1 * 4) as usize];
+        for (index, pixel) in pixels.chunks_exact_mut(4).enumerate() {
+            let x = index as u32 % size.0;
+            let y = index as u32 / size.0;
+            pixel.copy_from_slice(&[x as u8, y as u8, (x + y) as u8, 255]);
+        }
+        let image = Image::Cpu {
+            pixels: Arc::new(pixels),
+            width: size.0,
+            height: size.1,
+        };
+        let backend = super::super::vaapi::hardware_backend().expect("没有 VA-API 后端");
+        for codec in [Codec::H264, Codec::H265, Codec::Av1] {
+            let format = Format {
+                codec,
+                chroma: 1,
+                depth: 8,
+            };
+            let mut encoder =
+                super::Encoder::hardware_format(backend, &Device, size, format, rate, Color::Sdr)
+                    .unwrap();
+            let mut bytes = Vec::new();
+            for index in 0..10 {
+                for encoded in encoder.encode(&image, index * 333_333, index == 0).unwrap() {
+                    bytes.extend_from_slice(&encoded.data);
+                }
+            }
+            let signature = crate::media::video_format::parse_stream_format(codec.media(), &bytes);
+            println!("{codec:?}: {} 字节，序列头 {signature:?}", bytes.len());
+            assert!(signature.is_some(), "{codec:?} 没有可解析的序列头");
+            std::fs::write(format!("/tmp/vaapi-{codec:?}.bin"), &bytes).unwrap();
+        }
+    }
+
     /// Needs a running X session: `DISPLAY=:0 cargo test -- --ignored`.
     #[test]
     #[ignore]

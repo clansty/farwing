@@ -1,5 +1,5 @@
 //! 选择驱动显示器的那块 GPU、打开 VA display，并向协议申报 AMD / Intel 后端与
-//! H264 能力。
+//! 编解码能力。
 //!
 //! 编码本身已经交给 libavcodec（见 `super::ffmpeg`），这里只剩设备与能力探测：
 //! 哪块 GPU 在驱动画面、这个驱动接不接受某个格式。`vaInitialize` 贵且 display
@@ -132,12 +132,14 @@ pub(crate) fn hardware_backend() -> Option<Backend> {
     }
 }
 
-/// The VA profile a format is encoded with. HEVC 从没被申报过——手写那份产不出
-/// 可解码头（见 AGENTS_QA.md），libavcodec 这条路也还没验证，先只认 H.264。
+/// The VA profile a format is encoded with. 8 位 4:2:0 只对应各编码的最基础档；
+/// 驱动没有对应 profile 时 `accepts()` 直接拒掉，由 `encoder.rs` 的试编再做一次
+/// 实证。
 fn profile(format: Format) -> Option<i32> {
     match format.codec {
         Codec::H264 => Some(VAProfile::VAProfileH264ConstrainedBaseline),
-        Codec::H265 | Codec::Av1 => None,
+        Codec::H265 => Some(VAProfile::VAProfileHEVCMain),
+        Codec::Av1 => Some(VAProfile::VAProfileAV1Profile0),
     }
 }
 
@@ -167,8 +169,7 @@ fn profile_entrypoint(format: Format) -> Option<(Rc<Display>, i32, u32)> {
 pub(crate) fn accepts(format: Format) -> bool {
     // The capture backends deliver 8-bit BGRA; any other input format would
     // need a different surface type and conversion here.
-    let codec = format.codec == Codec::H264 && format.chroma == 1 && format.depth == 8;
-    codec && profile_entrypoint(format).is_some()
+    format.chroma == 1 && format.depth == 8 && profile_entrypoint(format).is_some()
 }
 
 #[cfg(test)]
