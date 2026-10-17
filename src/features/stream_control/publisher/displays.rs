@@ -95,6 +95,37 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// 终端环境检查的回复。主控的判定是 `code == 0` **且** `message == "ok"`：
+/// 只回 `code = 0` 不够，这个字符串的长度和内容都被逐字节比较过，属于
+/// 协议的一部分，不是给人看的说明。
+#[derive(Clone, PartialEq, prost::Message)]
+struct CheckEnvResp {
+    #[prost(int32, tag = "1")]
+    code: i32,
+    #[prost(string, tag = "2")]
+    message: String,
+}
+
+impl CheckEnvResp {
+    /// 官方被控端的三种回答：能开终端、没有终端组件、环境检查没过。
+    fn result(refusal: Option<&'static str>) -> Self {
+        match refusal {
+            None => Self {
+                code: 0,
+                message: "ok".to_owned(),
+            },
+            Some(_) if crate::platform::terminal::unavailable().is_some() => Self {
+                code: 5,
+                message: "terminal_component_unavailable".to_owned(),
+            },
+            Some(_) => Self {
+                code: 6,
+                message: "environment_check_failed".to_owned(),
+            },
+        }
+    }
+}
+
 fn response(
     message: &PbControlMessage,
     header: Option<PbResponseHeader>,
@@ -206,23 +237,7 @@ pub(crate) async fn receive_session(
                         (!session.authorization().terminal_allowed()).then_some("本机未允许终端")
                     });
                     let allowed = refusal.is_none();
-                    #[derive(Clone, PartialEq, prost::Message)]
-                    struct CheckEnvResp {
-                        // optional 不是协议要求，是为了让 0 也真的写进
-                        // wire：proto3 默认跳过默认值，`code: 0` 编出来是
-                        // 空 payload，客户端会当成没有回复而一直重试。
-                        #[prost(int32, optional, tag = "1")]
-                        code: Option<i32>,
-                        #[prost(string, tag = "2")]
-                        detail: String,
-                    }
-                    // 0 is the success code the other RPCs use; a refusal is
-                    // reported so the client can show its own message rather
-                    // than waiting for a reply that never comes.
-                    let resp = CheckEnvResp {
-                        code: Some(if allowed { 0 } else { 1 }),
-                        detail: refusal.unwrap_or_default().to_owned(),
-                    };
+                    let resp = CheckEnvResp::result(refusal);
                     // 客户端超时会重发；把 request_id 记下来，失败时能对上
                     // 是哪一次没被接住。
                     tracing::info!(
