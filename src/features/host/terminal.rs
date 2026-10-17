@@ -87,6 +87,18 @@ const PUMP_BUDGET: usize = 256 * 1024;
 /// Output the data channel may hold before the pump stops reading the ptys,
 /// the same mark the file transfer keeps to.
 const OUTPUT_HIGH_WATER: usize = 2 * 1024 * 1024;
+/// 主控能要求的最大终端尺寸。屏幕模型按格预分配（每格 32 字节，全屏程序
+/// 用备用屏幕时还要再一份），不设上限的话 65535 × 65535 就是 128 GiB，
+/// 直接把被控进程打挂；ConPTY 的 COORD 还是有符号 16 位。512 列比 4K 屏
+/// 在 7 像素字体下还宽，512 × 256 一屏 4 MiB。
+const MAX_COLS: u16 = 512;
+const MAX_ROWS: u16 = 256;
+
+/// pty 与屏幕模型实际采用的大小。
+fn clamp_size(cols: u16, rows: u16) -> (u16, u16) {
+    (cols.clamp(1, MAX_COLS), rows.clamp(1, MAX_ROWS))
+}
+
 /// A shell nobody has attached to for this long is ended.
 const IDLE_LIMIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 /// How often detached shells are checked against [`IDLE_LIMIT`].
@@ -299,14 +311,13 @@ impl Session {
             (Some(size), None) | (None, Some(size)) => size,
             (None, None) => return,
         };
-        if self.pty.resize(size.0, size.1).is_err() {
+        let (cols, rows) = clamp_size(size.0, size.1);
+        if self.pty.resize(cols, rows).is_err() {
             return;
         }
         // The model has to follow the pty, or the replay would describe a
         // screen of the old size.
-        self.screen
-            .screen_mut()
-            .set_size(size.1.max(1), size.0.max(1));
+        self.screen.screen_mut().set_size(rows, cols);
     }
 }
 
@@ -495,6 +506,7 @@ impl Sessions {
         if self.owned(owner).any(|(_, session)| session.name == name) {
             return Err(SessionError::DuplicateName);
         }
+        let (cols, rows) = clamp_size(cols, rows);
         let pty = crate::platform::terminal::Session::open(shell, cols, rows)
             .map_err(|_| SessionError::Gone)?;
         let stamp = now_ms();
@@ -506,7 +518,7 @@ impl Sessions {
                 state: SessionState::Running,
                 created_ms: stamp,
                 last_active_ms: stamp,
-                screen: vt100::Parser::new(rows.max(1), cols.max(1), 0),
+                screen: vt100::Parser::new(rows, cols, 0),
                 pending: Vec::new(),
                 output: BTreeMap::from([(Consumer::Remote(connection), Vec::new())]),
                 remote_size: Some((cols, rows)),
@@ -2234,6 +2246,36 @@ mod tests {
             without_alternate_scroll(b"\x1b[?1000h\x1b[?1007"),
             b"\x1b[?1000h\x1b[?1007"
         );
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", windows)),
+        ignore = "no terminal backend on this platform"
+    )]
+    fn an_oversized_terminal_is_clamped() {
+        let mut sessions = Sessions::default();
+        // 不设上限的话，这个尺寸光屏幕模型就要 128 GiB。
+        let (handle, _, _) = sessions
+            .open("acct", 0, 1, shell(), None, u16::MAX, u16::MAX)
+            .expect("open");
+        let size = |sessions: &Sessions| {
+            sessions.sessions[&key("acct", handle)]
+                .screen
+                .screen()
+                .size()
+        };
+        assert_eq!(size(&sessions), (MAX_ROWS, MAX_COLS));
+        sessions.resize("acct", handle, 100, 40).expect("resize");
+        assert_eq!(size(&sessions), (40, 100));
+        sessions
+            .resize("acct", handle, u16::MAX, 0)
+            .expect("resize");
+        assert_eq!(size(&sessions), (1, MAX_COLS));
+        sessions
+            .open("acct", handle, 1, shell(), None, 0, u16::MAX)
+            .expect("reattach");
+        assert_eq!(size(&sessions), (MAX_ROWS, 1));
     }
 
     #[test]
