@@ -22,8 +22,8 @@ mod logs;
 mod port_mapping;
 mod power;
 mod remote_diagnostics;
-mod terminal_sessions;
 mod startup;
+mod terminal_sessions;
 mod update_dialog;
 mod wol_setup;
 
@@ -860,18 +860,16 @@ impl DeviceCenterApp {
                     self.center_ui.page = Page::Management;
                 }
                 let terminals = crate::features::host::terminal::running();
-                if terminals > 0 {
-                    ui.add_space(14.0);
-                    ui.label(RichText::new("本机被控").small().color(MUTED));
-                    if nav_item(
-                        ui,
-                        Icon::Terminal,
-                        "终端会话",
-                        Some(terminals),
-                        self.center_ui.page == Page::TerminalSessions,
-                    ) {
-                        self.center_ui.page = Page::TerminalSessions;
-                    }
+                ui.add_space(14.0);
+                ui.label(RichText::new("本机被控").small().color(MUTED));
+                if nav_item(
+                    ui,
+                    Icon::Terminal,
+                    "终端会话",
+                    (terminals > 0).then_some(terminals),
+                    self.center_ui.page == Page::TerminalSessions,
+                ) {
+                    self.center_ui.page = Page::TerminalSessions;
                 }
                 ui.add_space(14.0);
                 ui.label(RichText::new("远程协助").small().color(MUTED));

@@ -32,6 +32,11 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::PWSTR;
 
+/// ConPTY 不暴露前台进程组。
+pub(crate) fn foreground_supported() -> bool {
+    false
+}
+
 /// Windows can serve a terminal; Linux states why it cannot here.
 pub(crate) fn unavailable() -> Option<&'static str> {
     None
@@ -209,6 +214,11 @@ impl Session {
     }
 
     /// The shell this session runs.
+    /// ConPTY 不暴露前台进程组，控制台 API 也不给进程树；这里先不报。
+    pub(crate) fn foreground(&self) -> Option<crate::platform::Foreground> {
+        None
+    }
+
     pub(crate) fn shell(&self) -> &str {
         &self.shell
     }

@@ -114,6 +114,9 @@ fn handle_client(mut stream: UnixStream) -> Result<()> {
                         "last_active_ms": session.last_active_ms,
                         "remote": session.remote,
                         "local": session.local,
+                        "foreground": session.foreground.map(|foreground| {
+                            json!({"name": foreground.name, "command": foreground.command})
+                        }),
                     })
                 })
                 .collect();
@@ -121,6 +124,27 @@ fn handle_client(mut stream: UnixStream) -> Result<()> {
             answer.push(b'\n');
             stream.write_all(&answer)?;
             Ok(())
+        }
+        Some("new") => {
+            let name = request
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let handle = match super::create_local(name) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    let mut answer =
+                        serde_json::to_vec(&json!({"ok": false, "message": error.to_string()}))?;
+                    answer.push(b'\n');
+                    stream.write_all(&answer)?;
+                    return Ok(());
+                }
+            };
+            // 新建完直接接入；客户端看到的是同一个回复形状。
+            let mut attach_request = request.clone();
+            attach_request["action"] = Value::from("attach");
+            attach_request["session"] = Value::from(handle);
+            attach(stream, reader, &attach_request)
         }
         Some("attach") => attach(stream, reader, &request),
         other => bail!("未知的终端通道请求 {other:?}"),
@@ -251,11 +275,15 @@ fn read_frame(reader: &mut impl Read) -> std::io::Result<(u8, Vec<u8>)> {
     Ok((header[0], payload))
 }
 
-/// 在本机终端里列出会话；`attach` 时接上其中一个。
-pub(crate) fn run_client(session: Option<&str>, list: bool) -> Result<()> {
+/// 在本机终端里列出会话、接上一个，或新建一个再接上。
+pub(crate) fn run_client(session: Option<&str>, list: bool, new: bool) -> Result<()> {
     let path = socket_path().context("XDG_RUNTIME_DIR 未设置，无法接入本机终端")?;
+    if new {
+        // 新建时位置参数是名字，可以省略。
+        return attach_client(&path, session, true);
+    }
     match session.filter(|_| !list) {
-        Some(session) => attach_client(&path, session),
+        Some(session) => attach_client(&path, Some(session), false),
         None => list_sessions(&path),
     }
 }
@@ -293,12 +321,16 @@ fn list_sessions(path: &std::path::Path) -> Result<()> {
         } else {
             attached.join("、")
         };
-        println!("{handle:>3}  {name}  {state}  {shell}  已附着：{attached}");
+        let running = session["foreground"]["name"]
+            .as_str()
+            .map(|command| format!("  {command}"))
+            .unwrap_or_default();
+        println!("{handle:>3}  {name}  {state}  {shell}{running}  已附着：{attached}");
     }
     Ok(())
 }
 
-fn attach_client(path: &std::path::Path, session: &str) -> Result<()> {
+fn attach_client(path: &std::path::Path, session: Option<&str>, new: bool) -> Result<()> {
     use std::os::fd::AsRawFd;
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -308,12 +340,22 @@ fn attach_client(path: &std::path::Path, session: &str) -> Result<()> {
     let (cols, rows) = terminal_size(stdout.as_raw_fd());
     let mut stream = connect(path)?;
     // 名字里不会有引号之外的麻烦：会话名在服务端已经过滤掉控制字符。
-    let request = json!({
-        "action": "attach",
-        "session": session.parse::<u32>().map(Value::from).unwrap_or_else(|_| Value::from(session)),
-        "cols": cols,
-        "rows": rows,
-    });
+    let request = if new {
+        json!({
+            "action": "new",
+            "name": session,
+            "cols": cols,
+            "rows": rows,
+        })
+    } else {
+        let session = session.context("缺少会话")?;
+        json!({
+            "action": "attach",
+            "session": session.parse::<u32>().map(Value::from).unwrap_or_else(|_| Value::from(session)),
+            "cols": cols,
+            "rows": rows,
+        })
+    };
     let mut line = serde_json::to_vec(&request)?;
     line.push(b'\n');
     stream.write_all(&line)?;
@@ -567,11 +609,30 @@ mod tests {
         let reply: Value = serde_json::from_str(line.trim()).expect("attach json");
         assert_eq!(reply["ok"], true, "attach is accepted: {reply:?}");
         assert_eq!(reply["name"], "socket-test");
+        // 新建：不经过手机端，编号落在本机区间。
+        let created = {
+            let mut stream = UnixStream::connect(&path).expect("connect");
+            stream
+                .write_all(
+                    b"{\"action\":\"new\",\"name\":\"made-by-cli\",\"cols\":80,\"rows\":24}\n",
+                )
+                .expect("new");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read new");
+            let reply: Value = serde_json::from_str(line.trim()).expect("new json");
+            assert_eq!(reply["ok"], true, "new is accepted: {reply:?}");
+            let created = reply["handle"].as_u64().expect("handle") as u32;
+            assert!(created >= 1000, "local handles start at 1000");
+            created
+        };
+
         // 命令行入口走的是同一条路。
-        run_client(None, true).expect("the client lists");
+        run_client(None, true, false).expect("the client lists");
         // 断开后会话还在，本机这一端也不算附着了。
         drop(stream);
         drop(reader);
+        super::super::kill_local(created);
         super::super::kill_local(handle);
     }
 }

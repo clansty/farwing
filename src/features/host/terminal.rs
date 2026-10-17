@@ -75,6 +75,10 @@ const MAX_SESSIONS: usize = 16;
 const MAX_NAME: usize = 64;
 /// Shells all logins together may hold, on top of [`MAX_SESSIONS`] each.
 const MAX_TOTAL: usize = 64;
+/// 本机自己创建的会话在表里的所有者。手机端按账号列出会话，看不到这些。
+const LOCAL_OWNER: &str = "local";
+/// 本机会话的编号从这里往上找，避开主控常用的小编号，免得两边撞号。
+const LOCAL_HANDLE_BASE: u32 = 1000;
 /// Input a session may hold when the pty will not take it yet. A frame that
 /// would go past it is refused whole (see [`Sessions::write`]).
 const PENDING_LIMIT: usize = 1024 * 1024;
@@ -394,6 +398,8 @@ pub(crate) struct LocalSession {
     pub remote: bool,
     /// 本机是否已经有终端接上。
     pub local: bool,
+    /// 前台正在跑的命令；空闲时为 `None`。
+    pub foreground: Option<crate::platform::Foreground>,
 }
 
 /// 一次本机 pump 的结果。
@@ -507,6 +513,53 @@ impl Sessions {
             },
         );
         Ok((handle, name, Vec::new()))
+    }
+
+    /// 本机主动开一个会话，不经过主控。
+    ///
+    /// 这类会话没有远程消费者，也不在 30 分钟空闲清扫的范围里：用户自己开
+    /// 的东西应当等用户自己关。编号从 [`LOCAL_HANDLE_BASE`] 起，与手机端
+    /// 常用的小编号分开。
+    pub(crate) fn create_local(&mut self, name: Option<String>) -> Result<u32, SessionError> {
+        if self.sessions.len() >= MAX_TOTAL {
+            return Err(SessionError::TooMany);
+        }
+        let name = match name {
+            Some(name) => validate_name(&name)?,
+            None => self.default_name(LOCAL_OWNER),
+        };
+        if self
+            .owned(LOCAL_OWNER)
+            .any(|(_, session)| session.name == name)
+        {
+            return Err(SessionError::DuplicateName);
+        }
+        let handle = (LOCAL_HANDLE_BASE..u32::MAX)
+            .find(|handle| !self.sessions.contains_key(&key(LOCAL_OWNER, *handle)))
+            .unwrap_or(LOCAL_HANDLE_BASE);
+        let shell = Sessions::default_shell();
+        // 尺寸只是占位：接上本地终端时 `attach_local` 会按那端改。
+        let pty = crate::platform::terminal::Session::open(&shell, 80, 24)
+            .map_err(|_| SessionError::Gone)?;
+        let stamp = now_ms();
+        self.sessions.insert(
+            key(LOCAL_OWNER, handle),
+            Session {
+                pty,
+                name,
+                state: SessionState::Detached,
+                created_ms: stamp,
+                last_active_ms: stamp,
+                screen: vt100::Parser::new(24, 80, 0),
+                pending: Vec::new(),
+                output: BTreeMap::new(),
+                remote_size: None,
+                local_size: None,
+                // 用户主动开的会话不参与空闲清扫。
+                detached_since: None,
+            },
+        );
+        Ok(handle)
     }
 
     fn owned<'a>(&'a self, owner: &'a str) -> impl Iterator<Item = (u32, &'a Session)> + 'a {
@@ -742,6 +795,7 @@ impl Sessions {
                     .output
                     .keys()
                     .any(|consumer| matches!(consumer, Consumer::Local(_))),
+                foreground: session.pty.foreground(),
             })
             .collect();
         listed.sort_by_key(|session| session.created_ms);
@@ -1073,6 +1127,16 @@ pub(crate) fn kill_local(handle: u32) -> bool {
         }
         None => false,
     }
+}
+
+/// 当前平台能不能报出终端里的前台命令。
+pub(crate) fn foreground_supported() -> bool {
+    crate::platform::terminal::foreground_supported()
+}
+
+/// 本机新建一个会话，返回它的编号。
+pub(crate) fn create_local(name: Option<String>) -> Result<u32, SessionError> {
+    lock_table(&shared()).create_local(name)
 }
 
 /// 在系统终端模拟器里接上这个会话。
@@ -2045,6 +2109,38 @@ mod tests {
             seen.contains("30 80"),
             "the pty takes the smallest of both ends: {seen:?}"
         );
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", windows)),
+        ignore = "no terminal backend on this platform"
+    )]
+    fn a_local_session_is_created_listed_and_kept() {
+        let mut sessions = Sessions::default();
+        let handle = sessions.create_local(Some("mine".into())).expect("create");
+        assert!(
+            handle >= LOCAL_HANDLE_BASE,
+            "local handles stay out of the controller's small numbers"
+        );
+        let listed = sessions.list_local();
+        assert!(
+            listed
+                .iter()
+                .any(|session| session.handle == handle && session.name == "mine"),
+            "the new session is listed"
+        );
+        // 手机端按账号列出会话，看不到本机自己开的。
+        assert!(sessions.list("acct").is_empty());
+        // 用户自己开的会话不参与 30 分钟空闲清扫。
+        let (exited, abandoned) = sessions.sweep(std::time::Duration::ZERO);
+        assert!(exited.sessions.is_empty());
+        assert!(abandoned.sessions.is_empty());
+        assert_eq!(
+            sessions.create_local(Some("mine".into())).err(),
+            Some(SessionError::DuplicateName)
+        );
+        sessions.kill(LOCAL_OWNER, handle).expect("kill").finish();
     }
 
     #[test]

@@ -115,6 +115,9 @@ enum Commands {
         /// 只列出会话，不接入
         #[arg(long)]
         list: bool,
+        /// 新建一个会话并直接接上；位置参数作为名字
+        #[arg(long)]
+        new: bool,
     },
     #[command(hide = true)]
     PluginVideoHost,
@@ -319,8 +322,8 @@ fn main() -> Result<()> {
             openuuyc::application::capture_agent(&pipe, parent)
         }
         Commands::DisplayRecovery { token } => openuuyc::application::display_recovery(&token),
-        Commands::Terminal { session, list } => {
-            openuuyc::application::terminal_attach(session.as_deref(), list)
+        Commands::Terminal { session, list, new } => {
+            openuuyc::application::terminal_attach(session.as_deref(), list, new)
         }
         Commands::PluginVideoHost => openuuyc::plugins::video::host(),
         #[cfg(windows)]

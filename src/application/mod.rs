@@ -22,8 +22,8 @@ pub fn launch_installed(
 ///
 /// 会话跑在 GUI 进程里，这里只是经 Unix socket 连过去；关闭这个终端不会
 /// 结束会话。
-pub fn terminal_attach(session: Option<&str>, list: bool) -> anyhow::Result<()> {
-    crate::features::host::terminal::local::run_client(session, list)
+pub fn terminal_attach(session: Option<&str>, list: bool, new: bool) -> anyhow::Result<()> {
+    crate::features::host::terminal::local::run_client(session, list, new)
 }
 
 /// Hand the GUI to the installed copy when one exists. Linux has no
