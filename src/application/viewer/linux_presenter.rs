@@ -5,6 +5,10 @@
 //! built the other way round: frames land on the CPU (software decode), the
 //! wgpu shell draws them under the egui chrome, and input comes from the winit
 //! events the compositor delivers to the focused window.
+
+mod fullscreen;
+
+use fullscreen::FullscreenChrome;
 use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
@@ -336,7 +340,7 @@ impl ConnectingWindowsRunner {
                     {
                         let _ = window.request_inner_size(LogicalSize::new(1280.0, 760.0));
                     }
-                    match Player::new(*session, &window, self.proxy.clone()) {
+                    match Player::new(*session, self.alias.clone(), &window, self.proxy.clone()) {
                         Ok(player) => {
                             window.set_visible(true);
                             self.stage = Stage::Playing(Box::new(player));
@@ -451,7 +455,7 @@ impl ConnectingWindowsRunner {
                         ),
                     };
                     if let Stage::Playing(player) = stage {
-                        player.title_bar_controls(ui, bar, &window);
+                        player.title_bar_controls(ui, bar, &window, true);
                     }
                 });
             }
@@ -830,11 +834,16 @@ struct Player {
     linked: Option<Arc<crate::platform::linux::drag_drop::linked::Linked>>,
     /// Mouse mode of the previous frame, to notice control being dropped.
     last_mouse_mode: MouseMode,
+    /// 设备别名，全屏浮条左侧要显示它（标题栏用的也是同一个字符串）。
+    alias: String,
+    /// 全屏浮条：标题栏藏起来之后，操作栏浮在画面顶部。
+    fullscreen_chrome: FullscreenChrome,
 }
 
 impl Player {
     fn new(
         mut session: NativeViewerSession,
+        alias: String,
         window: &Arc<Window>,
         proxy: EventLoopProxy<UiEvent>,
     ) -> Result<Self> {
@@ -910,6 +919,8 @@ impl Player {
             diagnostics_at: [None; 2],
             hidden_since: None,
             last_mouse_mode: MouseMode::View,
+            alias,
+            fullscreen_chrome: FullscreenChrome::default(),
         })
     }
 
@@ -950,7 +961,9 @@ impl Player {
         if self.focused
             && window.is_minimized() != Some(true)
             && !control.drag_drop().interactive()
-            && !self.stream_control_ui.open
+            // 菜单、浮条等本机界面占着输入时不要抢回来，否则和 `update_input_gate`
+            // 的暂停每帧互相抵消。
+            && !self.local_input_blocked
             // 切屏/切设备期间两边都在换轨道，这时候夺回控制会把键鼠落到别处。
             && !self.switching()
             && !ctx.any_popup_open()
@@ -967,6 +980,10 @@ impl Player {
             || context.any_popup_open()
             || context.text_edit_focused()
             || context.memory(|memory| memory.top_modal_layer().is_some())
+            // 全屏时指针在浮条上也一样：鼠标在操作栏上，按键不该落到远端。
+            || self
+                .fullscreen_chrome
+                .owns_pointer(context, self.input().relative_mode())
     }
 
     /// 本机界面开始接管输入的那一刻，把已经交给远端的键和指针收回来：否则菜单
@@ -1356,10 +1373,103 @@ impl Player {
         })
     }
 
+    /// 全屏时标题栏整条隐藏，操作栏改为浮在画面顶部的一条：内容与标题栏同一套，
+    /// 只是不占画面位置。行为（自动收起、进入提示）与 Windows 的浮条一致。
+    fn show_fullscreen_chrome(&mut self, context: &egui::Context, window: &Arc<Window>) {
+        let relative = self.input().relative_mode();
+        let menu_open = self.stream_control_ui.open || context.any_popup_open();
+        let busy = menu_open || self.pending.is_some() || context.input(|i| i.pointer.any_down());
+        // 绘制闭包要用整个 `self`，先把浮条状态挪出来，画完再放回去。
+        let mut chrome = std::mem::take(&mut self.fullscreen_chrome);
+        chrome.show(context, relative, busy, menu_open, |ui| {
+            self.fullscreen_bar(ui, window);
+        });
+        self.fullscreen_chrome = chrome;
+    }
+
+    /// 浮条的内容：左边品牌与设备切换，中间与标题栏同一排按钮和屏标签，右边窗口按钮。
+    fn fullscreen_bar(&mut self, ui: &mut egui::Ui, window: &Arc<Window>) {
+        use crate::ui::theme;
+        ui.set_min_height(theme::WINDOW_TITLE_CONTENT_HEIGHT);
+        let rect = egui::Rect::from_min_size(
+            ui.available_rect_before_wrap().min,
+            egui::vec2(ui.available_width(), theme::WINDOW_TITLE_CONTENT_HEIGHT),
+        );
+        // 和标题栏一样：左边留出品牌与别名那一格，右边留出窗口按钮那一格。
+        let controls_left = (rect.right() - theme::WINDOW_CONTROLS_WIDTH).max(rect.left());
+        let identity_rect = egui::Rect::from_min_max(
+            rect.min,
+            egui::pos2(
+                (rect.left() + TITLE_CAPTION_WIDTH).min(controls_left),
+                rect.bottom(),
+            ),
+        );
+        let mut identity = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(identity_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        identity.set_clip_rect(identity_rect);
+        crate::ui::chrome::paint_brand_logo(&mut identity);
+        let alias = self.alias.trim_start_matches(crate::VIEWER_TITLE_PREFIX);
+        match self.device_switch() {
+            Some(switcher) => {
+                let response = crate::ui::controls::viewer_device_button(&mut identity, alias);
+                switcher.menu(&response, window.id());
+            }
+            None => {
+                identity.add(
+                    egui::Label::new(
+                        egui::RichText::new(alias)
+                            .size(theme::BODY)
+                            .strong()
+                            .color(theme::TEXT),
+                    )
+                    .truncate(),
+                );
+            }
+        }
+        self.title_bar_controls(ui, rect, window, false);
+
+        let mut controls = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(
+                    egui::Rect::from_min_max(egui::pos2(controls_left, rect.top()), rect.max)
+                        .shrink2(egui::vec2(4.0, 0.0)),
+                )
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        controls.spacing_mut().item_spacing.x = 4.0;
+        // 和 Windows 的全屏浮条一样：最小化、退出全屏、关闭。
+        if caption_button(&mut controls, ViewerCaptionIcon::Minimize, false, "最小化").clicked()
+        {
+            window.set_minimized(true);
+        }
+        if caption_button(&mut controls, ViewerCaptionIcon::Restore, false, "退出全屏").clicked()
+        {
+            set_fullscreen(window, None);
+        }
+        if caption_button(
+            &mut controls,
+            ViewerCaptionIcon::Close,
+            false,
+            "关闭当前串流窗口",
+        )
+        .clicked()
+        {
+            self.run_shortcut(ViewerShortcut::Close, window);
+        }
+    }
+
     fn draw(&mut self, ui: &mut egui::Ui, window: &Arc<Window>) -> Option<VideoPlacement> {
         // The title bar is a panel above this ui; max_rect would include it and
         // push the first rows of the picture underneath it.
         let content = ui.available_rect_before_wrap();
+        // 全屏时标题栏整条不画，操作栏改由浮条承担（见 `show_fullscreen_chrome`）。
+        self.fullscreen_chrome.sync(window.fullscreen().is_some());
+        if window.fullscreen().is_some() {
+            self.show_fullscreen_chrome(ui.ctx(), window);
+        }
         self.video_rect = None;
         let scale = ui.ctx().pixels_per_point();
         self.scale = scale;
@@ -1414,8 +1524,8 @@ impl Player {
             &mut view,
             screen_id,
             local_size,
-            // Windows 那边这里要减掉全屏标题栏的宽度（`menu_inset`），Linux 没有那截。
-            egui::vec2(-114.0, 52.0),
+            // 全屏时把菜单向左让到浮条之外，和 Windows 的 `menu_inset` 一样。
+            egui::vec2(-114.0 - self.fullscreen_chrome.menu_inset(ui.ctx()), 52.0),
         );
         self.set_performance_mode(view.performance_mode);
         self.session
@@ -1588,6 +1698,7 @@ impl Player {
         ui: &mut egui::Ui,
         bar: egui::Rect,
         window: &Arc<Window>,
+        fullscreen_button: bool,
     ) {
         // Leave the logo and alias on the left and the window buttons on the right.
         let left = bar.left() + TITLE_CAPTION_WIDTH;
@@ -1632,16 +1743,17 @@ impl Player {
                 .on_disabled_hover_text(hint);
         }
 
-        // Windows 的 caption 里没有全屏按钮：它全屏之后会浮出一根工具条。Linux 还没有
-        // 那根条子，而全屏时整条标题栏都会隐藏（见 `draw` 里的判断），所以离开全屏
-        // 得留一个入口在这儿。它挨着 1:1，把靠左的位置让给下面那几个常用的开关。
-        if caption_button(
-            &mut row,
-            ViewerCaptionIcon::Fullscreen,
-            window.fullscreen().is_some(),
-            "切换全屏",
-        )
-        .clicked()
+        // Windows 的 caption 里没有全屏按钮：它全屏之后会浮出一根工具条。Linux 的全屏
+        // 入口只有快捷键，所以标题栏里留这一个；全屏浮条自己不画它，退出全屏用浮条里
+        // 的窗口按钮（和 Windows 一样）。
+        if fullscreen_button
+            && caption_button(
+                &mut row,
+                ViewerCaptionIcon::Fullscreen,
+                window.fullscreen().is_some(),
+                "切换全屏",
+            )
+            .clicked()
         {
             toggle_fullscreen(window);
         }

@@ -38,8 +38,8 @@ pub(crate) enum ViewerCaptionIcon {
     Microphone,
     Clipboard,
     Quality,
-    /// 只有 Linux 的播放器用它：Windows 那边全屏之后会浮出一根工具条，Linux 还没有，
-    /// 而全屏时整条标题栏都会隐藏，所以离开全屏必须留一个图标在这儿。
+    /// 只有 Linux 播放器的标题栏用它（Windows 的 caption 里没有全屏按钮）。它在
+    /// 全屏时不可见，用来进入全屏；退出全屏走全屏浮条里的窗口按钮。
     Fullscreen,
     Minimize,
     Maximize,
