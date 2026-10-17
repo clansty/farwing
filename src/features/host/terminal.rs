@@ -1258,7 +1258,10 @@ pub(crate) fn bind(
                         if stop.is_cancelled() {
                             break;
                         }
-                        if let Err(error) = channel.send(&Bytes::from(response)).await {
+                        // 和项目里其他业务回复一样走 text PPID。官方客户端
+                        // 在业务通道上按文本消息收 protobuf，binary 的那一
+                        // 份它不解析，环境检查就会一直等到超时。
+                        if let Err(error) = channel.send_text_bytes(&Bytes::from(response)).await {
                             tracing::warn!(%error, "host terminal response failed");
                             break;
                         }
