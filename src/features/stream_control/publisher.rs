@@ -8,6 +8,20 @@ use anyhow::Context as _;
 mod displays;
 pub(crate) use displays::{receive_session, screen_states};
 
+/// 终端会话列表变化的通知。
+///
+/// 官方被控端在会话增删改时广播这个空消息，主控收到后自己重新发
+/// `listSessionsReq`；它只接受自己请求之后的第一条列表响应，主动推列表
+/// 会被丢掉，所以通知是唯一能让列表页刷新的方式。
+pub(crate) fn terminal_session_changed() -> Vec<u8> {
+    PbControlMessage {
+        seq: 0,
+        timestamp: 0,
+        payload: Some(PbPayload::TerminalSessionChanged(Vec::new())),
+    }
+    .encode_to_vec()
+}
+
 pub(crate) struct DrawRequest {
     pub command: super::annotation::wire::PbDrawRequestKind,
     sequence: i64,

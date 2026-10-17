@@ -1263,9 +1263,6 @@ pub(crate) fn bind(
     cancel: CancellationToken,
 ) {
     let connection = next_connection();
-    // 客户端每次列表请求都带一个新的 handle，回填它才会被当成响应。主动
-    // 推送沿用它最近一次用过的 handle，0 是没人要的帧。
-    let list_handle = Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
     let stop = cancel.child_token();
     let close = stop.clone();
     channel.on_close(Box::new(move || {
@@ -1277,12 +1274,10 @@ pub(crate) fn bind(
     let pump_screens = screens.clone();
     let pump_stop = stop.clone();
     let weak = Arc::downgrade(channel);
-    let message_list_handle = list_handle.clone();
     channel.on_message(Box::new(move |message| {
         let weak = weak.clone();
         let screens = screens.clone();
         let stop = stop.clone();
-        let list_handle = message_list_handle.clone();
         Box::pin(async move {
             if stop.is_cancelled() {
                 return;
@@ -1292,7 +1287,7 @@ pub(crate) fn bind(
             };
             let data = message.data.clone();
             if data.starts_with(MAGIC) {
-                handle_frame(&channel, &screens, &data, connection, &list_handle, &stop).await;
+                handle_frame(&channel, &screens, &data, connection, &stop).await;
                 return;
             }
             let responses = {
@@ -1333,8 +1328,8 @@ pub(crate) fn bind(
     let pump_channel = Arc::downgrade(channel);
     let table = shared();
     tokio::spawn(async move {
-        // 客户端第一次请求列表时才开始跟踪，之后只在版本变化时补推。
-        let mut listed_generation = u64::MAX;
+        // 从连接时的版本开始跟踪，只在之后的增删改时通知。
+        let mut listed_generation = lock_table(&table).generation();
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(20));
         loop {
             ticker.tick().await;
@@ -1362,21 +1357,19 @@ pub(crate) fn bind(
             }
             // 列表变了就主动补推一份：客户端的会话列表页只会自己请求一次，
             // 手机/Windows 端新建终端后不等它轮询就能看到。
+            // 会话列表变了就广播一条空通知，主控收到后自己重新拉列表。
+            // 主动推 type 10 没用：它只认自己发过 listSessionsReq 之后的
+            // 第一条响应，其余被在途门控直接丢掉。
             let generation = lock_table(&table).generation();
-            let list_handle = list_handle.load(std::sync::atomic::Ordering::Relaxed);
-            if generation != listed_generation && list_handle != u32::MAX {
-                let payload = {
-                    let sessions = lock_table(&table);
-                    serde_json::to_vec(&Value::Array(sessions.list(&account)))
-                        .unwrap_or_else(|_| b"[]".to_vec())
-                };
-                let frame = Frame::encode(FrameType::ListSessionsResp, list_handle, &payload);
-                tracing::debug!(
-                    generation,
-                    bytes = payload.len(),
-                    "host terminal session list pushed"
-                );
-                if channel.send(&Bytes::from(frame)).await.is_err() {
+            if generation != listed_generation {
+                let changed =
+                    crate::features::stream_control::publisher::terminal_session_changed();
+                tracing::debug!(generation, "host terminal session list changed");
+                if channel
+                    .send_text_bytes(&Bytes::from(changed))
+                    .await
+                    .is_err()
+                {
                     pump_stop.cancel();
                     break;
                 }
@@ -1436,7 +1429,6 @@ async fn handle_frame(
     screens: &Arc<tokio::sync::Mutex<crate::features::host::peer::screens::Screens>>,
     data: &[u8],
     connection: u64,
-    list_handle: &std::sync::atomic::AtomicU32,
     stop: &CancellationToken,
 ) {
     let Some(frame) = Frame::parse(data) else {
@@ -1499,7 +1491,6 @@ async fn handle_frame(
     } else {
         match frame.kind {
             FrameType::ListSessionsReq => {
-                list_handle.store(frame.session, std::sync::atomic::Ordering::Relaxed);
                 let listed = lock_table(&table).list(&account);
                 let payload =
                     serde_json::to_vec(&Value::Array(listed)).unwrap_or_else(|_| b"[]".into());
@@ -2363,6 +2354,15 @@ mod tests {
         assert_ne!(renamed, created, "renaming bumps the list");
         sessions.kill(LOCAL_OWNER, handle).expect("kill").finish();
         assert_ne!(sessions.generation(), renamed, "killing bumps the list");
+    }
+
+    #[test]
+    fn a_session_change_is_the_control_message_field() {
+        // PbControlMessage 的 oneof 字段 28（wire type 2），空消息。
+        assert_eq!(
+            crate::features::stream_control::publisher::terminal_session_changed(),
+            [0xE2, 0x01, 0x00]
+        );
     }
 
     #[test]
