@@ -1365,6 +1365,11 @@ pub(crate) fn bind(
                         .unwrap_or_else(|_| b"[]".to_vec())
                 };
                 let frame = Frame::encode(FrameType::ListSessionsResp, 0, &payload);
+                tracing::debug!(
+                    generation,
+                    bytes = payload.len(),
+                    "host terminal session list pushed"
+                );
                 if channel.send(&Bytes::from(frame)).await.is_err() {
                     pump_stop.cancel();
                     break;
