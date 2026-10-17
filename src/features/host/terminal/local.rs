@@ -438,15 +438,24 @@ pub(crate) fn open_in_terminal(session: u32) -> Result<()> {
     let (program, args) = terminal_emulator().context("找不到可用的终端模拟器")?;
     let mut command = std::process::Command::new(&program);
     command.args(args);
-    command
-        .arg(exe)
-        .arg("terminal")
-        .arg("attach")
-        .arg(session.to_string());
+    command.args(attach_arguments(&exe, session));
     command
         .spawn()
         .with_context(|| format!("启动 {program} 失败"))?;
     Ok(())
+}
+
+/// 在系统终端里重新运行本程序本身，再接上会话。
+///
+/// 用当前可执行文件的路径而不是写死 `OpenUUYC`：便携运行、`cargo run` 和
+/// 安装到别的目录时，命令名不一定就是 PATH 里的那一个。Linux 上
+/// `current_exe` 读的就是 `/proc/self/exe`。
+fn attach_arguments(exe: &std::path::Path, session: u32) -> Vec<std::ffi::OsString> {
+    vec![
+        exe.as_os_str().to_owned(),
+        "terminal".into(),
+        session.to_string().into(),
+    ]
 }
 
 /// 找一个能运行命令的终端模拟器。`$TERMINAL` 优先，再试常见的几个。
@@ -504,6 +513,20 @@ fn in_path(program: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    /// 重新运行的是当前可执行文件，参数与 CLI 的形状一致。
+    #[test]
+    fn the_attach_command_reruns_this_binary() {
+        let arguments = attach_arguments(std::path::Path::new("/opt/openuuyc/OpenUUYC"), 7);
+        assert_eq!(
+            arguments,
+            vec![
+                std::ffi::OsString::from("/opt/openuuyc/OpenUUYC"),
+                std::ffi::OsString::from("terminal"),
+                std::ffi::OsString::from("7"),
+            ]
+        );
+    }
 
     /// 走一遍真实的 socket：列出一个会话，再接上它。
     #[test]
