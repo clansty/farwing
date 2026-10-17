@@ -167,8 +167,6 @@ impl DeviceCenterApp {
                 }
             },
         );
-        #[cfg(target_os = "linux")]
-
         if let Some(host) = host.as_ref() {
             if host.request_audio_devices()
                 && self
