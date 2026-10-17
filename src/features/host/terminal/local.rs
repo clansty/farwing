@@ -288,13 +288,60 @@ pub(crate) fn run_client(session: Option<&str>, list: bool, new: bool) -> Result
     }
 }
 
-fn connect(path: &std::path::Path) -> Result<UnixStream> {
-    UnixStream::connect(path)
-        .with_context(|| format!("连不上 {}：控制中心是否正在运行？", path.display()))
+/// 连上控制中心；`allow_start` 为真时，它没在跑就先把它拉起来。
+///
+/// 会话必须有个宿主进程，命令行自己不能当宿主（否则关掉终端会话就没了）。
+/// 所以 `--new` 与 attach 在连不上时会以 `--background` 启动控制中心，等
+/// socket 就绪；列出会话不这么做，免得只敲一下 `terminal` 就冒出个托盘图标。
+fn connect(path: &std::path::Path, allow_start: bool) -> Result<UnixStream> {
+    const START_TIMEOUT: Duration = Duration::from_secs(10);
+    match UnixStream::connect(path) {
+        Ok(stream) => Ok(stream),
+        Err(error)
+            if allow_start
+                && matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+        {
+            start_host()?;
+            let deadline = std::time::Instant::now() + START_TIMEOUT;
+            let mut last = error;
+            while std::time::Instant::now() < deadline {
+                match UnixStream::connect(path) {
+                    Ok(stream) => return Ok(stream),
+                    Err(error) => {
+                        last = error;
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                }
+            }
+            Err(last).with_context(|| format!("控制中心启动了，但 {} 一直没有就绪", path.display()))
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "连不上 {}：控制中心没有运行（`OpenUUYC terminal --new` 会自动拉起它）",
+                path.display()
+            )
+        }),
+    }
+}
+
+/// 以不建窗口的方式启动控制中心。已经有实例在跑时，新进程会激活它并退出。
+fn start_host() -> Result<()> {
+    let exe = std::env::current_exe().context("找不到当前程序路径")?;
+    std::process::Command::new(exe)
+        .args(["gui", "--background"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("启动控制中心失败")?;
+    Ok(())
 }
 
 fn list_sessions(path: &std::path::Path) -> Result<()> {
-    let mut stream = connect(path)?;
+    let mut stream = connect(path, false)?;
     stream.write_all(b"{\"action\":\"list\"}\n")?;
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
@@ -338,7 +385,7 @@ fn attach_client(path: &std::path::Path, session: Option<&str>, new: bool) -> Re
         bail!("请在终端里运行，输入不是一个终端");
     }
     let (cols, rows) = terminal_size(stdout.as_raw_fd());
-    let mut stream = connect(path)?;
+    let mut stream = connect(path, true)?;
     // 名字里不会有引号之外的麻烦：会话名在服务端已经过滤掉控制字符。
     let request = if new {
         json!({
