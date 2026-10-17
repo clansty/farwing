@@ -465,7 +465,9 @@ impl Sessions {
         };
         // Re-opening an existing handle happens on reconnect and when the
         // size changes; replacing the pty would hang up a shell in use.
-        if let Some(existing) = self.sessions.get_mut(&key(owner, handle)) {
+        if let Some(key) = self.resolve(owner, handle)
+            && let Some(existing) = self.sessions.get_mut(&key)
+        {
             if existing.state != SessionState::Exited {
                 existing.state = SessionState::Running;
             }
@@ -569,10 +571,21 @@ impl Sessions {
             .map(|((_, handle), session)| (*handle, session))
     }
 
+    /// 按编号找会话：先找这个账号自己的，再找本机开的那些。
+    ///
+    /// 本机会话对手机端可见，编号从 1000 起，与主控自己的编号不会撞。
+    fn resolve(&self, owner: &str, handle: u32) -> Option<(String, u32)> {
+        let own = key(owner, handle);
+        if self.sessions.contains_key(&own) {
+            return Some(own);
+        }
+        let local = key(LOCAL_OWNER, handle);
+        self.sessions.contains_key(&local).then_some(local)
+    }
+
     fn get_mut(&mut self, owner: &str, handle: u32) -> Result<&mut Session, SessionError> {
-        self.sessions
-            .get_mut(&key(owner, handle))
-            .ok_or(SessionError::Gone)
+        let key = self.resolve(owner, handle).ok_or(SessionError::Gone)?;
+        self.sessions.get_mut(&key).ok_or(SessionError::Gone)
     }
 
     /// The lowest handle this login does not use; the controller's handle
@@ -606,9 +619,12 @@ impl Sessions {
 
     /// The sessions `owner` may see, as the objects the client parses.
     pub(crate) fn list(&self, owner: &str) -> Vec<Value> {
+        // 本机自己开的会话也对主控可见，手机端能看到并接上。
         let mut listed: Vec<_> = self
-            .owned(owner)
-            .map(|(handle, session)| {
+            .sessions
+            .iter()
+            .filter(|((who, _), _)| who == owner || who == LOCAL_OWNER)
+            .map(|((_, handle), session)| {
                 json!({
                     "session_id": handle,
                     "state": session.state.as_str(),
@@ -661,13 +677,13 @@ impl Sessions {
         name: &str,
     ) -> Result<(), SessionError> {
         let name = validate_name(name)?;
-        if !self.sessions.contains_key(&key(owner, handle)) {
-            return Err(SessionError::Gone);
-        }
-        if self
-            .owned(owner)
-            .any(|(other, session)| other != handle && session.name == name)
-        {
+        let key = self.resolve(owner, handle).ok_or(SessionError::Gone)?;
+        let duplicate = self.sessions.iter().any(|((who, other), session)| {
+            (who == owner || who == LOCAL_OWNER)
+                && (*other != handle || who != &key.0)
+                && session.name == name
+        });
+        if duplicate {
             return Err(SessionError::DuplicateName);
         }
         self.get_mut(owner, handle)?.name = name;
@@ -696,10 +712,8 @@ impl Sessions {
 
     /// Removes one of `owner`'s sessions; finishing the result ends the shell.
     pub(crate) fn kill(&mut self, owner: &str, handle: u32) -> Result<Ended, SessionError> {
-        let session = self
-            .sessions
-            .remove(&key(owner, handle))
-            .ok_or(SessionError::Gone)?;
+        let key = self.resolve(owner, handle).ok_or(SessionError::Gone)?;
+        let session = self.sessions.remove(&key).ok_or(SessionError::Gone)?;
         Ok(Ended::forced(vec![session]))
     }
 
@@ -2130,8 +2144,14 @@ mod tests {
                 .any(|session| session.handle == handle && session.name == "mine"),
             "the new session is listed"
         );
-        // 手机端按账号列出会话，看不到本机自己开的。
-        assert!(sessions.list("acct").is_empty());
+        // 手机端也能看到本机自己开的会话，编号就是本机区间里的那个。
+        assert!(
+            sessions
+                .list("acct")
+                .iter()
+                .any(|session| session["session_id"] == handle),
+            "the controller sees the local session"
+        );
         // 用户自己开的会话不参与 30 分钟空闲清扫。
         let (exited, abandoned) = sessions.sweep(std::time::Duration::ZERO);
         assert!(exited.sessions.is_empty());
@@ -2141,6 +2161,41 @@ mod tests {
             Some(SessionError::DuplicateName)
         );
         sessions.kill(LOCAL_OWNER, handle).expect("kill").finish();
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", windows)),
+        ignore = "no terminal backend on this platform"
+    )]
+    fn the_controller_can_take_over_a_local_session() {
+        let mut sessions = Sessions::default();
+        let handle = sessions
+            .create_local(Some("shared".into()))
+            .expect("create local");
+        // 主控用同一个编号 open，接上的是本机开的那个 shell，不是新的。
+        let (again, name, _) = sessions
+            .open("acct", handle, 1, shell(), None, 80, 24)
+            .expect("open");
+        assert_eq!(again, handle);
+        assert_eq!(name, "shared");
+        assert_eq!(sessions.count(), 1, "no second shell was started");
+
+        sessions
+            .write("acct", handle, &line("echo MOBILE-TO-LOCAL"))
+            .expect("write");
+        let seen = output_until(&mut sessions, 1, "MOBILE-TO-LOCAL");
+        assert!(
+            seen.contains("MOBILE-TO-LOCAL"),
+            "controller input reaches the local shell"
+        );
+
+        // 本机接上同一会话时，看到的是同一份输出。
+        sessions
+            .attach_local(handle, 100, 80, 24)
+            .expect("attach local");
+        let local = local_output_until(&mut sessions, 100, "MOBILE-TO-LOCAL");
+        assert!(local.contains("MOBILE-TO-LOCAL"));
     }
 
     #[test]
