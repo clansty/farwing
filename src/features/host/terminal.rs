@@ -1569,11 +1569,20 @@ async fn handle_frame(
                 ));
             }
             FrameType::Signal => {
-                // The payload's signal semantics are unverified, and killing
-                // the shell on an unknown signal would lose the session.
-                // Ignore it until the frame is understood; Ctrl-C reaches the
-                // shell as a byte on stdin anyway.
-                tracing::debug!(session = frame.session, "host terminal signal ignored");
+                // 官方主控把 Ctrl-C 放在 Signal 帧里发，不走 stdin 字节；
+                // payload 的布局还没确认，先只记下来。把它当未知信号去杀
+                // shell 会丢会话，所以在弄清之前不执行。
+                let payload: String = frame
+                    .payload
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect();
+                tracing::debug!(
+                    session = frame.session,
+                    bytes = frame.payload.len(),
+                    payload,
+                    "host terminal signal ignored"
+                );
             }
             other => {
                 tracing::debug!(?other, "host terminal frame ignored");
