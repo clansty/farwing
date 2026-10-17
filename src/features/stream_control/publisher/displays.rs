@@ -209,7 +209,13 @@ pub(crate) async fn receive_session(
                         code: if allowed { 0 } else { 1 },
                         detail: refusal.unwrap_or_default().to_owned(),
                     };
-                    tracing::info!(allowed, "host terminal environment check answered");
+                    // 客户端超时会重发；把 request_id 记下来，失败时能对上
+                    // 是哪一次没被接住。
+                    tracing::info!(
+                        allowed,
+                        request_id = header.as_ref().map(|header| header.request_id),
+                        "host terminal environment check answered"
+                    );
                     return Ok(response(
                         &message,
                         header,

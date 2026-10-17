@@ -869,9 +869,10 @@ impl Sessions {
                 match session.pty.read(&mut buffer[..want]) {
                     Ok(Some(0)) | Err(_) => break,
                     Ok(Some(read)) => {
-                        session.record(&buffer[..read]);
+                        let data = without_alternate_scroll(&buffer[..read]);
+                        session.record(&data);
                         for queue in session.output.values_mut() {
-                            queue.extend_from_slice(&buffer[..read]);
+                            queue.extend_from_slice(&data);
                         }
                         left -= read;
                         session.last_active_ms = now_ms();
@@ -995,6 +996,30 @@ impl Sessions {
     fn is_empty(&self) -> bool {
         self.sessions.is_empty()
     }
+}
+
+/// 剥掉 alternateScroll（DECSET 1007）的开关。
+///
+/// 官方 Windows 客户端的终端解析器不认这个模式，收到就报
+/// `Unsupported screen mode: 1007 (private)`，严重时整个终端组件判定为
+/// 不可用。它只影响全屏程序里的滚轮，剥掉不改变画面；本机终端的
+/// alternateScroll 也已经由 attach 客户端关掉，两端行为一致。
+fn without_alternate_scroll(data: &[u8]) -> Vec<u8> {
+    const SEQ: &[u8] = b"\x1b[?1007";
+    if !data.windows(SEQ.len()).any(|window| window == SEQ) {
+        return data.to_vec();
+    }
+    let mut out = Vec::with_capacity(data.len());
+    let mut index = 0;
+    while index < data.len() {
+        if data[index..].starts_with(b"\x1b[?1007h") || data[index..].starts_with(b"\x1b[?1007l") {
+            index += SEQ.len() + 1;
+        } else {
+            out.push(data[index]);
+            index += 1;
+        }
+    }
+    out
 }
 
 /// 把输入排进会话并尽量交给 pty。
@@ -2196,6 +2221,19 @@ mod tests {
             .expect("attach local");
         let local = local_output_until(&mut sessions, 100, "MOBILE-TO-LOCAL");
         assert!(local.contains("MOBILE-TO-LOCAL"));
+    }
+
+    #[test]
+    fn alternate_scroll_is_stripped_from_the_output() {
+        assert_eq!(
+            without_alternate_scroll(b"a\x1b[?1007lb\x1b[?1007hc"),
+            b"abc"
+        );
+        // 别动别的 private mode，也别把不完整的序列吃掉。
+        assert_eq!(
+            without_alternate_scroll(b"\x1b[?1000h\x1b[?1007"),
+            b"\x1b[?1000h\x1b[?1007"
+        );
     }
 
     #[test]

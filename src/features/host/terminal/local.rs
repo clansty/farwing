@@ -512,7 +512,13 @@ impl RawMode {
         // 程序时终端会进备用屏幕，xterm 系终端在备用屏幕里把滚轮翻译成
         // 方向键发给前台程序；在这里就是被原样转发给 shell，滚一下屏幕上
         // 就多一串 `^[[D`。滚轮留给终端自己，别往会话里灌按键。
-        terminal_control(b"\x1b[?1007l");
+        //
+        // 如果这个进程本身就跑在被控会话里（stdout 是会话的 pty），这些
+        // 字节会进会话的输入输出，再被转发给主控；所以只在真正的本机
+        // 终端里发。
+        if !in_session() {
+            terminal_control(b"\x1b[?1007l");
+        }
         Ok(Self { fd, original })
     }
 }
@@ -521,12 +527,19 @@ impl Drop for RawMode {
     fn drop(&mut self) {
         // 恢复 alternateScroll，并把远端可能留在终端上的光标/样式/备用
         // 屏幕收掉，免得退出后本机终端还是那副样子。
-        terminal_control(b"\x1b[?1007h\x1b[?25h\x1b[0m\x1b[?1049l");
+        if !in_session() {
+            terminal_control(b"\x1b[?1007h\x1b[?25h\x1b[0m\x1b[?1049l");
+        }
         // SAFETY: fd 在作用域内一直有效，original 来自 tcgetattr。
         unsafe {
             libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
         }
     }
+}
+
+/// 这个进程是不是跑在被控会话的 shell 里（会话的 shell 带这个标记）。
+fn in_session() -> bool {
+    std::env::var_os("OPENUUYC_TERMINAL").is_some()
 }
 
 /// 往本机终端写一段控制序列；不支持的终端会忽略。

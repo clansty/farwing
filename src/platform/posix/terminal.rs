@@ -114,6 +114,9 @@ impl Session {
         // reference server sets the same pair before forking the pty.
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
+        // 在会话里再跑本机 attach 时，别再往这个 pty 里写终端控制序列：
+        // 那些字节会被当成输出转发给主控，官方客户端不认识就报解析错误。
+        command.env("OPENUUYC_TERMINAL", "1");
         if std::env::var_os("LANG").is_none() {
             command.env("LANG", "C.UTF-8");
         }
