@@ -461,17 +461,32 @@ impl RawMode {
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
             bail!("无法切换终端到原始模式");
         }
+        // 关掉 alternateScroll（DECSET 1007）。远端在跑 vim/top 这类全屏
+        // 程序时终端会进备用屏幕，xterm 系终端在备用屏幕里把滚轮翻译成
+        // 方向键发给前台程序；在这里就是被原样转发给 shell，滚一下屏幕上
+        // 就多一串 `^[[D`。滚轮留给终端自己，别往会话里灌按键。
+        terminal_control(b"\x1b[?1007l");
         Ok(Self { fd, original })
     }
 }
 
 impl Drop for RawMode {
     fn drop(&mut self) {
+        // 恢复 alternateScroll，并把远端可能留在终端上的光标/样式/备用
+        // 屏幕收掉，免得退出后本机终端还是那副样子。
+        terminal_control(b"\x1b[?1007h\x1b[?25h\x1b[0m\x1b[?1049l");
         // SAFETY: fd 在作用域内一直有效，original 来自 tcgetattr。
         unsafe {
             libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
         }
     }
+}
+
+/// 往本机终端写一段控制序列；不支持的终端会忽略。
+fn terminal_control(sequence: &[u8]) {
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(sequence);
+    let _ = stdout.flush();
 }
 
 /// 在系统终端模拟器里接上会话。
