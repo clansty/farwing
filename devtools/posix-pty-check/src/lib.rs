@@ -14,5 +14,8 @@
 //! changes. The module is deliberately dependency-light (`anyhow` and `libc`)
 //! precisely so this stays possible.
 
+// 应用里真正用到的是那些 pub(crate) 项，独立 crate 里除了本模块的测试
+// 没人调用它们；不加 allow 会刷一屏 dead_code，把真正的警告淹掉。
+#[allow(dead_code)]
 #[path = "../../../src/platform/posix/terminal.rs"]
-pub mod terminal;
+mod terminal;
