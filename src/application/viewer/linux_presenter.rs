@@ -487,10 +487,11 @@ impl ConnectingWindowsRunner {
         };
         // 旧主窗口的屏交给接替者，别让它们随着窗口一起消失。
         let mut tabs = Vec::new();
-        if let Stage::Playing(player) = &mut self.stage {
+        if let (Stage::Playing(player), Some(window)) = (&mut self.stage, &self.window) {
             // 它已经交出了正在直播的那块屏，析构时不能再关整个解码器池。
             player.input_owns_connection = false;
             tabs = std::mem::take(&mut player.tabs);
+            player.abandon_window(window.id());
         }
         let DetachedWindow {
             stage,
@@ -542,6 +543,9 @@ impl ConnectingWindowsRunner {
         slot.close = true;
         slot.window.set_visible(false);
         slot.pending = None;
+        if let DetachedStage::Playing(player) = &slot.stage {
+            player.abandon_window(slot.window.id());
+        }
         let tabs = std::mem::take(&mut slot.tabs);
         if let Stage::Playing(player) = &mut self.stage {
             for id in tabs {
@@ -551,7 +555,7 @@ impl ConnectingWindowsRunner {
                 // 拖出时交出去的那块屏又回来了：主窗口如果还在等新屏，直接从
                 // 这路解码器接着看，而不是一直停在「正在等待画面」。
                 if player.frame_paused && player.session.screen_id() == id {
-                    player.frame_paused = false;
+                    player.resume_frames();
                 }
             }
             self.schedule(Instant::now());
@@ -642,9 +646,19 @@ impl ConnectingWindowsRunner {
         crate::ui::branding::set_taskbar_icon(&window);
         configure_dwm_window(&window);
         if let Some(position) = position {
-            // 抓取点大致落在新窗口的标题栏上。Wayland 上这个请求会被忽略，
-            // 位置交给合成器决定。
-            window.set_outer_position(PhysicalPosition::new(position.x - 100, position.y - 18));
+            // 抓取点大致落在新窗口的标题栏上，标题栏整条留在松手的那块显示器里。
+            // Wayland 上这个请求会被忽略，位置交给合成器决定。
+            let monitors: Vec<_> = event_loop
+                .available_monitors()
+                .map(|monitor| (monitor.position(), monitor.size()))
+                .collect();
+            window.set_outer_position(constrain_to_monitor(
+                PhysicalPosition::new(position.x - 100, position.y - 18),
+                position,
+                window.outer_size(),
+                crate::ui::chrome::title_bar_height_pixels(&window),
+                &monitors,
+            ));
         }
         let (shell, interval) =
             Self::build_shell(event_loop, &window, &self.proxy, self.generation)?;
@@ -673,7 +687,7 @@ impl ConnectingWindowsRunner {
             stage: DetachedStage::Opening(Box::new(app)),
             pending: Some(DetachedPending {
                 screen_id,
-                _task: task,
+                task,
                 result,
             }),
             shell,
@@ -688,6 +702,16 @@ impl ConnectingWindowsRunner {
 
         if let Stage::Playing(player) = &mut self.stage {
             player.tabs.retain(|id| *id != screen_id);
+            // 正在打开的就是这块：交给新窗口去开，原窗口放弃这次切换，否则它接上
+            // 之后两个窗口会从同一个解码队列取帧（Windows `detach_tab` 同样
+            // `pending.take()`）。
+            if player
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.id == screen_id)
+            {
+                player.pending = None;
+            }
             if player.session.screen_id() == screen_id {
                 // 这块解码器已经交给新窗口了。新屏接上之前主窗口不要再从同一个
                 // 队列取帧，否则两个窗口会互相抢帧，两边都停住。
@@ -695,9 +719,16 @@ impl ConnectingWindowsRunner {
                 player.current = None;
                 player.video_size = None;
                 player.video_rect = None;
-                if let Some(next) = player.tabs.first().copied() {
-                    let _ = player.select(next, &source);
+                if let Some(next) = player.tabs.first().copied()
+                    && let Err(error) = player.select(next, &source)
+                {
+                    player.failed_screen = Some(player.failed_screen_for(next));
+                    player.report(
+                        "显示器操作失败",
+                        format!("切到显示器 {next} 失败：{error:#}"),
+                    );
                 }
+                player.park_stranded();
             }
         }
         Ok(())
@@ -772,7 +803,8 @@ impl ConnectingWindowsRunner {
             if let DetachedStage::Playing(player) = &mut slot.stage {
                 let mut redraw = player.poll_pending();
                 player.pump_drag();
-                redraw |= player.refresh_catalog(&slot.window);
+                // 独立窗口只守着自己那块屏，新屏归主窗口。
+                redraw |= player.refresh_catalog(&slot.window, &[]);
                 let frame = player.poll();
                 redraw |= player.error.is_some();
                 if frame || redraw {
@@ -1200,26 +1232,19 @@ impl ConnectingWindowsRunner {
     /// 把目录里还没分给任何窗口的屏补进主窗口。独立窗口只留它自己那一块，
     /// 和 Windows 的 `refresh_catalog` 把新屏交给 owner 窗口是同一条规则。
     fn sync_tabs(&mut self) -> bool {
-        let mut assigned: Vec<i32> = self
-            .detached
-            .iter()
-            .flat_map(|slot| slot.tabs.iter().copied())
-            .collect();
+        let elsewhere = self.detached_tabs();
         let Stage::Playing(player) = &mut self.stage else {
             return false;
         };
-        assigned.extend(player.tabs.iter().copied());
-        let missing: Vec<i32> = player
-            .catalog
+        collect_new_screens(&mut player.tabs, &player.catalog, &elsewhere)
+    }
+
+    /// 已经分给独立窗口的屏。
+    fn detached_tabs(&self) -> Vec<i32> {
+        self.detached
             .iter()
-            .map(|screen| screen.id)
-            .filter(|id| !assigned.contains(id))
-            .collect();
-        if missing.is_empty() {
-            return false;
-        }
-        player.tabs.extend(missing);
-        true
+            .flat_map(|slot| slot.tabs.iter().copied())
+            .collect()
     }
 }
 
@@ -1291,6 +1316,12 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
                 if let Stage::Playing(player) = &mut self.stage {
                     player.on_focus_changed(&window, focused);
                     player.update_shortcuts(&shell.context, &window);
+                    // 和独立窗口、和 Windows 的每个屏窗口一样：对端按聚焦窗口的那块屏
+                    // 送指针与输入。从独立窗口点回来时不说，键鼠会落到那边的屏上。
+                    // 当前屏刚交给独立窗口、新屏还没接上时，这个窗口没有自己的屏。
+                    if focused && !player.frame_paused {
+                        player.screens.focus(player.session.screen_id());
+                    }
                 }
                 crate::application::viewer_shortcuts::set_focused_window(if focused {
                     u64::from(id)
@@ -1376,6 +1407,7 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
         }
         self.poll_detached();
         self.sync_visible();
+        let elsewhere = self.detached_tabs();
         if let Stage::Playing(player) = &mut self.stage {
             let mut redraw = player.poll_pending();
             // 拖放那条通道读 socket 的仍然是 winit，这里只把已经读进来的事件
@@ -1384,7 +1416,7 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
             // 屏目录每 250 ms 对一次：切屏期间没有画面要画，但轮询交给它自己，
             // 不再把 UI 线程按在「立刻重画」上（那样会绕开帧率节拍一直占满一个核）。
             if let Some(window) = self.window.clone() {
-                redraw |= player.refresh_catalog(&window);
+                redraw |= player.refresh_catalog(&window, &elsewhere);
             }
             if player.connection_ended() {
                 // 和 Windows 一样干净地退出：结束的原因由 controller 那边报。
@@ -1395,6 +1427,7 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
             // wake bridge covers the next frame, so the loop can sleep.
             // Repainting the whole UI at the display rate instead would
             // leave an arriving frame waiting for the pass in progress.
+            player.park_stranded();
             let frame = player.poll();
             // 解码器出错的弹窗也要画出来，哪怕之后再没有新帧。
             redraw |= player.error.is_some();
@@ -1484,9 +1517,18 @@ enum DetachedStage {
 /// 正在为独立窗口打开的那块屏。
 struct DetachedPending {
     screen_id: i32,
-    /// 让 `ScreenPlayback` 申请对端开始推这块屏；句柄只是留个可以放弃的位置。
-    _task: Option<tokio::task::AbortHandle>,
+    /// 让 `ScreenPlayback` 申请对端开始推这块屏。窗口在打开途中被关掉时，
+    /// 丢掉这次等待就是取消请求，所以 Drop 里 abort（和 PendingScreen 一致）。
+    task: Option<tokio::task::AbortHandle>,
     result: tokio::sync::oneshot::Receiver<Result<Arc<NativeViewerSession>>>,
+}
+
+impl Drop for DetachedPending {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
 }
 
 /// 构造播放器时要和窗口绑在一起的一组东西。
@@ -1514,9 +1556,18 @@ enum WindowRequest {
 /// 正在打开的一块屏：解码器还没就绪，tab 先显示等待态。
 struct PendingScreen {
     id: i32,
-    /// 让 `ScreenPlayback` 申请对端开始推这块屏；句柄只是留个可以放弃的位置。
-    _task: Option<tokio::task::AbortHandle>,
+    /// 让 `ScreenPlayback` 申请对端开始推这块屏。丢掉这次等待就是取消请求，
+    /// 所以句柄留着、Drop 里 abort（和 Windows 侧一致）。
+    task: Option<tokio::task::AbortHandle>,
     result: tokio::sync::oneshot::Receiver<Result<Arc<NativeViewerSession>>>,
+}
+
+impl Drop for PendingScreen {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
 }
 
 /// The playing half of the window: video, input forwarding and the menus.
@@ -1549,8 +1600,10 @@ struct Player {
     window_id: WindowId,
     /// Keeps the decoder publishing frames and nudges the event loop; held for
     /// its lifetime, which is what registers this window with the session.
+    /// `None` while the window has handed its screen to a detached window and
+    /// has nothing else to show (see [`Player::park_stranded`]).
     #[allow(dead_code, reason = "Owned for its registration and its Drop.")]
-    wake: FrameWakeBridge,
+    wake: Option<FrameWakeBridge>,
     /// Identifies this window to `RemoteInput`, which arbitrates between windows.
     owner: u64,
     stream_control_ui: StreamControlUi,
@@ -1670,7 +1723,7 @@ impl Player {
             pending: None,
             proxy,
             window_id,
-            wake,
+            wake: Some(wake),
             owner,
             stream_control_ui: StreamControlUi::default(),
             performance_mode: PerformancePanelMode::Compact,
@@ -1836,7 +1889,7 @@ impl Player {
         );
         self.pending = Some(PendingScreen {
             id: screen_id,
-            _task: task,
+            task,
             result,
         });
         Ok(())
@@ -1848,8 +1901,12 @@ impl Player {
         // 对端把目标屏放到了当前这条轨道上时，拿回来的是同一个会话。这时不能再装一次
         // bridge：新 bridge 登记完之后旧的那个才 Drop，而它的 Drop 会把登记清掉，
         // 解码器随后丢掉每一帧，画面就永远停在「等待画面」。
-        if !Arc::ptr_eq(&session, &self.session) {
-            self.wake = FrameWakeBridge::install(&session, self.proxy.clone(), self.window_id)?;
+        if self.wake.is_none() || !Arc::ptr_eq(&session, &self.session) {
+            self.wake = Some(FrameWakeBridge::install(
+                &session,
+                self.proxy.clone(),
+                self.window_id,
+            )?);
         }
         self.session = session;
         self.session_failed = false;
@@ -1862,6 +1919,41 @@ impl Player {
         // 对端按「选中」的那块屏送指针与输入，换屏就得告诉它。
         self.screens.focus(screen_id);
         Ok(())
+    }
+
+    /// 窗口要关了：放下它发起、还等着回应的事，和 Windows `close_window` 一样——
+    /// 设备切换的接管确认（否则它指着一个已经销毁的窗口），以及这块屏的显示设置。
+    fn abandon_window(&self, window: WindowId) {
+        if let Some(switcher) = self.device_switch() {
+            switcher.cancel_takeover(window);
+        }
+        // 当前屏已经交给独立窗口时，它的显示设置归那边。
+        if !self.frame_paused {
+            self.control()
+                .cancel_display_change(self.session.screen_id());
+        }
+    }
+
+    /// 当前屏交给独立窗口之后没能接上别的屏（打开失败、对端拒绝）：窗口停在等待
+    /// 画面，用户点别的标签才会再开。这期间它还登记在那块屏的唤醒上，独立窗口每来
+    /// 一帧都会把它叫起来空画一遍，所以把这份登记撤掉。
+    fn park_stranded(&mut self) {
+        if self.frame_paused && self.pending.is_none() {
+            self.wake = None;
+        }
+    }
+
+    /// 交出去的那块屏又回到这个窗口（独立窗口关了）：接着从它的解码器取帧。
+    fn resume_frames(&mut self) {
+        self.frame_paused = false;
+        if self.wake.is_none() {
+            match FrameWakeBridge::install(&self.session, self.proxy.clone(), self.window_id) {
+                Ok(wake) => self.wake = Some(wake),
+                Err(error) => {
+                    self.report("显示器操作失败", format!("无法恢复显示器画面：{error:#}"))
+                }
+            }
+        }
     }
 
     /// 正在切屏或切设备：两边都在换轨道，键鼠很容易落到别处，这期间不把输入转发给
@@ -1931,7 +2023,9 @@ impl Player {
     /// 返回顶栏要不要重画：目录或等待中的屏变了，或者有错误要弹。Windows 每次核对完
     /// 都重画一遍；这里对端画面静止时没有新帧推着 UI 走，新加的屏的 tab、核对触发的
     /// 切屏的等待态和弹窗都得靠它排一次重画。
-    fn refresh_catalog(&mut self, window: &Arc<Window>) -> bool {
+    ///
+    /// `elsewhere` 是已经分给别的窗口的屏，主窗口不去收它们。
+    fn refresh_catalog(&mut self, window: &Arc<Window>, elsewhere: &[i32]) -> bool {
         let now = Instant::now();
         if now < self.next_refresh {
             return false;
@@ -1939,13 +2033,13 @@ impl Player {
         self.next_refresh = now + Duration::from_millis(250);
         let catalog = self.catalog.clone();
         let pending = self.pending.as_ref().map(|pending| pending.id);
-        self.reconcile_catalog(window);
+        self.reconcile_catalog(window, elsewhere);
         self.catalog != catalog
             || self.pending.as_ref().map(|pending| pending.id) != pending
             || self.error.is_some()
     }
 
-    fn reconcile_catalog(&mut self, window: &Arc<Window>) {
+    fn reconcile_catalog(&mut self, window: &Arc<Window>, elsewhere: &[i32]) {
         let topology = self.screens.topology();
         if topology.sequence != self.topology_sequence {
             self.topology_sequence = topology.sequence;
@@ -1957,6 +2051,11 @@ impl Player {
             if !self.catalog.iter().any(|known| known.id == screen.id) {
                 self.catalog.push(screen.clone());
             }
+        }
+        // 新出现的屏（刚加的虚拟屏）当场收进主窗口，不等 runner 的 `sync_tabs`：
+        // 对端往往在同一份快照里就报它为选中，下面要跟过去时它得已经在本窗口里。
+        if self.input_owns_connection {
+            collect_new_screens(&mut self.tabs, &self.catalog, elsewhere);
         }
         // 分给别的窗口的屏不在本窗口的 tabs 里；这里只丢掉已经消失的。
         self.tabs
@@ -1978,16 +2077,20 @@ impl Player {
                 .selected_screen
                 .filter(|id| actual.iter().any(|screen| screen.id == *id))
         {
-            if self
-                .pending
-                .as_ref()
-                .is_some_and(|pending| pending.id != selected)
-            {
-                self.pending = None;
-            }
             self.topology_focused = Some(selected);
-            self.failed_screen = None;
-            focus = Some(selected);
+            // 选中的是别的窗口里的屏（比如对独立窗口那块改了分辨率）：由那个窗口
+            // 自己跟，这里不动，否则会退回本窗口第一块屏。
+            if self.tabs.contains(&selected) {
+                if self
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.id != selected)
+                {
+                    self.pending = None;
+                }
+                self.failed_screen = None;
+                focus = Some(selected);
+            }
         }
         if self.pending.is_some() {
             return;
@@ -2705,7 +2808,7 @@ impl Player {
             rect.min,
             egui::pos2((row.min_rect().left() - 6.0).max(rect.min.x), rect.max.y),
         );
-        self.title_bar_screens(ui, free, window);
+        self.title_bar_screens(ui, free, bar, window);
     }
 
     /// 这台播放器能切到哪些设备。连接时由 controller 装进来，和 Windows 那份是同一个。
@@ -2716,7 +2819,15 @@ impl Player {
     /// 顶栏中间的屏标签与码流信息：每块远端屏一个 tab（点一下切过去，右键是这块
     /// 屏的显示器设置，虚拟屏可以关掉），右边一格写当前画面的「分辨率 · 帧率 ·
     /// 编码」。Windows 的 caption 是同一套内容，只是那边的按钮是图标。
-    fn title_bar_screens(&mut self, ui: &mut egui::Ui, rect: egui::Rect, window: &Arc<Window>) {
+    ///
+    /// `bar` 是整条标题栏（全屏时是浮动栏），拖动标签松手还在它里面就不算拖出。
+    fn title_bar_screens(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        bar: egui::Rect,
+        window: &Arc<Window>,
+    ) {
         // 与 Windows 同一个宽度，够放 "3840×1620 · 35 FPS · H.265"。
         const METRICS_WIDTH: f32 = 184.0;
         const MINIMUM: f32 = 60.0;
@@ -2850,8 +2961,14 @@ impl Player {
                             );
                         } else if response.clicked() {
                             open = Some(id);
-                        } else if response.drag_stopped() && detachable {
-                            // 把标签拖出去：新窗口落在松手的位置（Wayland 交给合成器）。
+                        } else if response.drag_stopped()
+                            && detachable
+                            && released_off_bar(
+                                ui.ctx().input(|input| input.pointer.latest_pos()),
+                                bar,
+                            )
+                        {
+                            // 把标签拖出标题栏：新窗口落在松手的位置（Wayland 交给合成器）。
                             request_detach(&requests, &proxy, window, ui.ctx(), id);
                         }
                         response.context_menu(|ui| {
@@ -3551,6 +3668,18 @@ fn replacement_target(
     Some(target)
 }
 
+/// 把目录里没分给任何窗口的屏补进 `tabs`，返回有没有补。`elsewhere` 是别的窗口
+/// 已经分到的屏，和 Windows 的 `refresh_catalog` 把新屏交给 owner 窗口同一条规则。
+fn collect_new_screens(tabs: &mut Vec<i32>, catalog: &[RemoteScreen], elsewhere: &[i32]) -> bool {
+    let before = tabs.len();
+    for screen in catalog {
+        if !tabs.contains(&screen.id) && !elsewhere.contains(&screen.id) {
+            tabs.push(screen.id);
+        }
+    }
+    tabs.len() != before
+}
+
 /// 刚打开的这一路 `(track, binding)` 还是不是目录里这块屏的，和 Windows
 /// `ScreenWindows::update` 接上新会话前的核对一样。
 fn screen_mapped(actual: &[RemoteScreen], screen_id: i32, track: i32, binding: u64) -> bool {
@@ -3579,6 +3708,44 @@ fn request_detach(
         pass: 0,
         when: Instant::now(),
     }));
+}
+
+/// 标签拖动松手的地方是否已经出了标题栏。egui 把手抖一下、按住不放都算拖动；
+/// 和 Windows `detach_tab` 一样，松手还在原窗口标题栏里就什么都不做。指针在拖动中
+/// 离开了窗口时 egui 不再有它的位置（`None`），那一定已经在栏外了。
+fn released_off_bar(release: Option<egui::Pos2>, bar: egui::Rect) -> bool {
+    release.is_none_or(|point| !bar.contains(point))
+}
+
+/// 新窗口的左上角夹进松手点所在（不在任何一块上就取最近）的显示器，和 Windows
+/// `constrain_drag_position` 一样以指针的目标显示器为准。Windows 只管上沿（任务栏
+/// 在工作区里扣掉了）；这里拿不到工作区，就让整条标题栏留在显示器里，免得在屏幕
+/// 边缘松手后窗口抓不回来。
+fn constrain_to_monitor(
+    position: PhysicalPosition<i32>,
+    cursor: PhysicalPosition<i32>,
+    size: winit::dpi::PhysicalSize<u32>,
+    title: u32,
+    monitors: &[(PhysicalPosition<i32>, winit::dpi::PhysicalSize<u32>)],
+) -> PhysicalPosition<i32> {
+    let distance = |(origin, extent): &(PhysicalPosition<i32>, winit::dpi::PhysicalSize<u32>)| {
+        let right = origin.x + extent.width as i32 - 1;
+        let bottom = origin.y + extent.height as i32 - 1;
+        let dx = (origin.x - cursor.x).max(cursor.x - right).max(0);
+        let dy = (origin.y - cursor.y).max(cursor.y - bottom).max(0);
+        i64::from(dx) * i64::from(dx) + i64::from(dy) * i64::from(dy)
+    };
+    let Some((origin, extent)) = monitors.iter().min_by_key(|monitor| distance(monitor)) else {
+        return position;
+    };
+    let width = extent.width.min(i32::MAX as u32) as i32;
+    let height = extent.height.min(i32::MAX as u32) as i32;
+    let max_x = origin.x + (width - size.width.min(width as u32) as i32);
+    let max_y = origin.y + (height - title.min(height as u32) as i32);
+    PhysicalPosition::new(
+        position.x.clamp(origin.x, max_x),
+        position.y.clamp(origin.y, max_y),
+    )
 }
 
 /// 指针此刻的全局物理位置。Wayland 不给窗口位置，返回 `None`，新窗口由合成器摆放。
@@ -3897,6 +4064,95 @@ mod screen_tests {
         );
         assert_eq!(
             replacement_target(&actual, &actual, 0, playing(&shown), None),
+            None
+        );
+    }
+
+    #[test]
+    fn a_tab_released_on_the_bar_is_not_detached() {
+        let bar = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1280.0, 36.0));
+        // 手抖一下或按住不放，松手还在栏上。
+        assert!(!released_off_bar(Some(egui::pos2(300.0, 20.0)), bar));
+        assert!(released_off_bar(Some(egui::pos2(300.0, 200.0)), bar));
+        assert!(released_off_bar(Some(egui::pos2(-40.0, 20.0)), bar));
+        // 拖动中指针离开了窗口。
+        assert!(released_off_bar(None, bar));
+    }
+
+    #[test]
+    fn a_detached_window_is_kept_on_the_drop_monitor() {
+        use winit::dpi::PhysicalSize;
+        let monitors = [
+            (PhysicalPosition::new(0, 0), PhysicalSize::new(1920, 1080)),
+            (
+                PhysicalPosition::new(1920, -200),
+                PhysicalSize::new(1280, 1024),
+            ),
+        ];
+        let size = PhysicalSize::new(1280, 760);
+        let place = |x: i32, y: i32| {
+            constrain_to_monitor(
+                PhysicalPosition::new(x - 100, y - 18),
+                PhysicalPosition::new(x, y),
+                size,
+                36,
+                &monitors,
+            )
+        };
+        // 在第一块屏里松手：留在松手的位置。
+        assert_eq!(place(400, 300), PhysicalPosition::new(300, 282));
+        // 左上角落点：标题栏会出屏。
+        assert_eq!(place(20, 5), PhysicalPosition::new(0, 0));
+        // 右边缘：窗口留在屏内。
+        assert_eq!(place(1900, 500), PhysicalPosition::new(640, 482));
+        // 第二块屏位置更高，按它自己的上沿算。
+        assert_eq!(place(2000, -190), PhysicalPosition::new(1920, -200));
+        // 在所有屏下面松手：取最近的那块。
+        assert_eq!(place(400, 1500), PhysicalPosition::new(300, 1044));
+        // 没有显示器信息：不动。
+        assert_eq!(
+            constrain_to_monitor(
+                PhysicalPosition::new(-50, -50),
+                PhysicalPosition::new(50, -32),
+                size,
+                36,
+                &[],
+            ),
+            PhysicalPosition::new(-50, -50)
+        );
+    }
+
+    /// 同一份快照里新增并被选中的虚拟屏：主窗口先把这块屏收进来，再跟过去，
+    /// 而不是退回自己的第一块屏。
+    #[test]
+    fn a_new_selected_screen_is_collected_before_it_is_followed() {
+        let actual = vec![screen(0, 0, 0), screen(1, 1, 0), screen(5, 2, 1)];
+        let mut tabs = vec![0, 1];
+        assert!(collect_new_screens(&mut tabs, &actual, &[]));
+        assert_eq!(tabs, vec![0, 1, 5]);
+        assert!(!collect_new_screens(&mut tabs, &actual, &[]));
+        let window: Vec<RemoteScreen> = actual
+            .iter()
+            .filter(|screen| tabs.contains(&screen.id))
+            .cloned()
+            .collect();
+        assert_eq!(
+            replacement_target(&window, &actual, 5, playing(&actual[1]), None),
+            Some(5)
+        );
+    }
+
+    /// 别的窗口拿着的屏既不收也不跟：主窗口保持自己正在显示的这块。
+    #[test]
+    fn a_screen_in_another_window_stays_there() {
+        let actual = vec![screen(0, 0, 0), screen(1, 1, 0), screen(2, 2, 0)];
+        let mut tabs = vec![0, 1];
+        assert!(!collect_new_screens(&mut tabs, &actual, &[2]));
+        assert_eq!(tabs, vec![0, 1]);
+        let window: Vec<RemoteScreen> = actual[..2].to_vec();
+        // 选中的屏不在本窗口里，核对就停在正在显示的这块。
+        assert_eq!(
+            replacement_target(&window, &actual, 1, playing(&actual[1]), None),
             None
         );
     }
