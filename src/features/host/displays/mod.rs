@@ -320,8 +320,19 @@ impl Session {
             "本次会话不允许添加虚拟屏"
         );
         self.run(move |state, lease| {
-            // 零输出时枚举会报错，而加虚拟屏正是为了这种机器，按空清单继续。
-            let screens = capture::screens().unwrap_or_default();
+            // 零输出时枚举会报错，而加虚拟屏正是为了这种机器，按空清单继续；但只
+            // 在拓扑里确实一块启用的输出都没有时才这样，别的错误（比如连不上 X）
+            // 照常报出来。
+            let screens = match capture::screens() {
+                Ok(screens) => screens,
+                Err(error) => {
+                    ensure!(
+                        Topology::query(true)?.metadata()?.iter().all(|t| !t.active),
+                        "{error:#}"
+                    );
+                    Vec::new()
+                }
+            };
             // 主控报的是它自己那块屏的尺寸；它没报就退回本机第一块屏的尺寸。
             let (width, height) = resolutions
                 .first()
@@ -537,7 +548,7 @@ impl Session {
         let state = lock(&self.state);
         state.journal.owned.is_empty()
             && state.journal.super_baseline.is_none()
-            && fallback::allows_retirement(&state.journal.token)
+            && fallback::allows_retirement()
     }
     #[cfg(windows)]
     pub(crate) async fn retire_fallback(&self, replacement: String) -> Result<bool> {
@@ -572,7 +583,7 @@ impl Session {
                 return Ok(false);
             }
             let retiring = fallback::screen()?.and_then(|s| s.identity);
-            let removed = fallback::retire(&state.journal.token, &replacement)?;
+            let removed = fallback::retire(&replacement)?;
             if removed {
                 // 回收之后不能再把兜底屏的旧布局当成要恢复的基线。
                 let available = Topology::query(false)?.metadata()?;
@@ -1762,12 +1773,15 @@ impl State {
             if let Some(mut session) = self.virtual_display.take() {
                 session.release_all();
             }
+            // 退出时兜底屏随进程一起被收回，建了也白建，还会拖慢退出。
             if no_other_display
+                && !fallback::is_exiting()
                 && let Err(error) = fallback::ensure(&self.journal.token, 1920, 1080, false)
             {
                 tracing::warn!(%error, "无屏兜底未能在归还虚拟屏之前建立");
             }
-            // 兜底屏是机器所有的：连接结束只是放弃使用权，屏留到进程退出。
+            // 兜底屏是机器所有的：连接结束只是放弃使用权，屏留着；没人连着时由后台
+            // 维护在别的屏回来后收掉。
             fallback::release(&self.journal.token);
         }
         if !self.dirty {
