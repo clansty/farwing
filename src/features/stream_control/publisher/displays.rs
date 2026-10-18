@@ -114,7 +114,7 @@ impl CheckEnvResp {
                 code: 0,
                 message: "ok".to_owned(),
             },
-            Some(_) if crate::platform::terminal::unavailable().is_some() => Self {
+            Some(_) if crate::features::host::terminal::unavailable().is_some() => Self {
                 code: 5,
                 message: "terminal_component_unavailable".to_owned(),
             },
@@ -231,17 +231,20 @@ pub(crate) async fn receive_session(
                         request = %hex(&bytes),
                         "host terminal environment check request"
                     );
-                    // A platform without a terminal backend says so; otherwise
-                    // the answer is the host's permission.
-                    let refusal = crate::platform::terminal::unavailable().or_else(|| {
+                    // 不能提供终端的主机先说明原因；否则答案就是本机的授权。
+                    let refusal = crate::features::host::terminal::unavailable().or_else(|| {
                         (!session.authorization().terminal_allowed()).then_some("本机未允许终端")
                     });
                     let allowed = refusal.is_none();
                     let resp = CheckEnvResp::result(refusal);
+                    // 主控只会拿到原因代码，可读的原因必须留在本机日志里，
+                    // 否则排查终端打不开时无从下手。
                     // 客户端超时会重发；把 request_id 记下来，失败时能对上
                     // 是哪一次没被接住。
                     tracing::info!(
                         allowed,
+                        reason = refusal.unwrap_or_default(),
+                        code = resp.code,
                         request_id = header.as_ref().map(|header| header.request_id),
                         "host terminal environment check answered"
                     );
@@ -279,8 +282,13 @@ pub(crate) async fn receive_session(
                     let result = if lease.terminal_allowed() {
                         let sessions = session.terminal();
                         let mut sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
+                        // 本机开的 shell 只有获准接入的主控才能改名。
+                        let owner = crate::features::host::terminal::Owner::new(
+                            &account,
+                            lease.terminal_local_allowed(),
+                        );
                         sessions
-                            .rename(&account, request.session_id, &request.new_name)
+                            .rename(owner, request.session_id, &request.new_name)
                             .map_err(|error| error.to_string())
                     } else {
                         Err("本机未允许终端".to_owned())

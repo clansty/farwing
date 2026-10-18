@@ -30,6 +30,10 @@ struct Record {
     port_mapping: bool,
     #[serde(default)]
     terminal: bool,
+    /// 主控持终端授权时，是否也能看到并接入本机自己开的 shell。
+    /// 默认关闭，终端关掉时没有意义。
+    #[serde(default)]
+    terminal_local: bool,
     #[serde(default)]
     remote_power: bool,
     #[serde(default)]
@@ -76,6 +80,7 @@ impl Store {
         bool,
         bool,
         bool,
+        bool,
     )> {
         let bytes = match self.0.get_secret() {
             Ok(bytes) => bytes,
@@ -89,6 +94,7 @@ impl Store {
                     Default::default(),
                     Default::default(),
                     true,
+                    false,
                     false,
                     false,
                     false,
@@ -118,6 +124,7 @@ impl Store {
             record.terminal,
             record.remote_power,
             record.wol,
+            record.terminal_local,
         ))
     }
     pub fn save(
@@ -134,6 +141,7 @@ impl Store {
         terminal: bool,
         remote_power: bool,
         wol: bool,
+        terminal_local: bool,
     ) -> Result<()> {
         encoding.validate()?;
         audio_quality.validate()?;
@@ -156,6 +164,7 @@ impl Store {
                 terminal,
                 remote_power,
                 wol,
+                terminal_local,
             })?)
             .map_err(|_| anyhow::anyhow!("无法保存被控设置"))
     }

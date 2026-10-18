@@ -64,6 +64,10 @@ pub(crate) struct ConnectionInfo {
     /// rather than watching the screen, and the access notice says so.
     #[serde(default)]
     pub terminal: bool,
+    /// 这条终端连接正处在一条本机自己开的会话里（见
+    /// `Handle::terminal_local_allowed`），访问提示据此说明对方在你的终端里。
+    #[serde(default)]
+    pub local_terminal: bool,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -131,6 +135,7 @@ struct Ownership {
     file_transfer: bool,
     port_mapping: bool,
     terminal: bool,
+    terminal_local: bool,
     remote_power: bool,
     wol: bool,
     power_executing: bool,
@@ -186,6 +191,7 @@ impl Default for Handle {
                 file_transfer: true,
                 port_mapping: false,
                 terminal: false,
+                terminal_local: false,
                 remote_power: false,
                 wol: false,
                 power_executing: false,
@@ -344,6 +350,8 @@ impl Handle {
         state.file_transfer = snapshot.file_transfer;
         state.port_mapping = snapshot.port_mapping;
         state.terminal = snapshot.terminal;
+        // 终端关掉时这项也随之失效，快照里已经归一过，这里再兜一次。
+        state.terminal_local = snapshot.terminal && snapshot.terminal_local;
         state.remote_power = snapshot.remote_power;
         state.wol = snapshot.wol;
         state.status = snapshot.status;
@@ -433,6 +441,7 @@ impl Handle {
                 terminal,
                 remote_power,
                 wol,
+                terminal_local,
             )) => {
                 let _ = handle.assistance.configure(assistance);
                 handle.set_allowed(allowed);
@@ -449,6 +458,7 @@ impl Handle {
                 state.file_transfer = file_transfer;
                 state.port_mapping = port_mapping;
                 state.terminal = terminal;
+                state.terminal_local = terminal && terminal_local;
                 state.remote_power = remote_power;
                 state.wol = wol;
                 state.dirty = false;
@@ -598,6 +608,11 @@ impl Handle {
             anyhow::ensure!(state.active, "账号会话已结束");
             if state.terminal != allowed {
                 state.terminal = allowed;
+                // 这项挂在终端授权下，不会随终端重新打开一起恢复：
+                // 那需要重新确认一次。
+                if !allowed {
+                    state.terminal_local = false;
+                }
                 state.settings_revision = state.settings_revision.wrapping_add(1);
                 state.dirty = true;
                 state.status.saving = true;
@@ -609,6 +624,31 @@ impl Handle {
         if !allowed {
             super::terminal::end_login(&self.account);
         }
+        Ok(())
+    }
+    /// 主控是否还能看到并接入本机用户自己开的 shell（侧边栏、OpenUUYC
+    /// terminal）。
+    ///
+    /// 终端下的第二道开关，默认关闭：终端授权允许主控自己开 shell，这道
+    /// 开关允许它看进本机用户正在工作的终端。只有终端开着时才有效。
+    pub(crate) fn terminal_local_allowed(&self) -> bool {
+        let state = lock(&self.ownership);
+        state.terminal && state.terminal_local
+    }
+    pub(crate) fn set_terminal_local_allowed(&self, allowed: bool) -> anyhow::Result<()> {
+        let mut state = lock(&self.ownership);
+        anyhow::ensure!(state.active, "账号会话已结束");
+        // 不能脱离它所属的终端单独打开。
+        let allowed = allowed && state.terminal;
+        if state.terminal_local != allowed {
+            state.terminal_local = allowed;
+            state.settings_revision = state.settings_revision.wrapping_add(1);
+            state.dirty = true;
+            state.status.saving = true;
+            state.status.settings_error = None;
+        }
+        // 关掉时本机的 shell 继续跑（它们属于本机用户），每条终端连接在
+        // 下一个 pump tick 自行放手（见 `terminal::bind`）。
         Ok(())
     }
     pub(crate) fn set_port_mapping_allowed(&self, allowed: bool) -> anyhow::Result<()> {
@@ -831,6 +871,7 @@ impl Handle {
                 file_transfer,
                 port_mapping,
                 terminal,
+                terminal_local,
                 remote_power,
                 wol,
             ) = {
@@ -850,6 +891,7 @@ impl Handle {
                     state.file_transfer,
                     state.port_mapping,
                     state.terminal,
+                    state.terminal_local,
                     state.remote_power,
                     state.wol,
                 )
@@ -868,6 +910,7 @@ impl Handle {
                         file_transfer,
                         port_mapping,
                         terminal,
+                        terminal_local,
                         remote_power,
                         wol,
                     },
@@ -889,6 +932,7 @@ impl Handle {
                         terminal,
                         remote_power,
                         wol,
+                        terminal_local,
                     )
                 })
                 .await
@@ -1272,6 +1316,24 @@ impl Lease {
     pub(crate) fn terminal_allowed(&self) -> bool {
         let state = lock(&self.handle.ownership);
         self.current(&state) && self.assistance.is_none() && !self.handle.guest && state.terminal
+    }
+    /// 本次许可是否也能接入本机自己开的 shell；见
+    /// [`Handle::terminal_local_allowed`]。
+    pub(crate) fn terminal_local_allowed(&self) -> bool {
+        let state = lock(&self.handle.ownership);
+        self.current(&state)
+            && self.assistance.is_none()
+            && !self.handle.guest
+            && state.terminal
+            && state.terminal_local
+    }
+    /// 记录这条终端连接是否正处在本机自己开的 shell 里，供访问提示使用。
+    pub(crate) fn terminal_on_local(&self, attached: bool) {
+        self.modify(|state| {
+            if let Some(connection) = state.status.connection.as_mut() {
+                connection.local_terminal = attached;
+            }
+        });
     }
     pub(crate) fn port_status(&self, status: crate::features::port_mapping::host::Status) {
         self.modify(|s| s.status.ports = status);

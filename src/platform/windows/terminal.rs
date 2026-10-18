@@ -11,8 +11,9 @@
 //! wait on a single shell.
 
 use anyhow::{Context, Result, bail};
-use std::sync::Mutex;
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
+use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Console::{
@@ -25,21 +26,35 @@ use windows::Win32::System::JobObjects::{
 };
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
-    CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, InitializeProcThreadAttributeList,
     LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
-    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    ResumeThread, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
-use windows::core::PWSTR;
+use windows::core::{PCWSTR, PWSTR};
 
 /// ConPTY 不暴露前台进程组。
 pub(crate) fn foreground_supported() -> bool {
     false
 }
 
-/// Windows can serve a terminal; Linux states why it cannot here.
+/// Why this process cannot serve a terminal; `None` when it can.
+///
+/// 无人值守服务把被控端跑在 LocalSystem 下：从那里开出来的 shell 会把
+/// SYSTEM 交给主控，而授权只承诺“以当前用户身份开终端”，这和 POSIX 后端
+/// 拒绝 root 是同一类越权。读不到身份时也拒绝——没核对过的账号不能开
+/// shell。结果进程内不会变，缓存一次省掉每次连接都去查令牌。
 pub(crate) fn unavailable() -> Option<&'static str> {
-    None
+    /// LocalSystem 的固定 SID。
+    const LOCAL_SYSTEM: &str = "S-1-5-18";
+    static REFUSAL: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *REFUSAL.get_or_init(|| match super::host_service::vault::sid(std::process::id()) {
+        Ok(sid) if sid == LOCAL_SYSTEM => {
+            Some("以 SYSTEM 身份运行（无人值守模式）时不提供终端")
+        }
+        Ok(_) => None,
+        Err(_) => Some("无法确认运行身份，不提供终端"),
+    })
 }
 
 /// Maps the controller's shell choice to a program.
@@ -130,6 +145,10 @@ impl Drop for Job {
     }
 }
 
+/// How much input may wait for the writer thread, like a pty's input buffer.
+/// Past this, `write` takes nothing and the shared layer holds the rest.
+const INPUT_QUEUE: usize = 64 * 1024;
+
 /// A handle handed to a worker thread.
 ///
 /// [`HANDLE`] wraps a raw pointer and so is not `Send`; ownership is moved to
@@ -146,9 +165,11 @@ pub(crate) struct Session {
     job: Job,
     /// Input queued for the writer thread; `None` once it has stopped.
     input: Mutex<Option<SyncSender<Vec<u8>>>>,
+    /// Bytes queued for the writer thread and not yet in the console.
+    queued: Arc<AtomicUsize>,
     /// Output the reader thread has produced but the frame layer has not
     /// taken yet.
-    output: Mutex<Receiver<Vec<u8>>>,
+    output: Mutex<Output>,
     shell: String,
 }
 
@@ -201,14 +222,20 @@ impl Session {
         std::thread::spawn(move || read_output(output_read, output_tx));
         let (input_tx, input_rx) = sync_channel(64);
         let input_write = SendHandle(input_write);
-        std::thread::spawn(move || write_input(input_write, input_rx));
+        let queued = Arc::new(AtomicUsize::new(0));
+        let drained = Arc::clone(&queued);
+        std::thread::spawn(move || write_input(input_write, input_rx, drained));
 
         Ok(Self {
             console,
             process,
             job,
             input: Mutex::new(Some(input_tx)),
-            output: Mutex::new(output_rx),
+            queued,
+            output: Mutex::new(Output {
+                channel: Some(output_rx),
+                carry: Vec::new(),
+            }),
             shell: shell.to_owned(),
         })
     }
@@ -227,32 +254,61 @@ impl Session {
     ///
     /// `Ok(None)` means nothing is ready; `Ok(Some(0))` is end-of-file, which
     /// is how the reader reports a closed console.
+    ///
+    /// A chunk larger than `buffer` is handed out over several calls, the way
+    /// a pty read returns what fits and leaves the rest queued.
     pub(crate) fn read(&self, buffer: &mut [u8]) -> Result<Option<usize>> {
-        let channel = self.output.lock().unwrap_or_else(|e| e.into_inner());
-        match channel.try_recv() {
-            Ok(chunk) => {
-                let take = chunk.len().min(buffer.len());
-                buffer[..take].copy_from_slice(&chunk[..take]);
-                Ok(Some(take))
-            }
-            Err(TryRecvError::Empty) => Ok(None),
-            // The reader thread ended: the console closed.
-            Err(TryRecvError::Disconnected) => Ok(Some(0)),
+        if buffer.is_empty() {
+            return Ok(None);
         }
+        let mut output = self.output.lock().unwrap_or_else(|e| e.into_inner());
+        if output.carry.is_empty() {
+            let Some(channel) = output.channel.as_ref() else {
+                return Ok(Some(0));
+            };
+            match channel.try_recv() {
+                Ok(chunk) => output.carry = chunk,
+                Err(TryRecvError::Empty) => return Ok(None),
+                // The reader thread ended: the console closed.
+                Err(TryRecvError::Disconnected) => return Ok(Some(0)),
+            }
+        }
+        let take = output.carry.len().min(buffer.len());
+        buffer[..take].copy_from_slice(&output.carry[..take]);
+        output.carry.drain(..take);
+        Ok(Some(take))
     }
 
     /// Queues keyboard input for the writer thread.
     ///
-    /// The caller counts the bytes as written because the queue is what
-    /// actually holds them; the writer drains it as the console accepts.
+    /// Behaves like a non-blocking pty write: it takes what fits in the
+    /// writer's queue and reports how much, and `Ok(0)` when the queue is
+    /// full. The caller holds the rest, so the shared layer's own input limit
+    /// and its overflow answer apply here as they do on POSIX, and a shell
+    /// that stopped reading never blocks the caller, which holds the lock of
+    /// every session.
     pub(crate) fn write(&self, data: &[u8]) -> Result<usize> {
         let channel = self.input.lock().unwrap_or_else(|e| e.into_inner());
-        match channel.as_ref() {
-            Some(sender) => sender
-                .send(data.to_vec())
-                .map(|()| data.len())
-                .context("写入伪控制台失败"),
-            None => bail!("伪控制台已关闭"),
+        let Some(sender) = channel.as_ref() else {
+            bail!("伪控制台已关闭");
+        };
+        let room = INPUT_QUEUE.saturating_sub(self.queued.load(Ordering::Acquire));
+        let take = data.len().min(room);
+        if take == 0 {
+            return Ok(0);
+        }
+        // Counted before the send so the writer can never subtract first.
+        self.queued.fetch_add(take, Ordering::AcqRel);
+        match sender.try_send(data[..take].to_vec()) {
+            Ok(()) => Ok(take),
+            Err(TrySendError::Full(_)) => {
+                self.queued.fetch_sub(take, Ordering::AcqRel);
+                Ok(0)
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.queued.fetch_sub(take, Ordering::AcqRel);
+                bail!("伪控制台已关闭")
+            }
         }
     }
 
@@ -288,18 +344,45 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // Closing the console hangs the shell up; the child is then killed so
-        // it cannot outlive the session, and the handles are released.
-        // SAFETY: every handle was created in `open` and is owned here.
+        // The shell and everything it started go first, so nothing is left
+        // writing to the console.
+        self.job.terminate();
+        // SAFETY: the process handle was created in `open` and is owned here.
+        unsafe {
+            let _ = TerminateProcess(self.process, 1);
+        }
+        // Then the channels. Before Windows 11 24H2, `ClosePseudoConsole`
+        // waits until the console's last output has been read; a reader stuck
+        // on a full channel (a detached or backpressured session) would never
+        // read it, and the close would hang this thread for good. Without a
+        // receiver the reader's next send fails and it closes the pipe, which
+        // ends the console's write. Dropping the sender ends the writer.
+        let _ = self
+            .output
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .channel
+            .take();
+        let _ = self
+            .input
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        // SAFETY: as above; neither handle is used again.
         unsafe {
             ClosePseudoConsole(self.console);
-            let _ = TerminateProcess(self.process, 1);
             let _ = CloseHandle(self.process);
         }
-        // Dropping the sender ends the writer thread; the console close ends
-        // the reader.
-        let _ = self.input.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
+}
+
+/// The output side of a [`Session`].
+struct Output {
+    /// Chunks from the reader thread; `None` once the session is being torn
+    /// down.
+    channel: Option<Receiver<Vec<u8>>>,
+    /// The rest of a chunk the last read had no room for.
+    carry: Vec<u8>,
 }
 
 /// A pipe pair, read end first.
@@ -315,6 +398,9 @@ fn pipe() -> Result<(HANDLE, HANDLE)> {
 
 /// Starts `shell` attached to `console`.
 fn spawn(shell: &str, console: HPCON) -> Result<(HANDLE, Job)> {
+    // The job exists before the shell does, so the shell joins it before it
+    // runs a single instruction and nothing it starts escapes.
+    let job = Job::create()?;
     // `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` carries the console handle; the
     // attribute list has to be sized first, then filled.
     let mut size = 0usize;
@@ -346,7 +432,20 @@ fn spawn(shell: &str, console: HPCON) -> Result<(HANDLE, Job)> {
         return Err(error).context("设置伪控制台属性失败");
     }
 
-    let mut command: Vec<u16> = shell.encode_utf16().chain(std::iter::once(0)).collect();
+    // Quoted, so a shell under a path with spaces (a `ComSpec` in
+    // `Program Files`) is not split into a program and arguments.
+    let mut command: Vec<u16> = format!("\"{}\"", shell.trim_matches('"'))
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // The shell starts in the user's profile, as the POSIX one starts in
+    // `$HOME`, rather than in whatever directory the host was launched from.
+    let directory: Option<Vec<u16>> = std::env::var_os("USERPROFILE")
+        .filter(|home| std::path::Path::new(home).is_dir())
+        .map(|home| {
+            use std::os::windows::ffi::OsStrExt;
+            home.encode_wide().chain(std::iter::once(0)).collect()
+        });
     let mut info = STARTUPINFOEXW::default();
     info.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
     info.lpAttributeList = list;
@@ -360,9 +459,11 @@ fn spawn(shell: &str, console: HPCON) -> Result<(HANDLE, Job)> {
             None,
             None,
             false,
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
             None,
-            None,
+            directory
+                .as_ref()
+                .map_or(PCWSTR::null(), |directory| PCWSTR(directory.as_ptr())),
             &info.StartupInfo,
             &mut process,
         )
@@ -372,16 +473,25 @@ fn spawn(shell: &str, console: HPCON) -> Result<(HANDLE, Job)> {
     unsafe { DeleteProcThreadAttributeList(list) };
     created.context("启动 shell 失败")?;
 
-    // The thread handle is not needed; the process handle is.
-    // SAFETY: the thread handle came back from `CreateProcessW` and is ours.
+    // The shell is still suspended: put it in the job, then let it run. A
+    // shell that cannot be contained is not started at all.
+    let started = job.assign(process.hProcess).and_then(|()| {
+        // SAFETY: the thread handle came back from `CreateProcessW` and is
+        // live; `u32::MAX` is the documented failure value.
+        (unsafe { ResumeThread(process.hThread) } != u32::MAX)
+            .then_some(())
+            .context("启动 shell 失败")
+    });
+    // SAFETY: the thread handle is ours and not used again; on failure the
+    // process handle is too.
     unsafe {
         let _ = CloseHandle(process.hThread);
-    };
-    // The job has to exist before the shell can start anything of its own, so
-    // it is assigned the moment the process does.
-    let job = Job::create()?;
-    job.assign(process.hProcess)?;
-    Ok((process.hProcess, job))
+        if started.is_err() {
+            let _ = TerminateProcess(process.hProcess, 1);
+            let _ = CloseHandle(process.hProcess);
+        }
+    }
+    started.map(|()| (process.hProcess, job))
 }
 
 /// Reads the console's output into `out` until it closes.
@@ -415,22 +525,27 @@ fn read_output(handle: SendHandle, out: SyncSender<Vec<u8>>) {
 }
 
 /// Writes queued input to the console until the channel closes.
-fn write_input(handle: SendHandle, input: Receiver<Vec<u8>>) {
+fn write_input(handle: SendHandle, input: Receiver<Vec<u8>>, queued: Arc<AtomicUsize>) {
     let handle = handle.0;
-    while let Ok(data) = input.recv() {
-        let mut written = 0u32;
-        // SAFETY: the handle is live and the slice is valid for reads.
-        let ok = unsafe {
-            WriteFile(
-                handle,
-                Some(&data),
-                Some(std::ptr::from_mut(&mut written)),
-                None,
-            )
-        };
-        if ok.is_err() {
-            break;
+    'chunks: while let Ok(data) = input.recv() {
+        let mut rest = data.as_slice();
+        while !rest.is_empty() {
+            let mut written = 0u32;
+            // SAFETY: the handle is live and the slice is valid for reads.
+            let ok = unsafe {
+                WriteFile(
+                    handle,
+                    Some(rest),
+                    Some(std::ptr::from_mut(&mut written)),
+                    None,
+                )
+            };
+            if ok.is_err() || written == 0 {
+                break 'chunks;
+            }
+            rest = &rest[written as usize..];
         }
+        queued.fetch_sub(data.len(), Ordering::AcqRel);
     }
     // SAFETY: the write end is ours and is not used again.
     unsafe {
@@ -482,6 +597,33 @@ mod tests {
     }
 
     #[test]
+    fn output_larger_than_the_read_buffer_is_not_lost() {
+        let session = Session::open(shell(), 200, 24).expect("open");
+        let marker = format!("LONG-{}-END", "x".repeat(120));
+        session
+            .write(format!("echo {marker}\r\n").as_bytes())
+            .expect("write");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut seen = Vec::new();
+        // Far smaller than one console chunk, so every chunk is split.
+        let mut buffer = [0u8; 16];
+        while Instant::now() < deadline {
+            match session.read(&mut buffer) {
+                Ok(Some(0)) => break,
+                Ok(Some(read)) => seen.extend_from_slice(&buffer[..read]),
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(error) => panic!("read: {error}"),
+            }
+            // The echoed command line holds the marker too; the second copy
+            // is the output.
+            if String::from_utf8_lossy(&seen).matches(&marker).count() >= 2 {
+                return;
+            }
+        }
+        panic!("shell produced: {:?}", String::from_utf8_lossy(&seen));
+    }
+
+    #[test]
     fn an_exited_shell_is_reported() {
         let mut session = Session::open(shell(), 80, 24).expect("open");
         session.write(b"exit\r\n").expect("write");
@@ -510,7 +652,8 @@ impl Session {
     /// Closing the console alone only hangs the shell up and leaves whatever
     /// it spawned running; the job is what makes this mean the same thing as
     /// it does on Linux, where the shell's whole session is walked. `self`
-    /// then drops, which closes the console and the handles.
+    /// then drops, which closes the console and the handles. Dropping alone
+    /// ends the job too, so this mainly states the intent at the call site.
     pub(crate) fn terminate(self) {
         self.job.terminate();
     }

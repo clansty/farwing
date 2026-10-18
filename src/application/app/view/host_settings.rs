@@ -62,25 +62,42 @@ impl DeviceCenterApp {
         let mut ports = host.port_mapping_allowed();
         let mut power = host.power_allowed();
         let mut wol = host.wol_allowed();
-        // Only where this platform can actually run a shell.
-        let terminal_supported = crate::platform::terminal::unavailable().is_none();
+        // 只有这台机器真能开 shell 时才允许；否则开关保留但禁用，并给出原因。
+        let terminal_refusal = crate::features::host::terminal::unavailable();
+        let terminal_supported = terminal_refusal.is_none();
         let mut terminal = host.terminal_allowed();
+        let mut terminal_local = host.terminal_local_allowed();
         let mut clipboard = host.clipboard_settings();
-        let before = (files, ports, power, wol, terminal, clipboard);
+        let before = (
+            files,
+            ports,
+            power,
+            wol,
+            terminal,
+            clipboard,
+            terminal_local,
+        );
         let enabled = usize::from(clipboard.enabled)
             + usize::from(clipboard.enabled && clipboard.files)
             + if guest {
                 0
             } else {
-                [files, ports, power, wol, terminal && terminal_supported]
-                    .into_iter()
-                    .filter(|v| *v)
-                    .count()
+                [
+                    files,
+                    ports,
+                    power,
+                    wol,
+                    terminal && terminal_supported,
+                    terminal_local && terminal_supported,
+                ]
+                .into_iter()
+                .filter(|v| *v)
+                .count()
             };
         let total = if guest {
             2
         } else {
-            6 + usize::from(terminal_supported)
+            6 + 2 * usize::from(terminal_supported)
         };
         let id = egui::Id::new(("host-access-settings", self.login_generation));
         let mut open = ui.data(|data| data.get_temp::<bool>(id).unwrap_or(false));
@@ -122,13 +139,37 @@ impl DeviceCenterApp {
                             ui.checkbox(&mut power, "关机和重启");
                             ui.checkbox(&mut ports, "端口转发");
                             ui.checkbox(&mut wol, "局域网唤醒协助");
-                            if terminal_supported {
+                            if let Some(reason) = terminal_refusal {
+                                ui.add_enabled(false, egui::Checkbox::new(&mut false, "终端"));
+                                ui.label(RichText::new(reason).small().color(MUTED));
+                            } else {
                                 ui.checkbox(&mut terminal, "终端");
                                 ui.label(
                                     RichText::new("主控设备可以以当前用户身份在本机执行任意命令")
                                         .small()
                                         .color(MUTED),
                                 );
+                                // 终端下的第二道授权：只有终端本身开着时可用，
+                                // 终端一关就随之失效。
+                                ui.indent("host-terminal-local", |ui| {
+                                    let mut shown = terminal_local && before.4;
+                                    ui.add_enabled(
+                                        before.4 && terminal,
+                                        egui::Checkbox::new(&mut shown, "允许主控接入本机终端会话"),
+                                    );
+                                    if before.4 && terminal {
+                                        terminal_local = shown;
+                                    }
+                                    ui.label(
+                                        RichText::new(if before.4 {
+                                            "主控能看到并接管你在本机「终端会话」页或命令行里打开的 shell"
+                                        } else {
+                                            "先允许终端，才能打开这一项"
+                                        })
+                                        .small()
+                                        .color(MUTED),
+                                    );
+                                });
                                 let running = crate::features::host::terminal::running();
                                 if running > 0 {
                                     ui.horizontal(|ui| {
@@ -167,12 +208,33 @@ impl DeviceCenterApp {
                 None => {}
             }
         }
+        // 让主控进本机用户自己的 shell 也要先问一次。
+        let local_confirm_id =
+            egui::Id::new(("host-terminal-local-confirm", self.login_generation));
+        if terminal_local && !before.6 {
+            terminal_local = false;
+            ui.data_mut(|data| data.insert_temp(local_confirm_id, true));
+        }
+        if ui.data(|data| data.get_temp::<bool>(local_confirm_id).unwrap_or(false)) {
+            match terminal_local_confirmation(ui.ctx()) {
+                Some(true) => {
+                    terminal_local = true;
+                    ui.data_mut(|data| data.remove::<bool>(local_confirm_id));
+                }
+                Some(false) => ui.data_mut(|data| data.remove::<bool>(local_confirm_id)),
+                None => {}
+            }
+        }
+        if !terminal {
+            terminal_local = false;
+        }
         let results = [
             (files != before.0).then(|| host.set_file_transfer_allowed(files)),
             (ports != before.1).then(|| host.set_port_mapping_allowed(ports)),
             (power != before.2).then(|| host.set_power_allowed(power)),
             (wol != before.3).then(|| host.set_wol_allowed(wol)),
             (terminal != before.4).then(|| host.set_terminal_allowed(terminal)),
+            (terminal_local != before.6).then(|| host.set_terminal_local_allowed(terminal_local)),
             (clipboard != before.5).then(|| host.set_clipboard_settings(clipboard)),
         ];
         let mut changed = false;
@@ -526,6 +588,43 @@ impl DeviceCenterApp {
 
 /// Asks before the controller may run a shell here: `Some(true)` to allow,
 /// `Some(false)` to leave it off, `None` while the dialog is still open.
+///
+/// 「允许主控接入本机终端会话」的确认，形式与 [`terminal_confirmation`] 相同。
+fn terminal_local_confirmation(ctx: &egui::Context) -> Option<bool> {
+    let mut decision = None;
+    let response = egui::Modal::new(egui::Id::new("host-terminal-local-confirm"))
+        .frame(crate::ui::controls::dialog_frame())
+        .show(ctx, |ui| {
+            ui.set_width(410.0);
+            if crate::ui::controls::dialog_header(
+                ui,
+                "允许主控接入本机终端会话？",
+                crate::ui::controls::DialogIcon::Warning,
+                true,
+            ) {
+                decision = Some(false);
+            }
+            ui.label(
+                "主控设备能看到并接管你在本机打开的终端会话，包括屏幕内容和之后输入的一切，\
+                 也能在这些会话里输入命令、改名或结束它们。只在信任的设备上开启。",
+            );
+            let (accept, dismiss) = crate::ui::controls::dialog_actions(
+                ui,
+                Some(crate::ui::controls::DialogAction::new("允许接入").danger(true)),
+                Some("取消"),
+            );
+            if accept {
+                decision = Some(true);
+            } else if dismiss {
+                decision = Some(false);
+            }
+        });
+    if decision.is_none() && response.should_close() {
+        decision = Some(false);
+    }
+    decision
+}
+
 fn terminal_confirmation(ctx: &egui::Context) -> Option<bool> {
     let mut decision = None;
     let response = egui::Modal::new(egui::Id::new("host-terminal-confirm"))
