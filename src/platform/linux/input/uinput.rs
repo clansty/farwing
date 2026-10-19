@@ -35,7 +35,7 @@
 //! codes, the first character as Escape. Text for a focused X client goes
 //! through X Test instead, which is the one reason this backend keeps an X
 //! connection.
-use super::{Lock, Touch, evdev, virtual_keyboard, xtest};
+use super::{Lock, Touch, evdev, input_method, virtual_keyboard, xtest};
 use crate::platform::Rotation;
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::{BTreeMap, BTreeSet};
@@ -725,6 +725,9 @@ pub(super) struct Injector {
     /// 前台是 XWayland 客户端时的文字输入，见 [`Self::x_client_focused`]。
     /// 没有 XWayland（纯 Wayland 会话、或 X 在别处）就是 None。
     xtest: Option<xtest::Injector>,
+    /// 走输入法协议提交文本：唯一能进 Chromium 系客户端的路（见
+    /// [`super::input_method`]）。应用没启用 text-input 时不会被激活。
+    input_method: Option<input_method::InputMethod>,
     /// 多点触摸屏，拿不到就没有：触摸退回单指模拟。
     touchscreen: Option<Touchscreen>,
 }
@@ -810,6 +813,16 @@ impl Injector {
         } else {
             None
         };
+        let input_method = match input_method::InputMethod::connect() {
+            Ok(method) => {
+                tracing::info!("文字输入优先走 zwp_input_method_v2（应用启用输入法时）");
+                Some(method)
+            }
+            Err(error) => {
+                tracing::debug!(%error, "没有输入法协议，文字输入只走虚拟键盘");
+                None
+            }
+        };
         Ok(Self {
             keyboard,
             relative,
@@ -818,6 +831,7 @@ impl Injector {
             leds: 0,
             virtual_keyboard,
             xtest,
+            input_method,
             touchscreen,
         })
     }
@@ -1020,6 +1034,24 @@ impl Injector {
     /// 的键位表解 keycode，会打出一串乱码（第一个字符还常常变成 Esc），这种情况
     /// 交给 XTest。前台是原生 Wayland 客户端（或没有 X）时才用虚拟键盘。
     fn type_text(&mut self, text: &str, permitted: &impl Fn() -> bool) -> Result<()> {
+        // 本机布局打得出来的字符优先走 uinput 的物理键位：Chromium 系客户端
+        // 收到虚拟键盘的 keymap 后会重建自己的键盘对象，重建出来的那份拿的是
+        // 合成器的默认键位表，此后整段文字都按默认布局解释（`@*+-` 变成数字、
+        // 中文变成乱码）。物理键位不经过那份 keymap，不受影响。
+        if us_layout() && text.chars().all(|c| us_key(c).is_some()) {
+            return self.type_locally(text, permitted);
+        }
+        // 输入法协议不经过 keymap，是唯一能进 Chromium 系客户端的路（它们要
+        // `--enable-wayland-ime` 才会启用 text-input）。没被激活就用虚拟键盘。
+        if let Some(method) = &mut self.input_method
+            && (method.active() || method.wait_active())
+        {
+            let sacrifice = input_method::chromium_foreground();
+            match method.text(text, sacrifice) {
+                Ok(()) => return Ok(()),
+                Err(error) => tracing::warn!(%error, "输入法提交失败，改用虚拟键盘"),
+            }
+        }
         if self.x_client_focused() {
             // 前台是 X 客户端，虚拟键盘对它无效；没有 XTest 时只剩本地布局。
             if let Some(xtest) = &self.xtest {
