@@ -853,9 +853,17 @@ pub(crate) fn visibility_button(ui: &mut egui::Ui, visible: &mut bool) -> egui::
 
 /// A full button target with a vector chevron, independent of font glyphs.
 pub fn back_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    let text =
-        ui.painter()
-            .layout_no_wrap(label.into(), egui::FontId::proportional(theme::BODY), TEXT);
+    back_button_ink(ui, label, None)
+}
+
+/// 压在壁纸这类深浅不定的底上时用：墨色由调用方给，
+/// 悬停只改变墨色的浓度，不像默认那样整个换色——白字换色在浅底上会消失。
+pub fn back_button_ink(ui: &mut egui::Ui, label: &str, ink: Option<Color32>) -> egui::Response {
+    let text = ui.painter().layout_no_wrap(
+        label.into(),
+        egui::FontId::proportional(theme::BODY),
+        ink.unwrap_or(TEXT),
+    );
     let response = ui.add_sized(
         vec2(text.size().x + 48.0, HEIGHT),
         egui::Button::new("").frame(false),
@@ -864,7 +872,11 @@ pub fn back_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
     });
     let center = response.rect.left_center() + vec2(18.0, 0.0);
-    let color = ui.style().interact(&response).fg_stroke.color;
+    let color = match ink {
+        Some(ink) if response.hovered() || response.has_focus() => ink,
+        Some(ink) => ink.gamma_multiply(0.78),
+        None => ui.style().interact(&response).fg_stroke.color,
+    };
     ui.painter().add(egui::Shape::line(
         vec![
             center + vec2(3.0, -5.0),

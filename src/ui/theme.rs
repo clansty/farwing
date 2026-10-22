@@ -7,6 +7,8 @@ pub const SIDEBAR: Color32 = Color32::from_rgb(16, 20, 26);
 pub const SURFACE: Color32 = Color32::from_rgb(31, 37, 47);
 pub const LINE: Color32 = Color32::from_rgb(45, 53, 66);
 pub const TEXT: Color32 = Color32::from_rgb(231, 235, 242);
+/// 直接压在壁纸上的文字：底色浅时用这个，白色在那上面看不清。
+pub const TEXT_ON_LIGHT: Color32 = Color32::from_rgb(24, 29, 38);
 pub const MUTED: Color32 = Color32::from_rgb(156, 167, 184);
 pub const ACCENT: Color32 = Color32::from_rgb(75, 136, 235);
 pub const GREEN: Color32 = Color32::from_rgb(102, 207, 156);

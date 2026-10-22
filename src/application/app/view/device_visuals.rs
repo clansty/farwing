@@ -142,6 +142,30 @@ pub(super) fn wallpaper(
     }
 }
 
+/// 取景固定在 380 逻辑像素高的框里，和窗口高度、有没有电源按钮都无关。
+const DETAIL_FRAME_HEIGHT: f32 = 380.0;
+const DETAIL_FRAME_ZOOM: f32 = 1.05;
+const DETAIL_FRAME_ANCHOR: egui::Vec2 = egui::vec2(0.5, 0.46);
+
+fn detail_uv(source: egui::Vec2, width: f32) -> (egui::Rect, f32) {
+    let frame = vec2(width, DETAIL_FRAME_HEIGHT);
+    let uv = wallpaper_uv(source, frame, DETAIL_FRAME_ZOOM, DETAIL_FRAME_ANCHOR);
+    (uv, frame.y / uv.height())
+}
+
+/// 详情页顶部工具栏压在壁纸上的那一块，换算回图片的 uv。
+/// 与 detail_wallpaper 共用取景，否则采样到的位置和眼睛看到的不是一处。
+pub(super) fn detail_header_uv(source: egui::Vec2, width: f32, header_height: f32) -> egui::Rect {
+    let (uv, image_height) = detail_uv(source, width);
+    egui::Rect::from_min_size(
+        uv.min,
+        vec2(
+            uv.width() * 0.45,
+            (header_height / image_height).min(uv.height()),
+        ),
+    )
+}
+
 /// Detail backdrop: the same cover/offset rule for every image.
 /// Fade before the information rows; the content layout never follows image height.
 pub(super) fn detail_wallpaper(
@@ -156,9 +180,7 @@ pub(super) fn detail_wallpaper(
     let source = texture.size_vec2();
     // A stable framing area keeps composition independent of window height
     // and of whether this device has power controls. Preserve image aspect.
-    let frame_size = vec2(bounds.width(), 380.0);
-    let uv = wallpaper_uv(source, frame_size, 1.05, vec2(0.5, 0.46));
-    let image_height = frame_size.y / uv.height();
+    let (uv, image_height) = detail_uv(source, bounds.width());
     let height = (1.0 - uv.top()) * image_height;
     let end = fade_end.min(height);
     let start = fade_start.min(end * 0.5);
@@ -186,4 +208,21 @@ pub(super) fn detail_wallpaper(
         }
     }
     egui::Shape::mesh(mesh)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 采样框必须落在最上面那一条、靠左那一段，和实际绘制共用同一套取景。
+    #[test]
+    fn header_uv_covers_only_the_top_left_band() {
+        let source = vec2(960.0, 540.0);
+        let (frame_uv, image_height) = detail_uv(source, 1200.0);
+        let uv = detail_header_uv(source, 1200.0, 48.0);
+        assert!((uv.top() - frame_uv.top()).abs() < 1e-6);
+        assert!((uv.height() - 48.0 / image_height).abs() < 1e-6);
+        assert!(uv.bottom() < frame_uv.top() + frame_uv.height() * 0.2);
+        assert!(uv.right() < frame_uv.center().x);
+    }
 }

@@ -29,11 +29,87 @@ impl std::fmt::Debug for Source {
     }
 }
 
+/// 低分辨率亮度表。详情页要把文字直接压在壁纸上，深浅只能按图判断，
+/// 而取景区（uv）是绘制时才知道的，所以这里只留一张粗网格供视图自己查。
+#[derive(Default)]
+struct Luma {
+    size: [usize; 2],
+    cells: Vec<f32>,
+}
+
+impl Luma {
+    const COLS: usize = 6;
+    const ROWS: usize = 6;
+
+    fn new(image: &egui::ColorImage) -> Self {
+        let [width, height] = image.size;
+        let mut cells = vec![0.0; Self::COLS * Self::ROWS];
+        if width == 0 || height == 0 {
+            return Self::default();
+        }
+        let mut counts = vec![0u32; cells.len()];
+        for y in 0..height {
+            let row = y * Self::ROWS / height;
+            for x in 0..width {
+                let pixel = image.pixels[y * width + x];
+                let cell = row * Self::COLS + x * Self::COLS / width;
+                // Rec.601 亮度：判断「白底还是黑底」够用，也比线性化便宜。
+                cells[cell] += (0.299 * f32::from(pixel.r())
+                    + 0.587 * f32::from(pixel.g())
+                    + 0.114 * f32::from(pixel.b()))
+                    / 255.0;
+                counts[cell] += 1;
+            }
+        }
+        for (cell, count) in cells.iter_mut().zip(counts) {
+            if count > 0 {
+                *cell /= count as f32;
+            }
+        }
+        Self {
+            size: [width, height],
+            cells,
+        }
+    }
+
+    /// uv 覆盖范围（0..1 归一化）内的平均亮度；没有交集时返回 None。
+    fn mean(&self, uv: egui::Rect) -> Option<f32> {
+        let [width, height] = self.size;
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let mut sum = 0.0;
+        let mut weight = 0.0;
+        for row in 0..Self::ROWS {
+            for col in 0..Self::COLS {
+                let cell = egui::Rect::from_min_max(
+                    egui::pos2(
+                        col as f32 / Self::COLS as f32,
+                        row as f32 / Self::ROWS as f32,
+                    ),
+                    egui::pos2(
+                        (col + 1) as f32 / Self::COLS as f32,
+                        (row + 1) as f32 / Self::ROWS as f32,
+                    ),
+                );
+                let overlap = cell.intersect(uv);
+                let area = overlap.width().max(0.0) * overlap.height().max(0.0);
+                if area > 0.0 {
+                    sum += self.cells[row * Self::COLS + col] * area;
+                    weight += area;
+                }
+            }
+        }
+        (weight > 0.0).then(|| sum / weight)
+    }
+}
+
 struct Entry {
     url: String,
     ticket: u64,
     touched: u64,
     texture: Option<egui::TextureHandle>,
+    luma: Option<Luma>,
     failed: bool,
 }
 
@@ -106,6 +182,7 @@ impl Wallpapers {
                 && entry.ticket == ticket
             {
                 if let Some(pixels) = pixels {
+                    entry.luma = Some(Luma::new(&pixels));
                     entry.texture = Some(ctx.load_texture(
                         format!("device-wallpaper-{ticket}"),
                         pixels,
@@ -119,6 +196,11 @@ impl Wallpapers {
 
     pub fn failed(&self, id: &str) -> bool {
         self.entries.get(id).is_some_and(|e| e.failed)
+    }
+
+    /// 壁纸在给定 uv 区域（0..1）上的平均亮度，用来判断压在上面的文字该用什么颜色。
+    pub fn mean_luma(&self, id: &str, uv: egui::Rect) -> Option<f32> {
+        self.entries.get(id)?.luma.as_ref()?.mean(uv)
     }
 
     pub fn texture(
@@ -157,6 +239,7 @@ impl Wallpapers {
                 ticket,
                 touched: self.clock,
                 texture: None,
+                luma: None,
                 failed: false,
             },
         );
@@ -310,4 +393,57 @@ async fn download(address: &str) -> Result<Vec<u8>> {
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn left_white_right_black() -> egui::ColorImage {
+        let size = [128, 128];
+        egui::ColorImage::new(
+            size,
+            (0..size[0] * size[1])
+                .map(|i| {
+                    if i % size[0] < size[0] / 2 {
+                        egui::Color32::WHITE
+                    } else {
+                        egui::Color32::BLACK
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// 亮度表要按查询的区域给值，不能整张图抹成平均。
+    #[test]
+    fn mean_follows_the_queried_region() {
+        let luma = Luma::new(&left_white_right_black());
+        let left = luma
+            .mean(egui::Rect::from_min_max(
+                egui::pos2(0.0, 0.0),
+                egui::pos2(0.4, 0.2),
+            ))
+            .unwrap();
+        let right = luma
+            .mean(egui::Rect::from_min_max(
+                egui::pos2(0.6, 0.0),
+                egui::pos2(1.0, 0.2),
+            ))
+            .unwrap();
+        assert!(left > 0.99, "left = {left}");
+        assert!(right < 0.01, "right = {right}");
+    }
+
+    #[test]
+    fn empty_image_has_no_luma() {
+        let luma = Luma::new(&egui::ColorImage::filled([0, 0], egui::Color32::WHITE));
+        assert!(
+            luma.mean(egui::Rect::from_min_max(
+                egui::Pos2::ZERO,
+                egui::pos2(1.0, 1.0)
+            ))
+            .is_none()
+        );
+    }
 }

@@ -25,6 +25,11 @@ enum ButtonTone {
     Danger,
 }
 
+/// 顶部工具栏高度；壁纸从这一行开始就被压在下面了。
+const HEADER_HEIGHT: f32 = 48.0;
+/// 顶部壁纸平均亮度超过这个值就认为底色是浅色，返回文字换深墨色。
+const LIGHT_WALLPAPER_LUMA: f32 = 0.55;
+
 fn hardware_summary(label: &str, value: &str) -> String {
     match label {
         "主板" => {
@@ -411,16 +416,30 @@ impl DeviceCenterApp {
             })
         });
         let has_diagnostics = has_ports && device.platform == 1;
-        let (header, _) = ui.allocate_exact_size(vec2(viewport.x, 48.0), Sense::hover());
+        let texture = self
+            .center_ui
+            .wallpapers
+            .texture(ui.ctx(), &id, &device.wallpaper_url);
+        // 返回按钮没有衬底，直接压在壁纸左上角：浅色壁纸要把墨色换深。
+        let ink = texture
+            .as_ref()
+            .and_then(|t| {
+                let uv = device_visuals::detail_header_uv(t.size_vec2(), viewport.x, HEADER_HEIGHT);
+                self.center_ui.wallpapers.mean_luma(&id, uv)
+            })
+            .filter(|luma| *luma > LIGHT_WALLPAPER_LUMA)
+            .map(|_| theme::TEXT_ON_LIGHT);
+        let (header, _) = ui.allocate_exact_size(vec2(viewport.x, HEADER_HEIGHT), Sense::hover());
         let mut header_ui = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(header.shrink2(vec2(20.0, 0.0)))
                 .layout(egui::Layout::left_to_right(Align::Center)),
         );
         header_ui.horizontal(|ui| {
-            back = crate::ui::controls::back_button(
+            back = crate::ui::controls::back_button_ink(
                 ui,
                 &format!("返回{}", self.center_ui.detail_parent.title()),
+                ink,
             )
             .clicked();
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
@@ -442,7 +461,8 @@ impl DeviceCenterApp {
             && !self.exit_requested
             && self.takeover_confirmation.is_none()
             && !egui::Popup::is_any_open(ui.ctx())
-            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+            && (ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra1))
+                || ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)))
         {
             back = true;
         }
@@ -485,10 +505,6 @@ impl DeviceCenterApp {
                     .map(|d| &d.value)
             })
             .cloned();
-        let texture = self
-            .center_ui
-            .wallpapers
-            .texture(ui.ctx(), &id, &device.wallpaper_url);
         let wallpaper_note = if device.wallpaper_url.is_empty() {
             "未提供桌面壁纸"
         } else if self.center_ui.wallpapers.failed(&id) {
