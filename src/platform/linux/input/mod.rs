@@ -11,7 +11,6 @@
 //! `OPENUUYC_INPUT` picks between them explicitly (`uinput`, `xtest`), and
 //! any other value is an error rather than a silent choice: a session that
 //! takes no input is easier to diagnose when the reason is on the screen.
-mod input_method;
 mod uinput;
 mod virtual_keyboard;
 mod xtest;
