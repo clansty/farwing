@@ -34,6 +34,7 @@ pub mod instance;
 pub(crate) mod maintenance;
 mod phone;
 mod power;
+mod tags;
 mod updates;
 mod view;
 
@@ -183,6 +184,11 @@ struct DeviceCenterApp {
     >,
     detail_pending: Option<String>,
     account_name: String,
+    /// 设备标签：本地一份，配了同步目录就跟着目录走。账号变了要整个换掉。
+    tags: Option<tags::Store>,
+    tag_draft: Option<view::TagDraft>,
+    /// 标签同步对话框里的目录草稿。
+    tag_sync: Option<String>,
     diagnostics: diagnostics::LocalDiagnostics,
     mutation_pending: bool,
     queued_mutation: Option<DeviceMutation>,
@@ -244,6 +250,9 @@ impl DeviceCenterApp {
             extra_details: Default::default(),
             detail_pending: None,
             account_name: String::new(),
+            tags: None,
+            tag_draft: None,
+            tag_sync: None,
             diagnostics: diagnostics::LocalDiagnostics::start(),
             mutation_pending: false,
             queued_mutation: None,
@@ -411,6 +420,19 @@ impl DeviceCenterApp {
                         || self.login_running
                     {
                         continue;
+                    }
+                    // 标签只跟本机与同步目录有关，跟账号无关；第一次拿到账号时读一次。
+                    if self.tags.is_none() {
+                        self.tag_draft = None;
+                        self.tag_sync = None;
+                        match tags::Store::open() {
+                            Ok(store) => self.tags = Some(store),
+                            Err(error) => {
+                                self.tags = None;
+                                self.status =
+                                    StatusMessage::error(format!("标签存储不可用：{error:#}"));
+                            }
+                        }
                     }
                     self.account_name = account_name;
                     match result {
@@ -935,6 +957,10 @@ impl DeviceCenterApp {
         self.mutation_pending = false;
         self.catalog = None;
         self.catalog_error = None;
+        self.tags = None;
+        self.tag_draft = None;
+        self.tag_sync = None;
+        self.center_ui.clear_tag_filters();
         self.account_name.clear();
         self.center_ui.close_details();
     }

@@ -103,6 +103,12 @@ enum EditAction {
     Remove,
 }
 
+/// 详情页标签输入框的草稿：一台设备一份，切设备就换掉。
+pub(super) struct TagDraft {
+    id: String,
+    text: String,
+}
+
 impl CenterUi {
     pub(super) fn clear_host_assist(&mut self) {
         self.host_assist_password = None;
@@ -130,6 +136,11 @@ impl CenterUi {
     }
     pub(super) fn clear_wallpapers(&mut self) {
         self.wallpapers.clear();
+    }
+    pub(super) fn clear_tag_filters(&mut self) {
+        for list in &mut self.device_lists {
+            list.clear_tags();
+        }
     }
 }
 
@@ -1537,6 +1548,8 @@ impl DeviceCenterApp {
             self.power_confirmation(ctx);
         } else if self.center_ui.edit.is_some() {
             self.device_edit_dialog(ctx);
+        } else if self.tag_sync.is_some() {
+            self.tag_sync_dialog(ctx);
         }
         if self.logout_confirmation {
             self.logout_dialog(ctx);
@@ -1676,6 +1689,105 @@ impl DeviceCenterApp {
             self.queue_mutation(change);
         } else if !cancel && !response.should_close() {
             self.center_ui.edit = Some(edit);
+        }
+    }
+
+    fn tag_sync_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut draft) = self.tag_sync.take() else {
+            return;
+        };
+        let mut save = false;
+        let mut close = false;
+        let response = egui::Modal::new(egui::Id::new("device-tag-sync"))
+            .frame(dialog_frame())
+            .show(ctx, |ui| {
+                ui.set_width(520.0);
+                close = crate::ui::controls::dialog_header(
+                    ui,
+                    "标签同步",
+                    crate::ui::controls::DialogIcon::Info,
+                    true,
+                );
+                ui.add(
+                    egui::Label::new(
+                        "把同步目录指到网盘、Syncthing 或 git 仓库里的同一个文件夹：每台机器只写自己的一份文件，\
+                         读取时按设备取最后写入的那份，不需要人工合并，也不会产生冲突副本。",
+                    )
+                    .wrap(),
+                );
+                ui.add_space(12.0);
+                ui.add_sized(
+                    [ui.available_width(), theme::CONTROL_HEIGHT],
+                    singleline_input(&mut draft).hint_text("同步目录，留空表示只存本机"),
+                );
+                ui.add_space(6.0);
+                let (writer, files, skipped, error, synced_at) = self
+                    .tags
+                    .as_ref()
+                    .map(|store| {
+                        let report = store.report();
+                        (
+                            store.writer().to_owned(),
+                            report.files,
+                            report.skipped,
+                            report.error.clone(),
+                            report.at,
+                        )
+                    })
+                    .unwrap_or_default();
+                match error {
+                    Some(error) => {
+                        ui.colored_label(AMBER, error);
+                    }
+                    None => {
+                        let ago = synced_at
+                            .and_then(|at| at.elapsed().ok())
+                            .map(|elapsed| format!("，{} 秒前", elapsed.as_secs()))
+                            .unwrap_or_default();
+                        ui.label(
+                            RichText::new(format!("已读取 {files} 个文件{ago}"))
+                                .size(theme::TINY)
+                                .color(MUTED),
+                        );
+                    }
+                }
+                if skipped > 0 {
+                    ui.colored_label(AMBER, format!("跳过了 {skipped} 个无法读取的文件"));
+                }
+                ui.label(
+                    RichText::new(format!("本机写入 {writer}.json"))
+                        .size(theme::TINY)
+                        .color(MUTED),
+                );
+                let (accept, dismiss) = crate::ui::controls::dialog_actions(
+                    ui,
+                    Some(crate::ui::controls::DialogAction::new("保存并同步").enabled(self.tags.is_some())),
+                    Some("关闭"),
+                );
+                save = accept;
+                close |= dismiss;
+            });
+        if save {
+            let path = draft.trim();
+            let dir = (!path.is_empty()).then(|| std::path::PathBuf::from(path));
+            match self.tags.as_mut().map(|store| store.set_sync_dir(dir)) {
+                Some(Ok(())) => {
+                    let failure = self
+                        .tags
+                        .as_ref()
+                        .and_then(|store| store.report().error.clone());
+                    self.status = match failure {
+                        Some(error) => StatusMessage::error(format!("标签同步失败：{error}")),
+                        None => StatusMessage::success("标签已同步"),
+                    };
+                }
+                Some(Err(error)) => {
+                    self.status = StatusMessage::error(format!("保存同步目录失败：{error:#}"))
+                }
+                None => self.status = StatusMessage::error("标签存储不可用"),
+            }
+        } else if !close && !response.should_close() {
+            self.tag_sync = Some(draft);
         }
     }
 

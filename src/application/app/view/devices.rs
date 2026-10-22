@@ -30,6 +30,22 @@ pub(super) struct ListUi {
     search: String,
     filter: Filter,
     sort: Sort,
+    /// 选中的标签，全部命中才显示；一个都没选就是不过滤。
+    tags: Vec<String>,
+}
+
+impl ListUi {
+    pub(super) fn clear_tags(&mut self) {
+        self.tags.clear();
+    }
+    fn toggle_tag(&mut self, tag: &str) {
+        match self.tags.iter().position(|existing| existing == tag) {
+            Some(index) => {
+                self.tags.remove(index);
+            }
+            None => self.tags.push(tag.to_owned()),
+        }
+    }
 }
 
 struct Entry {
@@ -55,6 +71,75 @@ impl DeviceCenterApp {
     }
     pub(super) fn management_page(&mut self, ui: &mut egui::Ui) {
         self.device_list(ui, true);
+    }
+
+    /// 设备行上的标签及数量。已选中但当前没有设备的标签也留着，否则就没法取消。
+    fn tag_counts(
+        &self,
+        rows: Option<&[Entry]>,
+        selected: &[String],
+    ) -> std::collections::BTreeMap<String, usize> {
+        let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+        let Some(store) = self.tags.as_ref() else {
+            return counts;
+        };
+        for entry in rows.into_iter().flatten() {
+            for tag in store.tags(&entry.device.device_id) {
+                *counts.entry(tag.clone()).or_default() += 1;
+            }
+        }
+        for tag in selected {
+            counts.entry(tag.clone()).or_default();
+        }
+        counts
+    }
+
+    /// 详情页那个输入框的文本。换设备时先把上一台的草稿落盘，再按存储里的值重建。
+    pub(super) fn tag_draft(&mut self, id: &str) -> &mut String {
+        if !self.tag_draft.as_ref().is_some_and(|draft| draft.id == id) {
+            self.flush_tag_draft();
+            let text = self
+                .tags
+                .as_ref()
+                .map(|store| store.tags(id).join(" "))
+                .unwrap_or_default();
+            self.tag_draft = Some(TagDraft {
+                id: id.to_owned(),
+                text,
+            });
+        }
+        &mut self
+            .tag_draft
+            .as_mut()
+            .expect("草稿刚刚建好")
+            .text
+    }
+
+    /// 把草稿写回标签存储。文字没变就不写，免得每次失焦都落一次盘。
+    pub(super) fn flush_tag_draft(&mut self) {
+        let Some(draft) = self.tag_draft.take() else {
+            return;
+        };
+        let parsed = tags::parse(&draft.text);
+        let Some(store) = self.tags.as_mut() else {
+            return;
+        };
+        if parsed.as_slice() == store.tags(&draft.id) {
+            return;
+        }
+        if let Err(error) = store.set(&draft.id, parsed) {
+            self.status = StatusMessage::error(format!("保存标签失败：{error:#}"));
+        }
+    }
+
+    pub(super) fn open_tag_sync(&mut self) {
+        let draft = self
+            .tags
+            .as_ref()
+            .and_then(|store| store.sync_dir())
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.tag_sync = Some(draft);
     }
 
     fn device_entries(&self, management: bool) -> Option<Vec<Entry>> {
@@ -140,6 +225,9 @@ impl DeviceCenterApp {
                     response
                         .on_hover_text(format!("上次状态更新于 {} 秒前", at.elapsed().as_secs()));
                 }
+                if ui.button("标签同步").clicked() {
+                    self.open_tag_sync();
+                }
                 if !management {
                     self.active_view(ui);
                 }
@@ -169,13 +257,32 @@ impl DeviceCenterApp {
                 });
         });
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
+        // 状态和标签同一行；标签多的账号这里会自然折到第二行。
+        let active_tags = self.center_ui.device_lists[index].tags.clone();
+        let tag_counts = self.tag_counts(rows.as_deref(), &active_tags);
+        let state = &mut self.center_ui.device_lists[index];
+        ui.horizontal_wrapped(|ui| {
             for (filter, label, n) in [
                 (Filter::All, "全部", count),
                 (Filter::Online, "在线", online),
                 (Filter::Offline, "离线", offline),
             ] {
                 ui.selectable_value(&mut state.filter, filter, format!("{label}  {n}"));
+            }
+            if !tag_counts.is_empty() {
+                ui.add_space(8.0);
+                for (tag, n) in &tag_counts {
+                    let picked = state.tags.contains(tag);
+                    if ui
+                        .selectable_label(picked, format!("#{tag}  {n}"))
+                        .clicked()
+                    {
+                        state.toggle_tag(tag);
+                    }
+                }
+                if !state.tags.is_empty() && ui.button("清除标签").clicked() {
+                    state.clear_tags();
+                }
             }
         });
         let query = state.search.trim().to_lowercase();
@@ -194,14 +301,21 @@ impl DeviceCenterApp {
             self.empty_state(ui, "正在读取设备清单…", None);
             return;
         };
+        // 芯片行里可能刚被点掉一个标签，取最新的一次。
+        let selected_tags = self.center_ui.device_lists[index].tags.clone();
+        let store = self.tags.as_ref();
         rows.retain(|e| {
             let d = &e.device;
+            let tags = store.map_or(&[][..], |store| store.tags(&d.device_id));
             let visible = match filter {
                 Filter::All => true,
                 Filter::Online => d.is_connected(),
                 Filter::Offline => d.status == "DISCONNECTED",
             };
             visible
+                && selected_tags
+                    .iter()
+                    .all(|wanted| tags.iter().any(|tag| tag == wanted))
                 && (query.is_empty()
                     || [
                         display_alias(d),
@@ -210,7 +324,8 @@ impl DeviceCenterApp {
                         &d.version_name,
                     ]
                     .iter()
-                    .any(|value| value.to_lowercase().contains(&query)))
+                    .any(|value| value.to_lowercase().contains(&query))
+                    || tags.iter().any(|tag| tag.to_lowercase().contains(&query)))
         });
         rows.sort_by(|a, b| {
             a.group
@@ -243,6 +358,7 @@ impl DeviceCenterApp {
                 let state = &mut self.center_ui.device_lists[index];
                 state.search.clear();
                 state.filter = Filter::All;
+                state.clear_tags();
             }
             return;
         }
@@ -268,9 +384,10 @@ impl DeviceCenterApp {
                 for entry in entries {
                     let selected =
                         self.selected_device_id.as_deref() == Some(&entry.device.device_id);
+                    let tags = store.map(|store| store.tags(&entry.device.device_id));
                     if let Some(action) = ui
                         .push_id(&entry.device.device_id, |ui| {
-                            row(ui, entry, selected, &mut self.center_ui.wallpapers)
+                            row(ui, entry, selected, tags, &mut self.center_ui.wallpapers)
                         })
                         .inner
                     {
@@ -301,6 +418,7 @@ fn row(
     ui: &mut egui::Ui,
     entry: &Entry,
     selected: bool,
+    tags: Option<&[String]>,
     wallpapers: &mut crate::application::wallpaper::Wallpapers,
 ) -> Option<Action> {
     let device = &entry.device;
@@ -370,19 +488,25 @@ fn row(
         .truncate(),
     )
     .on_hover_text(display_alias(device));
+    // 标签跟着 ID 一行显示，不额外占高度；太长的部分由 truncate 截掉。
+    let mut id_line = format!(
+        "{}{}",
+        if entry.current { "本机 · " } else { "ID  " },
+        device.device_id
+    );
+    for tag in tags.into_iter().flatten() {
+        id_line.push_str("  #");
+        id_line.push_str(tag);
+    }
     name.add(
         egui::Label::new(
-            RichText::new(format!(
-                "{}{}",
-                if entry.current { "本机 · " } else { "ID  " },
-                device.device_id
-            ))
-            .size(crate::ui::theme::TINY)
-            .color(MUTED),
+            RichText::new(id_line.clone())
+                .size(crate::ui::theme::TINY)
+                .color(MUTED),
         )
         .truncate(),
     )
-    .on_hover_text(&device.device_id);
+    .on_hover_text(id_line);
     let status_rect = egui::Rect::from_min_size(
         egui::pos2(status_x, rect.top() + if wide { 30.0 } else { 77.0 }),
         crate::ui::theme::DEVICE_STATUS_SIZE.into(),

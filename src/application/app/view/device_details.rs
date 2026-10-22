@@ -335,6 +335,8 @@ fn paint_glyph(p: &egui::Painter, r: egui::Rect, g: Glyph, color: Color32) {
 impl DeviceCenterApp {
     pub(super) fn reconcile_device_details(&mut self) {
         if self.center_ui.page != Page::DeviceDetails {
+            // 离开详情页时把还没落盘的标签输入收掉。
+            self.flush_tag_draft();
             return;
         }
         let Some(id) = self.center_ui.detail_id.clone() else {
@@ -342,6 +344,7 @@ impl DeviceCenterApp {
             return;
         };
         if self.detail_device(&id).is_none() {
+            self.flush_tag_draft();
             self.extra_details.remove(&id);
             if self.detail_pending.as_deref() == Some(&id) {
                 self.detail_pending = None;
@@ -350,7 +353,7 @@ impl DeviceCenterApp {
         }
     }
 
-    fn detail_device(&self, id: &str) -> Option<&DeviceInfo> {
+    pub(super) fn detail_device(&self, id: &str) -> Option<&DeviceInfo> {
         self.devices
             .as_ref()
             .and_then(|list| {
@@ -511,6 +514,7 @@ impl DeviceCenterApp {
         let mut connect = false;
         let mut audio_only = false;
         let mut edit = None;
+        let mut commit_tags = false;
         let mut power = None;
         let mut exit_account = false;
         self.alert(ui);
@@ -552,7 +556,9 @@ impl DeviceCenterApp {
             let row_h = 42.0;
             let table_bottom = info_y + 28.0 + row_h * 4.0;
             let divider_y = table_bottom + 24.0;
-            let footer_y = divider_y + 20.0;
+            // 标签直接就地编辑，放在「设备管理」按钮行上面，它不弹对话框。
+            let tags_y = divider_y + 20.0;
+            let footer_y = tags_y + theme::CONTROL_HEIGHT + 16.0;
             let body_h = if owned {
                 footer_y + theme::CONTROL_HEIGHT + 24.0
             } else {
@@ -635,7 +641,19 @@ impl DeviceCenterApp {
                     egui::pos2(title_x, card.top() + 88.0),
                     card.max - vec2(15.0, 5.0),
                 )));
-            let summary_text = format!("{os}   |   设备 ID: {id}   |   客户端版本: {version}");
+            let mut summary_text = format!("{os}   |   设备 ID: {id}   |   客户端版本: {version}");
+            if let Some(tags) = self.tags.as_ref().map(|store| store.tags(&id))
+                && !tags.is_empty()
+            {
+                summary_text.push_str("   |   标签: ");
+                for (index, tag) in tags.iter().enumerate() {
+                    if index > 0 {
+                        summary_text.push(' ');
+                    }
+                    summary_text.push('#');
+                    summary_text.push_str(tag);
+                }
+            }
             summary
                 .add(
                     egui::Label::new(
@@ -929,6 +947,44 @@ impl DeviceCenterApp {
                     canvas.top() + divider_y,
                     Stroke::new(1.0, LINE),
                 );
+                // 标签就地编辑：回车或失焦落盘，离开详情页时由 reconcile 兜底。
+                ui.painter().text(
+                    egui::pos2(
+                        card.left() + 8.0,
+                        canvas.top() + tags_y + theme::CONTROL_HEIGHT / 2.0,
+                    ),
+                    egui::Align2::LEFT_CENTER,
+                    "标签",
+                    FontId::proportional(crate::ui::theme::SECTION),
+                    TEXT,
+                );
+                let mut tag_row = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(egui::Rect::from_min_size(
+                            at(pad + 108.0, tags_y),
+                            vec2(card.width() - 116.0, theme::CONTROL_HEIGHT),
+                        ))
+                        .layout(egui::Layout::left_to_right(Align::Center)),
+                );
+                let field_width = (card.width() * 0.4).clamp(200.0, 420.0);
+                let enabled = self.tags.is_some();
+                let draft = self.tag_draft(&id);
+                let response = tag_row
+                    .add_enabled_ui(enabled, |ui| {
+                        ui.add_sized(
+                            [field_width, theme::CONTROL_HEIGHT],
+                            singleline_input(draft).hint_text("用空格或逗号分隔，例如：家里 主力机"),
+                        )
+                    })
+                    .inner;
+                tag_row.label(
+                    RichText::new("回车或点到别处即保存；不上传账号，只在本机与同步目录之间交换")
+                        .size(crate::ui::theme::TINY)
+                        .color(MUTED),
+                );
+                let entered = response.has_focus()
+                    && tag_row.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+                commit_tags = response.lost_focus() || entered;
                 ui.painter().text(
                     egui::pos2(
                         card.left() + 8.0,
@@ -1045,6 +1101,9 @@ impl DeviceCenterApp {
         if connect || audio_only {
             self.selected_device_id = Some(id);
             self.start_viewer_mode(audio_only);
+        }
+        if commit_tags {
+            self.flush_tag_draft();
         }
         if let Some(action) = edit {
             self.center_ui.edit = Some(DeviceEdit {
