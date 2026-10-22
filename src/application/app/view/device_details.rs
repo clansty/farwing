@@ -897,7 +897,7 @@ impl DeviceCenterApp {
                         .color(MUTED),
                 )
                 .on_hover_text(
-                    "这台设备能否远程控制本机；跟随全局即按被控设置里的「允许被控」，那个开关关着时都不生效",
+                    "这台设备能否远程控制本机；跟随全局即按被控设置里的「允许被控」，设为允许则在那个开关关掉时也放行",
                 );
                 row.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                     egui::ComboBox::from_id_salt(("device-policy", &id))

@@ -20,16 +20,32 @@ impl DevicePolicy {
             Self::Deny => "禁止",
         }
     }
+    fn admits(self, default_allowed: bool) -> bool {
+        match self {
+            Self::Follow => default_allowed,
+            Self::Allow => true,
+            Self::Deny => false,
+        }
+    }
 }
 
 /// 主控设备 ID → 策略。只存偏离「跟随全局」的选择，所以缺省即 Follow。
 pub(crate) type DevicePolicies = BTreeMap<String, DevicePolicy>;
 
-/// `enabled` 是「允许被控」总开关，它是硬开关：关着时这张表完全不参与判定。
-/// 开着时只有「禁止」会挡下一台设备，「允许」与「跟随全局」等价——留着它是
-/// 为了把「这台设备可以」写死，将来默认值收紧时不必再回来改。
-pub(crate) fn admits(policies: &DevicePolicies, controller: &str, enabled: bool) -> bool {
-    enabled && !matches!(policies.get(controller), Some(DevicePolicy::Deny))
+/// `default_allowed` 是「允许被控」总开关，它只是一个默认值：关掉之后
+/// 新设备一律被拒，但被单独设为「允许」的设备仍然连得进来。
+pub(crate) fn admits(policies: &DevicePolicies, controller: &str, default_allowed: bool) -> bool {
+    policies
+        .get(controller)
+        .copied()
+        .unwrap_or_default()
+        .admits(default_allowed)
+}
+
+/// 有没有设备被单独放行。总开关关着时，本机靠它决定还要不要保持在线可被控，
+/// 否则那些设备在主控那边只会看到「未开放连接」。
+pub(crate) fn any_allowed(policies: &DevicePolicies) -> bool {
+    policies.values().any(|p| *p == DevicePolicy::Allow)
 }
 
 /// 只留下非 Follow 的条目，避免这份表跟着设备列表一起长胖。
@@ -46,16 +62,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_switch_gates_every_device() {
+    fn follow_takes_the_switch() {
+        let policies = DevicePolicies::new();
+        assert!(admits(&policies, "a", true));
+        assert!(!admits(&policies, "a", false));
+    }
+
+    #[test]
+    fn per_device_choice_wins_over_the_switch() {
         let mut policies = DevicePolicies::new();
         insert(&mut policies, "a", DevicePolicy::Allow);
         insert(&mut policies, "b", DevicePolicy::Deny);
-        assert!(admits(&policies, "a", true));
-        assert!(admits(&policies, "c", true));
+        // 总开关关着时，被单独放行的设备仍然连得进来，其余的一律不行。
+        assert!(admits(&policies, "a", false));
         assert!(!admits(&policies, "b", true));
-        // 总开关关着时，连显式放行的设备也一起挡住。
-        assert!(!admits(&policies, "a", false));
+        assert!(admits(&policies, "c", true));
         assert!(!admits(&policies, "c", false));
+    }
+
+    #[test]
+    fn an_allowed_device_keeps_the_machine_online() {
+        let mut policies = DevicePolicies::new();
+        assert!(!any_allowed(&policies));
+        insert(&mut policies, "a", DevicePolicy::Deny);
+        assert!(!any_allowed(&policies));
+        insert(&mut policies, "b", DevicePolicy::Allow);
+        assert!(any_allowed(&policies));
+        insert(&mut policies, "b", DevicePolicy::Follow);
+        assert!(!any_allowed(&policies));
     }
 
     #[test]

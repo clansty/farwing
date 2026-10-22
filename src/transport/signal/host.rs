@@ -155,12 +155,12 @@ impl Session {
                 self.end_control(signal).await;
                 if let Some(request) = request {
                     let lease = self.client.host.lease(&request);
-                    if !lease.requested() {
+                    if !lease.permitted() {
                         return Ok(());
                     }
                     lease.update(false, false, "正在启用被控…");
                     match self.client.set_controllable(true).await {
-                        Ok(()) if lease.requested() && self.client.is_active() => {
+                        Ok(()) if lease.permitted() && self.client.is_active() => {
                             lease.update(true, false, "等待连接");
                             self.authorization = Some(lease);
                             tracing::info!(
@@ -316,7 +316,7 @@ impl Session {
         match event {
             "be-controlled" => {
                 let authorization = self.authorization.clone().context("本机被控尚未就绪")?;
-                anyhow::ensure!(authorization.requested(), "本次被控许可已失效");
+                anyhow::ensure!(authorization.permitted(), "本次被控许可已失效");
                 tracing::info!("host received authenticated be-controlled event");
                 let encoding_settings = self.client.host.encoding_settings();
                 let value = args.first().context("缺少被控会话参数")?;
@@ -424,16 +424,21 @@ impl Session {
                     authorization.for_assistance()?
                 } else {
                     // 同账号远程控制先过一遍按设备的许可，协助走自己的授权码。
-                    if let Err(error) = authorization.admit(&options.device_id) {
-                        // 不说一声的话，对端只会一路等到自己超时。
-                        tracing::info!(%error, "host incoming connection refused by device policy");
-                        Self::notify_termination(signal).await;
-                        if let Some(peer) = self.peer.take() {
-                            peer.close().await;
+                    match authorization.admit(&options.device_id) {
+                        Ok(admitted) => admitted,
+                        Err(error) => {
+                            // 不说一声的话，对端只会一路等到自己超时。
+                            tracing::info!(
+                                %error,
+                                "host incoming connection refused by device policy"
+                            );
+                            Self::notify_termination(signal).await;
+                            if let Some(peer) = self.peer.take() {
+                                peer.close().await;
+                            }
+                            return Ok(());
                         }
-                        return Ok(());
                     }
-                    authorization
                 };
                 anyhow::ensure!(
                     !file_only || authorization.file_access(),
@@ -715,7 +720,7 @@ impl Session {
             && self
                 .authorization
                 .as_ref()
-                .is_some_and(|lease| lease.requested())
+                .is_some_and(|lease| lease.permitted())
         {
             // A physical socket loss drops its queued messages. Publish the
             // current idempotent snapshot again; never replay old RPC actions.

@@ -93,7 +93,8 @@ impl DeviceCenterApp {
         }
         let host = self.host.as_ref().unwrap();
         let status = host.status().wol_setup;
-        let allowed = host.allowed();
+        // 总开关或单台设备的放行都算「本机在线可被控」。
+        let allowed = host.requested();
         let state = &mut self.center_ui.wol_setup;
         if let Some(rx) = &state.pending {
             match rx.try_recv() {
@@ -169,7 +170,7 @@ impl DeviceCenterApp {
                 #[cfg(not(windows))]
                 ui.colored_label(AMBER,"开启时会启用登录自启动（接入 systemd 图形会话的桌面用 systemd 用户服务，其余桌面写入 XDG 自启动条目），登录桌面后才能自动上线。被控要有图形会话，Linux 无法在登录前被控。");
                 ui.add_enabled_ui(!busy,|ui|{ui.checkbox(&mut state.confirmed,"我已了解上述条件，允许本设备被远程开机");});
-                if !allowed{ui.colored_label(AMBER,"请先在连接设置中开启“允许被控”。");}
+                if !allowed{ui.colored_label(AMBER,"请先在连接设置中允许被控。");}
             });
             ui.add_space(10.);
             if busy{ui.horizontal(|ui|{ui.spinner();ui.label("正在处理，请稍候…");});ctx.request_repaint_after(std::time::Duration::from_millis(100));}

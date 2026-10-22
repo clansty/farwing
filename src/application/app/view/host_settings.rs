@@ -311,12 +311,22 @@ impl DeviceCenterApp {
             }
         });
         ui.data_mut(|data| data.insert_temp(id, open));
-        // 总开关才是硬开关；关着的话这里选什么都不会生效。
+        // 总开关关着时这里就是白名单：只有被放行的设备能连，本机因此保持在线。
         if !host.allowed() {
+            let allowed = policies
+                .values()
+                .filter(|p| **p == DevicePolicy::Allow)
+                .count();
             ui.label(
-                RichText::new("「允许被控」关着，下面的选择在开关打开之前不会生效")
-                    .small()
-                    .color(MUTED),
+                RichText::new(if allowed > 0 {
+                    format!(
+                        "「允许被控」已关闭：只有这 {allowed} 台设备能连本机，本机保持在线可被控"
+                    )
+                } else {
+                    "「允许被控」已关闭：本机不上线，任何设备都连不进来".into()
+                })
+                .small()
+                .color(MUTED),
             );
         }
         if !open {
@@ -358,7 +368,7 @@ impl DeviceCenterApp {
         form_row(
             ui,
             "允许被控",
-            "开启后同账号设备默认都能控制本机，可在下方按设备单独放行或禁止",
+            "新设备默认是否可以控制本机；关掉后只有下方单独设为「允许」的设备能连",
             |ui| {
                 if ui
                     .add_enabled_ui(host.is_some(), |ui| {

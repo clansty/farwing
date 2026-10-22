@@ -186,8 +186,8 @@ async fn run(client: HostClient, mut requests: mpsc::Receiver<Queued>, stop: Can
                 status = Status {
                     message: if !client.host.wol_allowed() && !client.host.wol_setup.enabled() {
                         "远程开机与唤醒协助均未开启"
-                    } else if !client.host.allowed() {
-                        "需先开启允许被控"
+                    } else if !client.host.requested() {
+                        "需先允许被控"
                     } else {
                         "等待账号上线"
                     }

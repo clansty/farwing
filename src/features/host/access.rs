@@ -158,6 +158,12 @@ struct Ownership {
     status: Status,
 }
 
+/// 本机要不要对服务端保持「可被控」。总开关关掉之后，被单独放行的设备
+/// 仍然要靠这条线上线才能连进来，否则主控那边只会看到「未开放连接」。
+fn want_online(state: &Ownership) -> bool {
+    state.active && (state.allowed || super::policy::any_allowed(&state.policies))
+}
+
 #[derive(Clone)]
 pub(crate) struct Handle {
     pub(crate) wol: super::wol::Handle,
@@ -448,9 +454,10 @@ impl Handle {
                 policies,
             )) => {
                 let _ = handle.assistance.configure(assistance);
+                // 策略先落地，`set_allowed` 才能算出正确的上线状态。
+                lock(&handle.ownership).policies = policies;
                 handle.set_allowed(allowed);
                 let mut state = lock(&handle.ownership);
-                state.policies = policies;
                 state.encoding = encoding;
                 // An unavailable encoder choice must remain editable without
                 // discarding unrelated saved permissions and device settings.
@@ -468,6 +475,15 @@ impl Handle {
                 state.wol = wol;
                 state.dirty = false;
                 state.status.saving = false;
+                drop(state);
+                // `set_allowed` 在取值未变时不发通道，但白名单能让本机直接上线，
+                // 所以加载完再对齐一次房间状态。
+                let wanted = lock(&handle.ownership);
+                let request = want_online(&wanted).then_some(AccessRequest {
+                    generation: wanted.permission,
+                });
+                drop(wanted);
+                handle.desired.send_replace(request);
             }
             Err(error) => lock(&handle.ownership).status.settings_error = Some(error.to_string()),
         }
@@ -521,11 +537,12 @@ impl Handle {
     }
     pub(crate) fn wol_permitted(&self) -> bool {
         let s = lock(&self.ownership);
-        !self.guest && s.active && s.allowed && s.wol
+        // 只要本机还挂在线上就成立，总开关或单台设备的放行都算。
+        !self.guest && want_online(&s) && s.wol
     }
     pub(crate) fn wol_registration_permitted(&self) -> bool {
         let s = lock(&self.ownership);
-        !self.guest && s.active && s.allowed && (s.wol || self.wol_setup.enabled())
+        !self.guest && want_online(&s) && (s.wol || self.wol_setup.enabled())
     }
     pub(crate) fn set_wol_allowed(&self, allowed: bool) -> anyhow::Result<()> {
         let mut s = lock(&self.ownership);
@@ -554,7 +571,7 @@ impl Handle {
     }
     pub(crate) fn power_permitted(&self) -> bool {
         let state = lock(&self.ownership);
-        !self.guest && state.active && state.allowed && state.remote_power && !state.updating
+        !self.guest && want_online(&state) && state.remote_power && !state.updating
     }
     pub(crate) fn set_power_allowed(&self, allowed: bool) -> anyhow::Result<()> {
         let mut state = lock(&self.ownership);
@@ -577,7 +594,7 @@ impl Handle {
     pub(crate) fn begin_power(&self) -> anyhow::Result<()> {
         let mut state = lock(&self.ownership);
         anyhow::ensure!(
-            !self.guest && state.active && state.allowed && state.remote_power && !state.updating,
+            !self.guest && want_online(&state) && state.remote_power && !state.updating,
             "远程电源许可已撤销"
         );
         state.power_executing = true;
@@ -846,7 +863,8 @@ impl Handle {
             "已禁止被控"
         }
         .into();
-        self.desired.send_replace(allowed.then_some(AccessRequest {
+        let online = want_online(&state);
+        self.desired.send_replace(online.then_some(AccessRequest {
             generation: state.permission,
         }));
     }
@@ -868,12 +886,13 @@ impl Handle {
         policies: super::policy::DevicePolicies,
     ) -> anyhow::Result<()> {
         // 已经连着的那台设备被改成禁止时，改完就该断开，而不是等它下一次接入。
-        let revoke = {
+        let (revoke, was_online) = {
             let mut state = lock(&self.ownership);
             anyhow::ensure!(state.active, "账号会话已结束");
             if state.policies == policies {
                 return Ok(());
             }
+            let was_online = want_online(&state);
             state.policies = policies;
             state.settings_revision = state.settings_revision.wrapping_add(1);
             state.dirty = true;
@@ -885,12 +904,28 @@ impl Handle {
                 .as_ref()
                 .map(|c| c.device_id.clone())
                 .filter(|id| !id.is_empty());
-            controller.is_some_and(|id| !super::policy::admits(&state.policies, &id, state.allowed))
+            (
+                controller
+                    .is_some_and(|id| !super::policy::admits(&state.policies, &id, state.allowed)),
+                was_online,
+            )
         };
         // 装成服务时由常驻端自己按新策略断开；这台观察端再发一次，那边会撞上
         // 「该连接已结束或已更换」。
         if revoke && !crate::platform::host_service::resident::managed() {
             self.disconnect();
+        }
+        // 总开关关着时，白名单从无到有会把本机重新挂上线，反过来则要下线。
+        // 只有真变了才发通道：发一次就会重开被控房间，没必要踢掉现有会话。
+        let state = lock(&self.ownership);
+        let online = want_online(&state);
+        let changed = online != was_online;
+        let request = (changed && online).then_some(AccessRequest {
+            generation: state.permission,
+        });
+        drop(state);
+        if changed {
+            self.desired.send_replace(request);
         }
         Ok(())
     }
@@ -1010,7 +1045,7 @@ impl Handle {
             return;
         }
         let mut state = lock(&self.ownership);
-        if !state.active || !state.allowed {
+        if !want_online(&state) {
             return;
         }
         state.permission = state.permission.wrapping_add(1);
@@ -1052,10 +1087,10 @@ impl Handle {
         finish_session(&mut state);
         state.status.ready = false;
         state.status.message = "本机离线".into();
-        self.desired
-            .send_replace((state.active && state.allowed).then_some(AccessRequest {
-                generation: state.permission,
-            }));
+        let online = want_online(&state);
+        self.desired.send_replace(online.then_some(AccessRequest {
+            generation: state.permission,
+        }));
     }
     pub(crate) fn disconnect(&self) {
         let session = lock(&self.ownership)
@@ -1078,7 +1113,7 @@ impl Handle {
     }
     pub(crate) fn requested(&self) -> bool {
         let state = lock(&self.ownership);
-        state.active && state.allowed && !state.power_executing
+        want_online(&state) && !state.power_executing
     }
     pub(crate) fn subscribe(&self) -> watch::Receiver<Option<AccessRequest>> {
         self.desired.subscribe()
@@ -1109,6 +1144,7 @@ impl Handle {
         Lease {
             handle: self.clone(),
             permission: request.generation,
+            admitted: false,
             media: None,
             track: 0,
             stream_generation: None,
@@ -1127,6 +1163,8 @@ impl Handle {
 pub(crate) struct Lease {
     handle: Handle,
     permission: u64,
+    /// 这条许可已经按设备策略判定过：总开关关着也照常放行。
+    admitted: bool,
     media: Option<u64>,
     track: usize,
     stream_generation: Option<u64>,
@@ -1256,7 +1294,7 @@ impl Lease {
     }
     fn current_owner(&self, state: &Ownership) -> bool {
         state.active
-            && state.allowed
+            && (state.allowed || self.admitted)
             && self.permission == state.permission
             && self.media.is_none_or(|m| m == state.media)
             && self
@@ -1269,21 +1307,24 @@ impl Lease {
             update(&mut state);
         }
     }
-    /// 按主控设备 ID 判一次许可。总开关关着就一律不接，开着才看这张表。
-    pub(crate) fn admit(&self, controller: &str) -> anyhow::Result<()> {
+    /// 按主控设备 ID 判一次许可。判定通过后这条 lease 不再随总开关失效，
+    /// 「总开关关掉、只放行某几台」才算数。
+    pub(crate) fn admit(&self, controller: &str) -> anyhow::Result<Self> {
         // 标识由主控自报，必须先按 `controller()` 同样的口径校验：一个空串或
         // 随便编的 ID 查不到条目就会落到「跟随全局」，把禁止绕过去。
         anyhow::ensure!(
             crate::account::api::validate_device_id(controller).is_ok(),
             "主控设备标识无效"
         );
+        let mut lease = self.clone();
         let state = lock(&self.handle.ownership);
-        anyhow::ensure!(state.active && state.allowed, "本次被控许可已失效");
+        anyhow::ensure!(state.active, "本次被控许可已失效");
         anyhow::ensure!(
             super::policy::admits(&state.policies, controller, state.allowed),
             "本机已禁止这台设备控制"
         );
-        Ok(())
+        lease.admitted = true;
+        Ok(lease)
     }
     pub(crate) fn peer_lease(&self) -> anyhow::Result<SessionLease> {
         let mut state = lock(&self.handle.ownership);
@@ -1302,6 +1343,7 @@ impl Lease {
         Ok(SessionLease(Self {
             handle: self.handle.clone(),
             permission: self.permission,
+            admitted: self.admitted,
             media: Some(state.media),
             track: 0,
             stream_generation: None,
@@ -1344,6 +1386,11 @@ impl Lease {
     }
     pub(crate) fn requested(&self) -> bool {
         self.current(&lock(&self.handle.ownership))
+    }
+    /// 许可代数是否还有效。不看总开关——按设备的判定还没做过。
+    pub(crate) fn permitted(&self) -> bool {
+        let state = lock(&self.handle.ownership);
+        state.active && self.permission == state.permission
     }
     pub(crate) fn updating(&self) -> bool {
         lock(&self.handle.ownership).updating
