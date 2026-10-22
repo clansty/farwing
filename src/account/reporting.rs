@@ -1,5 +1,6 @@
 //! A diagnostic view of this process's device publisher, mirrored by the resident.
 use crate::platform::device_profile::Hardware;
+use crate::platform::host_service::resident;
 use serde::{Deserialize, Serialize};
 use std::sync::{LazyLock, Mutex};
 
@@ -31,4 +32,15 @@ pub(crate) fn update(action: impl FnOnce(&mut Snapshot)) {
 }
 pub(crate) fn replace(value: Snapshot) {
     *STATE.lock().unwrap_or_else(|e| e.into_inner()) = value;
+}
+
+/// 让上报任务立刻重读本机资料与壁纸。常驻服务持有账号时只有它能上报，
+/// 就由它代劳；这个调用会阻塞，别放在界面线程里。
+pub(crate) fn refresh() -> anyhow::Result<()> {
+    if resident::managed() {
+        resident::call(resident::Request::RefreshPublication)?;
+    } else {
+        REFRESH.notify_one();
+    }
+    Ok(())
 }

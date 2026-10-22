@@ -743,7 +743,7 @@ fn cosmic_source(text: &str) -> Option<PathBuf> {
     Some(PathBuf::from(&rest[..end]))
 }
 
-pub(crate) fn wallpaper_image(source: &WallpaperSource) -> Result<Vec<u8>> {
+pub(crate) fn wallpaper_image(source: &WallpaperSource, logo: bool) -> Result<Vec<u8>> {
     let maximum = crate::platform::wallpaper::MAXIMUM_FILE;
     let mut bytes = Vec::new();
     std::fs::File::open(&source.path)?
@@ -751,7 +751,7 @@ pub(crate) fn wallpaper_image(source: &WallpaperSource) -> Result<Vec<u8>> {
         .read_to_end(&mut bytes)?;
     ensure!(bytes.len() as u64 <= maximum, "壁纸文件过大");
     // A GNOME slideshow is an XML file, not a picture.
-    let jpeg = crate::platform::wallpaper::card(bytes).context("壁纸不是静态图片")?;
+    let jpeg = crate::platform::wallpaper::card(bytes, logo).context("壁纸不是静态图片")?;
     ensure!(wallpaper_source()? == *source, "壁纸在读取期间已改变");
     Ok(jpeg)
 }
@@ -918,7 +918,7 @@ mod tests {
         );
         let source = wallpaper_source().unwrap();
         println!("wallpaper {}", source.path.display());
-        let card = wallpaper_image(&source).unwrap();
+        let card = wallpaper_image(&source, true).unwrap();
         println!("card {} bytes", card.len());
     }
 

@@ -118,8 +118,16 @@ impl AuthenticatedClient {
                     if source.is_ok() {
                         source_error = None;
                     }
+                    // 名片设置和壁纸源一起构成卡片的身份：开关一动，同一张壁纸
+                    // 也得重新渲染重传。
+                    let card = crate::account::device_card::Settings::load().unwrap_or_default();
                     match source {
-                        Ok(source) if explicit || source_seen.as_ref() != Some(&source) => {
+                        Ok(source)
+                            if explicit
+                                || source_seen.as_ref().is_none_or(|(seen, logo)| {
+                                    *seen != source || *logo != card.logo
+                                }) =>
+                        {
                             tracing::info!(
                                 cached = source.cached(),
                                 "device wallpaper source resolved"
@@ -130,7 +138,7 @@ impl AuthenticatedClient {
                                     s.wallpaper_file = source.path.display().to_string()
                                 });
                                 let image = tokio::task::spawn_blocking(move || {
-                                    device_profile::wallpaper_image(&capture)
+                                    device_profile::wallpaper_image(&capture, card.logo)
                                 })
                                 .await??;
                                 let hash = digest(&image);
@@ -160,7 +168,7 @@ impl AuthenticatedClient {
                                 anyhow::Ok(())
                             }
                             .await;
-                            source_seen = Some(source);
+                            source_seen = Some((source, card.logo));
                             if let Err(error) = result {
                                 reporting::update(|s| {
                                     s.wallpaper = format!("上报未确认：{error:#}")

@@ -469,7 +469,7 @@ fn transcoded_source(bytes: &[u8]) -> Option<PathBuf> {
     (!text.is_empty()).then(|| PathBuf::from(text))
 }
 
-pub(crate) fn wallpaper_image(source: &WallpaperSource) -> Result<Vec<u8>> {
+pub(crate) fn wallpaper_image(source: &WallpaperSource, logo: bool) -> Result<Vec<u8>> {
     let user = WallpaperUser::enter()?;
     let maximum = crate::platform::wallpaper::MAXIMUM_FILE;
     let mut bytes = Vec::new();
@@ -477,7 +477,7 @@ pub(crate) fn wallpaper_image(source: &WallpaperSource) -> Result<Vec<u8>> {
         .take(maximum + 1)
         .read_to_end(&mut bytes)?;
     ensure!(bytes.len() as u64 <= maximum, "壁纸文件过大");
-    let jpeg = crate::platform::wallpaper::card(bytes)?;
+    let jpeg = crate::platform::wallpaper::card(bytes, logo)?;
     ensure!(
         wallpaper_source_inner(&user)? == *source,
         "壁纸在读取期间已改变"

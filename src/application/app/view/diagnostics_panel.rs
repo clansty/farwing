@@ -353,13 +353,7 @@ impl DeviceCenterApp {
                 state.publication_error = None;
                 let context = ui.ctx().clone();
                 std::thread::spawn(move || {
-                    use crate::platform::host_service::resident;
-                    let result = if resident::managed() {
-                        resident::call(resident::Request::RefreshPublication).map(|_| ())
-                    } else {
-                        reporting::REFRESH.notify_one();
-                        Ok(())
-                    };
+                    let result = reporting::refresh();
                     let _ = tx.send(result.map_err(|e| format!("{e:#}")));
                     context.request_repaint();
                 });

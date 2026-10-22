@@ -11,6 +11,7 @@ mod assist_components;
 // Installing the service and drivers is part of the Windows setup.
 #[cfg(windows)]
 mod components;
+mod device_card;
 mod device_details;
 mod device_visuals;
 mod devices;
@@ -81,6 +82,7 @@ pub(super) struct CenterUi {
     logs: logs::LogUi,
     diagnostics: diagnostics_panel::ViewState,
     wol_setup: wol_setup::ViewState,
+    device_card: device_card::ViewState,
     startup: startup::ViewState,
     host_assist_password: Option<host_assist::PasswordEditor>,
     host_assist_settings_open: bool,
@@ -1357,6 +1359,7 @@ impl DeviceCenterApp {
         crate::ui::controls::page_scroll("center-settings-scroll").show(ui, |ui| {
             self.startup_settings(ui);
             self.host_settings(ui);
+            self.device_card_settings(ui);
             self.notification_settings(ui);
             section(ui, "本机作为主控");
             form_row(ui, "串流帧率", "以远端实际刷新率为准", |ui| {
