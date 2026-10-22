@@ -255,6 +255,102 @@ impl DeviceCenterApp {
             ui.label(RichText::new(message).small().color(MUTED));
         }
     }
+    /// 同账号设备的单独许可：总开关是默认值，这里只记住偏离它的选择。
+    fn host_device_policies(&mut self, ui: &mut egui::Ui, host: &crate::features::host::Handle) {
+        use crate::features::host::policy::DevicePolicy;
+        let Some(devices) = self.devices.as_ref() else {
+            return;
+        };
+        let policies = host.device_policies();
+        let own = devices.current_device.device_id.clone();
+        // 能当主控的不止「我的设备」：账号里的手机、平板、电视都会来连本机，
+        // 设备详情页给出的也是同一份全集，这里不能只列一半。
+        let mut seen = std::collections::BTreeSet::new();
+        let mut candidates: Vec<(String, String)> = Vec::new();
+        {
+            let mut push = |device: &DeviceInfo| {
+                if device.device_id != own && seen.insert(device.device_id.clone()) {
+                    candidates.push((device.device_id.clone(), display_alias(device).to_owned()));
+                }
+            };
+            for (_, device) in all_devices(devices) {
+                push(device);
+            }
+            if let Some(catalog) = self.catalog.as_ref() {
+                for (_, device) in catalog.groups.entries() {
+                    push(device);
+                }
+            }
+        }
+        // 表里可能还留着已经不在账号里的设备，至少让它看得见、取消得掉。
+        for device in policies.keys() {
+            if seen.insert(device.clone()) {
+                candidates.push((device.clone(), format!("已移除的设备 {device}")));
+            }
+        }
+        if candidates.is_empty() {
+            return;
+        }
+        let summary = if policies.is_empty() {
+            "全部跟随上面的开关".to_owned()
+        } else {
+            format!("{} 台单独设置", policies.len())
+        };
+        let id = egui::Id::new(("host-device-policies", self.login_generation));
+        let mut open = ui.data(|data| data.get_temp::<bool>(id).unwrap_or(false));
+        form_row(ui, "设备权限", &summary, |ui| {
+            if ui
+                .add(crate::ui::controls::secondary(if open {
+                    "收起"
+                } else {
+                    "展开"
+                }))
+                .clicked()
+            {
+                open = !open;
+            }
+        });
+        ui.data_mut(|data| data.insert_temp(id, open));
+        // 总开关才是硬开关；关着的话这里选什么都不会生效。
+        if !host.allowed() {
+            ui.label(
+                RichText::new("「允许被控」关着，下面的选择在开关打开之前不会生效")
+                    .small()
+                    .color(MUTED),
+            );
+        }
+        if !open {
+            return;
+        }
+        crate::ui::controls::section_frame()
+            .inner_margin(theme::DIALOG_MARGIN)
+            .show(ui, |ui| {
+                for (device, alias) in candidates {
+                    let current = policies.get(&device).copied().unwrap_or_default();
+                    let mut selected = current;
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Label::new(alias).truncate())
+                            .on_hover_text(&device);
+                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                            egui::ComboBox::from_id_salt(("host-device-policy", &device))
+                                .width(160.0)
+                                .selected_text(selected.label())
+                                .show_ui(ui, |ui| {
+                                    for item in DevicePolicy::ALL {
+                                        ui.selectable_value(&mut selected, item, item.label());
+                                    }
+                                });
+                        });
+                    });
+                    if selected != current {
+                        match host.set_device_policy(&device, selected) {
+                            Ok(()) => self.save_host_settings(),
+                            Err(error) => self.status = StatusMessage::error(error.to_string()),
+                        }
+                    }
+                }
+            });
+    }
     fn host_settings_controls(&mut self, ui: &mut egui::Ui) {
         section(ui, "被控设置");
         let host = self.host.clone();
@@ -262,7 +358,7 @@ impl DeviceCenterApp {
         form_row(
             ui,
             "允许被控",
-            "允许授权设备连接本机，远程协助需单独开启",
+            "开启后同账号设备默认都能控制本机，可在下方按设备单独放行或禁止",
             |ui| {
                 if ui
                     .add_enabled_ui(host.is_some(), |ui| {
@@ -278,6 +374,7 @@ impl DeviceCenterApp {
             },
         );
         if let Some(host) = host.as_ref() {
+            self.host_device_policies(ui, host);
             if host.request_audio_devices()
                 && self
                     .worker

@@ -38,6 +38,9 @@ struct Record {
     remote_power: bool,
     #[serde(default)]
     wol: bool,
+    /// 同账号设备的单独许可，覆盖 `allow_control` 这个默认值。
+    #[serde(default)]
+    device_policies: super::policy::DevicePolicies,
 }
 fn file_transfer_default() -> bool {
     true
@@ -81,6 +84,7 @@ impl Store {
         bool,
         bool,
         bool,
+        super::policy::DevicePolicies,
     )> {
         let bytes = match self.0.get_secret() {
             Ok(bytes) => bytes,
@@ -99,6 +103,7 @@ impl Store {
                     false,
                     false,
                     false,
+                    Default::default(),
                 ));
             }
             Err(_) => bail!("无法读取被控设置"),
@@ -125,6 +130,7 @@ impl Store {
             record.remote_power,
             record.wol,
             record.terminal_local,
+            record.device_policies,
         ))
     }
     pub fn save(
@@ -142,6 +148,7 @@ impl Store {
         remote_power: bool,
         wol: bool,
         terminal_local: bool,
+        device_policies: super::policy::DevicePolicies,
     ) -> Result<()> {
         encoding.validate()?;
         audio_quality.validate()?;
@@ -165,6 +172,7 @@ impl Store {
                 remote_power,
                 wol,
                 terminal_local,
+                device_policies,
             })?)
             .map_err(|_| anyhow::anyhow!("无法保存被控设置"))
     }

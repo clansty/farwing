@@ -147,6 +147,7 @@ struct Ownership {
     media: u64,
     stream_generations: std::collections::BTreeMap<usize, u64>,
     allowed: bool,
+    policies: super::policy::DevicePolicies,
     active: bool,
     dirty: bool,
     last_controlled: Option<std::time::Instant>,
@@ -203,6 +204,7 @@ impl Default for Handle {
                 media: 0,
                 stream_generations: Default::default(),
                 allowed: false,
+                policies: Default::default(),
                 active: true,
                 dirty: false,
                 last_controlled: None,
@@ -342,6 +344,7 @@ impl Handle {
             return;
         }
         state.allowed = snapshot.allowed;
+        state.policies = snapshot.device_policies;
         state.encoding = snapshot.encoding;
         state.audio_device.send_replace(snapshot.audio_device);
         state.audio_defaults = snapshot.audio_defaults;
@@ -442,10 +445,12 @@ impl Handle {
                 remote_power,
                 wol,
                 terminal_local,
+                policies,
             )) => {
                 let _ = handle.assistance.configure(assistance);
                 handle.set_allowed(allowed);
                 let mut state = lock(&handle.ownership);
+                state.policies = policies;
                 state.encoding = encoding;
                 // An unavailable encoder choice must remain editable without
                 // discarding unrelated saved permissions and device settings.
@@ -845,6 +850,50 @@ impl Handle {
             generation: state.permission,
         }));
     }
+    /// 同账号设备的单独许可。总开关是默认值，这里存的是偏离它的部分。
+    pub(crate) fn device_policies(&self) -> super::policy::DevicePolicies {
+        lock(&self.ownership).policies.clone()
+    }
+    pub(crate) fn set_device_policy(
+        &self,
+        device: &str,
+        policy: super::policy::DevicePolicy,
+    ) -> anyhow::Result<()> {
+        let mut policies = self.device_policies();
+        super::policy::insert(&mut policies, device, policy);
+        self.set_device_policies(policies)
+    }
+    pub(crate) fn set_device_policies(
+        &self,
+        policies: super::policy::DevicePolicies,
+    ) -> anyhow::Result<()> {
+        // 已经连着的那台设备被改成禁止时，改完就该断开，而不是等它下一次接入。
+        let revoke = {
+            let mut state = lock(&self.ownership);
+            anyhow::ensure!(state.active, "账号会话已结束");
+            if state.policies == policies {
+                return Ok(());
+            }
+            state.policies = policies;
+            state.settings_revision = state.settings_revision.wrapping_add(1);
+            state.dirty = true;
+            state.status.saving = true;
+            state.status.settings_error = None;
+            let controller = state
+                .status
+                .connection
+                .as_ref()
+                .map(|c| c.device_id.clone())
+                .filter(|id| !id.is_empty());
+            controller.is_some_and(|id| !super::policy::admits(&state.policies, &id, state.allowed))
+        };
+        // 装成服务时由常驻端自己按新策略断开；这台观察端再发一次，那边会撞上
+        // 「该连接已结束或已更换」。
+        if revoke && !crate::platform::host_service::resident::managed() {
+            self.disconnect();
+        }
+        Ok(())
+    }
     pub(crate) fn set_assistance(&self, settings: super::assist::Settings) -> anyhow::Result<()> {
         let mut state = lock(&self.ownership);
         anyhow::ensure!(state.active, "账号会话已结束");
@@ -874,6 +923,7 @@ impl Handle {
                 terminal_local,
                 remote_power,
                 wol,
+                device_policies,
             ) = {
                 let state = lock(&self.ownership);
                 if !state.dirty {
@@ -894,6 +944,7 @@ impl Handle {
                     state.terminal_local,
                     state.remote_power,
                     state.wol,
+                    state.policies.clone(),
                 )
             };
             let result = if crate::platform::host_service::resident::managed() {
@@ -913,6 +964,7 @@ impl Handle {
                         terminal_local,
                         remote_power,
                         wol,
+                        device_policies,
                     },
                 )
                 .await
@@ -933,6 +985,7 @@ impl Handle {
                         remote_power,
                         wol,
                         terminal_local,
+                        device_policies,
                     )
                 })
                 .await
@@ -974,8 +1027,7 @@ impl Handle {
         self.power.invalidate();
         self.assistance.unavailable();
         let mut state = lock(&self.ownership);
-        let clear_update =
-            !state.updating && !crate::platform::host_service::resident::managed();
+        let clear_update = !state.updating && !crate::platform::host_service::resident::managed();
         state.active = false;
         state.permission = state.permission.wrapping_add(1);
         finish_session(&mut state);
@@ -1216,6 +1268,22 @@ impl Lease {
         if self.current(&state) {
             update(&mut state);
         }
+    }
+    /// 按主控设备 ID 判一次许可。总开关关着就一律不接，开着才看这张表。
+    pub(crate) fn admit(&self, controller: &str) -> anyhow::Result<()> {
+        // 标识由主控自报，必须先按 `controller()` 同样的口径校验：一个空串或
+        // 随便编的 ID 查不到条目就会落到「跟随全局」，把禁止绕过去。
+        anyhow::ensure!(
+            crate::account::api::validate_device_id(controller).is_ok(),
+            "主控设备标识无效"
+        );
+        let state = lock(&self.handle.ownership);
+        anyhow::ensure!(state.active && state.allowed, "本次被控许可已失效");
+        anyhow::ensure!(
+            super::policy::admits(&state.policies, controller, state.allowed),
+            "本机已禁止这台设备控制"
+        );
+        Ok(())
     }
     pub(crate) fn peer_lease(&self) -> anyhow::Result<SessionLease> {
         let mut state = lock(&self.handle.ownership);

@@ -54,6 +54,8 @@ pub(crate) enum Request {
         terminal_local: bool,
         remote_power: bool,
         wol: bool,
+        #[serde(default)]
+        device_policies: host::policy::DevicePolicies,
     },
     Disconnect {
         account: String,
@@ -96,6 +98,8 @@ pub(crate) struct Snapshot {
     pub remote_power: bool,
     #[serde(default)]
     pub wol: bool,
+    #[serde(default)]
+    pub device_policies: host::policy::DevicePolicies,
     pub status: host::Status,
     pub capabilities: Option<host::desktop::Capabilities>,
 }

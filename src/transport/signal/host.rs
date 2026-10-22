@@ -423,6 +423,16 @@ impl Session {
                 let authorization = if options.connect_type == 2 {
                     authorization.for_assistance()?
                 } else {
+                    // 同账号远程控制先过一遍按设备的许可，协助走自己的授权码。
+                    if let Err(error) = authorization.admit(&options.device_id) {
+                        // 不说一声的话，对端只会一路等到自己超时。
+                        tracing::info!(%error, "host incoming connection refused by device policy");
+                        Self::notify_termination(signal).await;
+                        if let Some(peer) = self.peer.take() {
+                            peer.close().await;
+                        }
+                        return Ok(());
+                    }
                     authorization
                 };
                 anyhow::ensure!(

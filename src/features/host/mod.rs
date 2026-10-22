@@ -20,6 +20,7 @@ pub(crate) mod microphone;
 pub(crate) mod network;
 pub(crate) mod parameters;
 pub(crate) mod peer;
+pub(crate) mod policy;
 pub(crate) mod power;
 mod protection;
 mod settings;

@@ -873,6 +873,49 @@ impl DeviceCenterApp {
                 );
                 specification(ui, rect, label, value, glyph, copy);
             }
+            // 「设备信息」那一列空出来的最后一行正好放这条：这台设备能不能控制本机。
+            let own_device = self
+                .devices
+                .as_ref()
+                .is_some_and(|list| list.current_device.device_id == id);
+            if let Some(host) = self.host.clone().filter(|h| !h.is_guest() && !own_device) {
+                use crate::features::host::policy::DevicePolicy;
+                let current = host.device_policies().get(&id).copied().unwrap_or_default();
+                let mut selected = current;
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(right, canvas.top() + info_y + 28.0 + 3.0 * row_h),
+                    vec2(right_w, row_h),
+                );
+                let mut row = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .layout(egui::Layout::left_to_right(Align::Center)),
+                );
+                row.label(
+                    RichText::new("允许控制本机")
+                        .size(crate::ui::theme::COMPACT_TEXT)
+                        .color(MUTED),
+                )
+                .on_hover_text(
+                    "这台设备能否远程控制本机；跟随全局即按被控设置里的「允许被控」，那个开关关着时都不生效",
+                );
+                row.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                    egui::ComboBox::from_id_salt(("device-policy", &id))
+                        .width(132.0)
+                        .selected_text(selected.label())
+                        .show_ui(ui, |ui| {
+                            for item in DevicePolicy::ALL {
+                                ui.selectable_value(&mut selected, item, item.label());
+                            }
+                        });
+                });
+                if selected != current {
+                    match host.set_device_policy(&id, selected) {
+                        Ok(()) => self.save_host_settings(),
+                        Err(error) => self.status = StatusMessage::error(error.to_string()),
+                    }
+                }
+            }
             ui.painter().line_segment(
                 [
                     egui::pos2(middle, canvas.top() + info_y),
