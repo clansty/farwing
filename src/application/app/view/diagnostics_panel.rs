@@ -121,7 +121,7 @@ impl DeviceCenterApp {
             ui.label("局域网信息登记");
             if ui
                 .add_enabled(
-                    host.requested()
+                    host.remotely_controllable()
                         && (host.wol_allowed() || host.status().wol_setup.enabled == Some(true))
                         && !wol.reporting
                         && state.wol_refresh.is_none(),

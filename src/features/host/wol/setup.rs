@@ -205,7 +205,7 @@ async fn perform(
             confirmed,
         } => {
             ensure!(confirmed, "请先确认网卡与 BIOS 已配置");
-            ensure!(client.host.requested(), "请先允许被控");
+            ensure!(client.host.remotely_controllable(), "请先允许被控");
             ensure!(
                 status.checked && status.adapters.iter().any(|a| a.key == key),
                 "请先检查并选择网卡"
@@ -245,7 +245,7 @@ async fn perform(
                 .await
                 .context("网络登记失败，未开启远程开机")?;
             active(client, stop)?;
-            ensure!(client.host.requested(), "允许被控已关闭");
+            ensure!(client.host.remotely_controllable(), "允许被控已关闭");
             status.enabled = None;
             let saved = client.set_wol_enabled(true).await;
             let readback = client.wol_enabled().await;

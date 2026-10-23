@@ -148,6 +148,9 @@ struct Ownership {
     stream_generations: std::collections::BTreeMap<usize, u64>,
     allowed: bool,
     policies: super::policy::DevicePolicies,
+    /// 远程协助的开关。单独存一份是为了让上线判定不必再进去拿协助那边的锁
+    /// （那条路径是反方向加锁的）。
+    assist_enabled: bool,
     active: bool,
     dirty: bool,
     last_controlled: Option<std::time::Instant>,
@@ -158,10 +161,14 @@ struct Ownership {
     status: Status,
 }
 
-/// 本机要不要对服务端保持「可被控」。总开关关掉之后，被单独放行的设备
-/// 仍然要靠这条线上线才能连进来，否则主控那边只会看到「未开放连接」。
-fn want_online(state: &Ownership) -> bool {
+/// 同账号远程控制这一路是否开着：总开关，或者被单独放行的设备。
+fn control_online(state: &Ownership) -> bool {
     state.active && (state.allowed || super::policy::any_allowed(&state.policies))
+}
+
+/// 本机要不要对服务端保持「可被控」。远程协助开着也得在线，否则协助根本连不进来。
+fn want_online(state: &Ownership) -> bool {
+    control_online(state) || (state.active && state.assist_enabled)
 }
 
 #[derive(Clone)]
@@ -211,6 +218,7 @@ impl Default for Handle {
                 stream_generations: Default::default(),
                 allowed: false,
                 policies: Default::default(),
+                assist_enabled: false,
                 active: true,
                 dirty: false,
                 last_controlled: None,
@@ -351,6 +359,7 @@ impl Handle {
         }
         state.allowed = snapshot.allowed;
         state.policies = snapshot.device_policies;
+        state.assist_enabled = snapshot.assistance.settings.enabled;
         state.encoding = snapshot.encoding;
         state.audio_device.send_replace(snapshot.audio_device);
         state.audio_defaults = snapshot.audio_defaults;
@@ -453,9 +462,14 @@ impl Handle {
                 terminal_local,
                 policies,
             )) => {
+                let assist_enabled = assistance.enabled;
                 let _ = handle.assistance.configure(assistance);
-                // 策略先落地，`set_allowed` 才能算出正确的上线状态。
-                lock(&handle.ownership).policies = policies;
+                // 策略与协助开关先落地，`set_allowed` 才能算出正确的上线状态。
+                {
+                    let mut state = lock(&handle.ownership);
+                    state.assist_enabled = assist_enabled;
+                    state.policies = policies;
+                }
                 handle.set_allowed(allowed);
                 let mut state = lock(&handle.ownership);
                 state.encoding = encoding;
@@ -537,12 +551,12 @@ impl Handle {
     }
     pub(crate) fn wol_permitted(&self) -> bool {
         let s = lock(&self.ownership);
-        // 只要本机还挂在线上就成立，总开关或单台设备的放行都算。
-        !self.guest && want_online(&s) && s.wol
+        // 只看同账号控制这一路；协助开着不该顺带放开唤醒。
+        !self.guest && control_online(&s) && s.wol
     }
     pub(crate) fn wol_registration_permitted(&self) -> bool {
         let s = lock(&self.ownership);
-        !self.guest && want_online(&s) && (s.wol || self.wol_setup.enabled())
+        !self.guest && control_online(&s) && (s.wol || self.wol_setup.enabled())
     }
     pub(crate) fn set_wol_allowed(&self, allowed: bool) -> anyhow::Result<()> {
         let mut s = lock(&self.ownership);
@@ -571,7 +585,7 @@ impl Handle {
     }
     pub(crate) fn power_permitted(&self) -> bool {
         let state = lock(&self.ownership);
-        !self.guest && want_online(&state) && state.remote_power && !state.updating
+        !self.guest && control_online(&state) && state.remote_power && !state.updating
     }
     pub(crate) fn set_power_allowed(&self, allowed: bool) -> anyhow::Result<()> {
         let mut state = lock(&self.ownership);
@@ -594,7 +608,7 @@ impl Handle {
     pub(crate) fn begin_power(&self) -> anyhow::Result<()> {
         let mut state = lock(&self.ownership);
         anyhow::ensure!(
-            !self.guest && want_online(&state) && state.remote_power && !state.updating,
+            !self.guest && control_online(&state) && state.remote_power && !state.updating,
             "远程电源许可已撤销"
         );
         state.power_executing = true;
@@ -930,13 +944,29 @@ impl Handle {
         Ok(())
     }
     pub(crate) fn set_assistance(&self, settings: super::assist::Settings) -> anyhow::Result<()> {
+        let (active, was_online) = {
+            let state = lock(&self.ownership);
+            (state.active, want_online(&state))
+        };
+        anyhow::ensure!(active, "账号会话已结束");
+        let enabled = settings.enabled;
+        // 协助那边的锁不在这把锁里拿：它的后台线程恰好是反方向加锁的。
+        let changed = self.assistance.configure(settings)?;
         let mut state = lock(&self.ownership);
-        anyhow::ensure!(state.active, "账号会话已结束");
-        if self.assistance.configure(settings)? {
+        state.assist_enabled = enabled;
+        if changed {
             state.settings_revision = state.settings_revision.wrapping_add(1);
             state.dirty = true;
             state.status.saving = true;
             state.status.settings_error = None;
+        }
+        // 协助开关自己就能把本机拉上线，反过来也要能放下去。
+        let online = want_online(&state);
+        if online != was_online {
+            let request = online.then_some(AccessRequest {
+                generation: state.permission,
+            });
+            self.desired.send_replace(request);
         }
         Ok(())
     }
@@ -1114,6 +1144,11 @@ impl Handle {
     pub(crate) fn requested(&self) -> bool {
         let state = lock(&self.ownership);
         want_online(&state) && !state.power_executing
+    }
+    /// 同账号远程控制这一路是否开着。远程协助、被单独放行的设备都不算在这里，
+    /// 唤醒协助、关机这些能力只跟这一路走。
+    pub(crate) fn remotely_controllable(&self) -> bool {
+        control_online(&lock(&self.ownership))
     }
     pub(crate) fn subscribe(&self) -> watch::Receiver<Option<AccessRequest>> {
         self.desired.subscribe()

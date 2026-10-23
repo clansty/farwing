@@ -1932,7 +1932,7 @@ impl DeviceCenterApp {
                             ui.add_space(12.0);
                             ui.label(if status.connected {
                                 "正在接受远程协助"
-                            } else if !host.allowed() {
+                            } else if !host.assistance.settings().enabled {
                                 "尚未开启远程协助"
                             } else {
                                 &status.message

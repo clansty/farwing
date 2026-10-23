@@ -40,7 +40,6 @@ fn share_text(id: &str, settings: &Settings) -> String {
 fn local_card(
     ui: &mut egui::Ui,
     snapshot: &crate::features::host::assist::Snapshot,
-    allowed: bool,
     saving: bool,
     show_code: &mut bool,
     save_error: Option<&str>,
@@ -57,7 +56,7 @@ fn local_card(
         ui.set_width(ui.available_width());
         ui.spacing_mut().item_spacing.y = 0.0;
         header(ui, "本设备", None, |ui| {
-            ui.add_enabled_ui((allowed || action.enabled) && !saving, |ui| {
+            ui.add_enabled_ui(!saving, |ui| {
                 crate::ui::controls::switch(ui, &mut action.enabled);
             });
             ui.label("允许他人远程协助");
@@ -67,7 +66,7 @@ fn local_card(
             .inner_margin(theme::ASSIST_CARD_MARGIN)
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 8.0;
-                let enabled = allowed && action.enabled;
+                let enabled = action.enabled;
                 if !enabled {
                     *show_code = false;
                 }
@@ -212,9 +211,6 @@ fn local_card(
                         },
                     );
                 });
-                if !allowed {
-                    ui.label(RichText::new("请先在连接设置中开启“允许被控”").color(MUTED));
-                }
                 if let Some(error) = save_error {
                     ui.colored_label(AMBER, format!("设置未保存：{error}"));
                 }
@@ -262,7 +258,6 @@ impl DeviceCenterApp {
         let action = local_card(
             ui,
             &snapshot,
-            host.allowed() || host.is_guest(),
             host.status().saving,
             &mut self.center_ui.host_assist_show_code,
             host.status().settings_error.as_deref(),
@@ -273,9 +268,6 @@ impl DeviceCenterApp {
             settings.refresh_code();
         }
         if settings != snapshot.settings {
-            if host.is_guest() {
-                host.set_allowed(settings.enabled);
-            }
             match host.set_assistance(settings) {
                 Ok(()) => self.save_host_settings(),
                 Err(error) => self.status = StatusMessage::error(error.to_string()),

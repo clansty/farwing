@@ -93,8 +93,8 @@ impl DeviceCenterApp {
         }
         let host = self.host.as_ref().unwrap();
         let status = host.status().wol_setup;
-        // 总开关或单台设备的放行都算「本机在线可被控」。
-        let allowed = host.requested();
+        // 总开关或单台设备的放行都算「同账号控制开着」；协助开着不算。
+        let allowed = host.remotely_controllable();
         let state = &mut self.center_ui.wol_setup;
         if let Some(rx) = &state.pending {
             match rx.try_recv() {
