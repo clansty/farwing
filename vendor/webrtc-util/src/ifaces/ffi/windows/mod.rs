@@ -37,7 +37,13 @@ pub fn ifaces() -> io::Result<Vec<Interface>> {
 }
 
 unsafe fn collect_adapters(mut adapter: *const IP_ADAPTER_ADDRESSES_LH) -> Vec<Interface> {
-    let mut result = Vec::new();
+    // 虚拟网卡不能一刀切丢掉。桥上来的机台（Hyper-V 外部交换机接 Wi-Fi）里，
+    // 物理网卡会被解绑、只剩 vEthernet 带 IP；照原生客户端那份忽略名单过滤完就是
+    // 0 块网卡，于是本地一条 ICE 候选都产生不出来，主控那边永远停在 ICE new。
+    // 所以这里分三拨收：有带地址的物理网卡就用它，没有才退给虚拟网卡，最后才轮到环回。
+    let mut physical = Vec::new();
+    let mut virtuals = Vec::new();
+    let mut loopback = Vec::new();
     let mut network_index = 0_u32;
     while let Some(current) = adapter.as_ref() {
         adapter = current.Next;
@@ -51,7 +57,7 @@ unsafe fn collect_adapters(mut adapter: *const IP_ADAPTER_ADDRESSES_LH) -> Vec<I
         // UU 78678 -> 79096 -> 7665B. The adapter index still advances for
         // ignored adapters; the normal NetworkManager snapshot excludes them.
         let lower_description = description.to_ascii_lowercase();
-        if [
+        let is_virtual = [
             "vmware",
             "hyper-v",
             "virtualbox",
@@ -60,13 +66,11 @@ unsafe fn collect_adapters(mut adapter: *const IP_ADAPTER_ADDRESSES_LH) -> Vec<I
             "qemu",
         ]
         .iter()
-        .any(|part| lower_description.contains(part))
-        {
-            continue;
-        }
+        .any(|part| lower_description.contains(part));
         let mac = &current.PhysicalAddress
             [..(current.PhysicalAddressLength as usize).min(current.PhysicalAddress.len())];
         let adapter_type = uu_adapter_type(current.IfType, &description, mac);
+        let mut interfaces = Vec::new();
         let mut unicast = current.FirstUnicastAddress;
         while let Some(address) = unicast.as_ref() {
             unicast = address.Next;
@@ -76,7 +80,7 @@ unsafe fn collect_adapters(mut adapter: *const IP_ADAPTER_ADDRESSES_LH) -> Vec<I
             if let SocketAddr::V6(v6) = &mut socket {
                 v6.set_scope_id(current.Ipv6IfIndex);
             }
-            result.push(Interface {
+            interfaces.push(Interface {
                 name: name.clone(),
                 kind: if socket.is_ipv4() {
                     Kind::Ipv4
@@ -89,8 +93,34 @@ unsafe fn collect_adapters(mut adapter: *const IP_ADAPTER_ADDRESSES_LH) -> Vec<I
                 adapter_type,
             });
         }
+        if interfaces.is_empty() {
+            continue;
+        }
+        // 环回地址不算「能用」：ICE 网络目录默认就把环回筛掉（include_loopback=false），
+        // 把它当成物理网卡会让「有物理网卡」恒成立、虚拟网卡兜底永远轮不到。
+        if current.IfType == 24
+            || interfaces
+                .iter()
+                .all(|i| i.addr.is_some_and(|a| a.ip().is_loopback()))
+        {
+            loopback.extend(interfaces);
+        } else if is_virtual {
+            virtuals.extend(interfaces);
+        } else {
+            physical.extend(interfaces);
+        }
     }
-    result
+    if !physical.is_empty() {
+        physical
+    } else if !virtuals.is_empty() {
+        log::debug!(
+            "no physical adapter carries an address; using {} virtual adapter address(es)",
+            virtuals.len()
+        );
+        virtuals
+    } else {
+        loopback
+    }
 }
 
 unsafe fn socket_addr(address: &SOCKET_ADDRESS) -> Option<SocketAddr> {
