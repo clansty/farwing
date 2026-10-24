@@ -12,20 +12,31 @@ permissions:
 
 jobs:
   deb:
-    # The oldest supported Ubuntu, so the package's glibc and library
-    # requirements hold on 22.04 and everything newer.
-    runs-on: ubuntu-22.04
+    # 24.04 而不是更老的 22.04：这台机器上编出来的包 glibc 下限就是 runner 的 glibc，
+    # 但 22.04 的 FFmpeg 是 4.4（libavcodec 58），本工程的 ffmpeg 代码用到了
+    # `AV_FRAME_FLAG_KEY`（6.1 才有）和改类型后的 `av_buffer_create`，在 4.4 上头文件里
+    # 根本不存在，直接编不过。实测 24.04（FFmpeg 6.1 / libavcodec 60）可以完整编出并装上。
+    # 代价是产物的 libc6 依赖变成 >= 2.39，只装得上 24.04 及更新（22.04 用户得自己编译）。
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
       - name: Install build dependencies
         run: |
           sudo apt-get update
+          # libav*-dev 是必须的：Linux 上的硬件编码走系统 FFmpeg（ffmpeg-sys-next 用
+          # pkg-config 找 libavutil/libavcodec/libavfilter 等），缺了会在 build.rs 里
+          # 直接 "error: FFmpeg not found." 退出。它默认开了 avcodec/avformat/avfilter/
+          # avdevice/swscale/swresample 六个特性，所以七个子库的 -dev 都要装。
+          # 顺带一提：cargo-deb 的 `$auto` 依赖也是在这一步定的——没有对应的 -dev 包，
+          # dpkg-shlibdeps 认不出 soname，打出来的包会缺 libavcodec 之类的运行依赖。
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake clang nasm pkg-config dpkg-dev libva-dev \
             libasound2-dev libdbus-1-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libwayland-dev libx11-dev libxcb1-dev libxrandr-dev libxi-dev \
-            libxcursor-dev libgl1-mesa-dev libvulkan-dev libudev-dev libssl-dev
+            libxcursor-dev libgl1-mesa-dev libvulkan-dev libudev-dev libssl-dev \
+            libavcodec-dev libavutil-dev libavformat-dev libavfilter-dev \
+            libavdevice-dev libswscale-dev libswresample-dev
 
       - uses: dtolnay/rust-toolchain@stable
 
