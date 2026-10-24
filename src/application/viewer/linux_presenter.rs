@@ -1650,6 +1650,10 @@ struct Player {
     video_rect: Option<egui::Rect>,
     pointer_in_video: bool,
     last_position: Option<PhysicalPosition<f64>>,
+    /// 指针交回本机那一刻它停着的位置。指针锁着的时候合成器一直报同一个点，
+    /// 交还之后的下一条 `CursorMoved` 还是那个点——把它当绝对坐标发出去，被控端
+    /// 指针会被拖到本机指针停着的地方，而那一下并不是用户动了鼠标。
+    released_position: Option<PhysicalPosition<f64>>,
     modifiers: winit::keyboard::ModifiersState,
     held_keys: Vec<u16>,
     /// Everything physically down right now, whether or not it was forwarded.
@@ -1769,6 +1773,7 @@ impl Player {
             video_rect: None,
             pointer_in_video: false,
             last_position: None,
+            released_position: None,
             modifiers: winit::keyboard::ModifiersState::empty(),
             held_keys: Vec::new(),
             physical_keys: Vec::new(),
@@ -3189,6 +3194,8 @@ impl Player {
                 Ok(()) => {
                     window.set_cursor_visible(false);
                     self.pointer_locked = true;
+                    // 相对位移这一段没有绝对坐标，别把交还时那个旧点留着。
+                    self.released_position = None;
                 }
                 Err(error) => {
                     tracing::warn!(%error, "无法锁定指针，改用绝对坐标");
@@ -3205,6 +3212,8 @@ impl Player {
             window.set_cursor_visible(true);
             self.pointer_locked = false;
             self.motion_remainder = [0.0, 0.0];
+            // 记下它停在哪儿：接下来那条 CursorMoved 会把这个点再报一次。
+            self.released_position = self.last_position;
         }
     }
 
@@ -3609,9 +3618,29 @@ impl Player {
         drag.probe(self.owner, point, input.clone()).is_ok()
     }
 
+    /// 这条位置是不是刚从锁里交还时那个停住的点（允许两个像素的抖动）。
+    ///
+    /// 是就丢掉这一次，并且留着记录等真的移动；不是就清掉记录、正常按绝对坐标发。
+    fn repeats_the_released_point(&mut self, position: PhysicalPosition<f64>) -> bool {
+        let Some(released) = self.released_position else {
+            return false;
+        };
+        if (position.x - released.x).abs() <= 2.0 && (position.y - released.y).abs() <= 2.0 {
+            return true;
+        }
+        self.released_position = None;
+        false
+    }
+
     fn send_position(&mut self, position: PhysicalPosition<f64>) {
         // 失焦时继续转发，会把 owner 从别的观看窗口手里抢回来。
         if !self.focused || self.switching() || self.local_input_blocked {
+            return;
+        }
+        // 刚从相对位移切回绝对定位时，第一条位置事件报的还是指针锁着时停住的那个
+        // 点（合成器锁着也一直报它）。那不是用户移动，发出去只会让被控端指针跳到
+        // 本机指针停着的地方；等真的动了再开始报。
+        if self.repeats_the_released_point(position) {
             return;
         }
         let input = self.input();

@@ -112,6 +112,11 @@ impl StreamControlHandle {
         let mut state = lock(&self.shared);
         expire_cursor_request(&mut state);
         state.mouse_restore_point = None;
+        if user_choice {
+            // 用户自己挑模式就是要那个模式：「主控端鼠标」得回到绝对定位，别再让
+            // 那条「这是游戏」的锁把它按在相对上。
+            state.guessed_relative = false;
+        }
         if mode == MouseMode::View {
             // Local revocation never waits for remote settings.
             state.mouse.disable();
@@ -249,6 +254,12 @@ impl StreamControlHandle {
     /// Minecraft 就不在里面。所以这里补一条本地推断：**远端光标不见了、人还在动
     /// 鼠标**，那就是要相对位移，三种模式都一样（见 `mouse_policy`）。被控端在
     /// **打字**时也会藏光标，只是那时候人手在键盘上，没有这条位移，误判不会发生。
+    ///
+    /// 判据和官方一致：**只看「远端光标是不是隐藏」这一个状态量**，没有时长、也没有
+    /// 迟滞（官方 4.40 的模式解析里同样只有 `cursor_type == -1` 这一个条件，切来切去
+    /// 全靠它对指针的 `SetCursorPos` 复位来抹平）。我们多做的一件事是要求「本地指针
+    /// 真的动过」，用来挡被控端打字时藏光标那一下；光标一露出来推断立刻作废，回到
+    /// 绝对定位（见 `refresh_mouse_policy`）。
     pub(crate) fn pointer_moved(&self) {
         let mut state = lock(&self.shared);
         if state.guessed_relative
@@ -341,11 +352,13 @@ impl StreamControlHandle {
     }
 
     pub(super) fn refresh_mouse_policy(&self, state: &mut StreamControlState) {
-        // 远端光标又出现了（或者它压根没藏过）：本地那条「这是游戏」的推断作废，
-        // 回到绝对定位。被控端明确表态时（`peer_mouse_relative`）也一并清掉，
-        // 免得那条旧推断在它下次沉默时又被捡起来。
+        // 远端光标一露出来就作废这条推断，回到绝对定位——和官方一致：官方那边的
+        // 判据只有 `cursor_type == -1` 这一个状态量，没有时长、没有迟滞。被控端开口
+        // （`peer_mouse_relative`）当然也以它为准，退出控制时同样清掉。
         if state.guessed_relative
-            && (!state.remote_cursor.hidden() || state.peer_mouse_relative.is_some())
+            && (!state.remote_cursor.hidden()
+                || state.peer_mouse_relative.is_some()
+                || state.mouse.mode() == MouseMode::View)
         {
             state.guessed_relative = false;
         }
@@ -433,25 +446,22 @@ fn game_took_pointer(state: &StreamControlState) -> bool {
 /// 这一局该怎么注入：第一个是「发相对位移吗」，第二个是「让被控端把它的指针
 /// 画进画面吗」。
 pub(super) fn mouse_policy(state: &StreamControlState, mode: MouseMode) -> (bool, bool) {
-    // 光标合成只跟模式有关：「主控端鼠标」里本机指针就是远端指针，不需要被控端画。
+    let game = game_took_pointer(state);
+    // 谁画指针：绝对定位时本机指针就代表远端指针，不用被控端画。推断出来的那一档
+    // 不去动这个开关（官方在同样情形下也不 claim capture：那时光标本来就藏了，
+    // 没什么可画；一露出来我们就回绝对定位、自己画了）。
     let wanted = match mode {
         MouseMode::View | MouseMode::Remote => true,
         MouseMode::Local => false,
-        // 智能鼠标：被控端表态相对时由它画；本地推断出来的游戏不去动这个开关——
-        // 那会让被控端重开一路采集，而游戏里本来就没有指针要画。
-        MouseMode::Smart => match state.peer_mouse_relative {
-            Some(opinion) => opinion,
-            None if state.guessed_relative => state.cursor_desired_capture,
-            None => false,
-        },
+        MouseMode::Smart => state.peer_mouse_relative.unwrap_or(false),
     };
     // 指针一旦被前台程序锁走，绝对定位一项也写不进去：锁定中的指针只接受相对位移。
-    // 所以只要这一局是游戏，三种模式都发位移——「主控端鼠标」也一样，代价只是本机
-    // 不再有指针可看（游戏把自己的指针藏了）。
+    // 所以只要这一局是游戏，三种模式都发位移——「主控端鼠标」也一样，代价是本机
+    // 不再有指针可看，只能看被控端画进画面的那个。
     let relative = match mode {
         MouseMode::View => false,
         MouseMode::Remote => true,
-        MouseMode::Local | MouseMode::Smart => game_took_pointer(state),
+        MouseMode::Local | MouseMode::Smart => game,
     };
     (relative, wanted)
 }
@@ -519,29 +529,41 @@ mod tests {
         assert_eq!(mouse_policy(&state, MouseMode::View), (false, true));
 
         state.peer_mouse_relative = Some(true);
-        assert_eq!(mouse_policy(&state, MouseMode::Local).0, true);
+        assert_eq!(mouse_policy(&state, MouseMode::Local), (true, false));
         assert_eq!(mouse_policy(&state, MouseMode::Smart), (true, true));
 
         // 被控端说这个程序要绝对，比本地推断更权威。
         state.peer_mouse_relative = Some(false);
         state.guessed_relative = true;
-        assert_eq!(mouse_policy(&state, MouseMode::Local).0, false);
+        assert_eq!(mouse_policy(&state, MouseMode::Local), (false, false));
         assert_eq!(mouse_policy(&state, MouseMode::Smart), (false, false));
     }
 
-    /// 被控端不表态时（白名单里没有的三维游戏），本地推断进来那条路：光标藏着、
-    /// 人在动鼠标，就发相对位移，且不去动被控端的光标合成开关。
+    /// 推断出来的那一档不改被控端的光标合成开关：那时光标正藏着，没什么可画，而
+    /// 一露出来我们就回绝对定位、由本机画（官方同样不在这一档 claim capture）。
     #[test]
-    fn a_local_guess_leaves_the_host_cursor_capture_alone() {
+    fn a_guessed_game_leaves_the_host_cursor_capture_alone() {
         let handle = handle();
         let mut state = lock(&handle.shared);
         state.viewing_enabled = true;
-        state.cursor_desired_capture = true;
-        state.peer_mouse_relative = None;
         state.guessed_relative = true;
-        assert_eq!(mouse_policy(&state, MouseMode::Smart), (true, true));
-        state.cursor_desired_capture = false;
         assert_eq!(mouse_policy(&state, MouseMode::Smart), (true, false));
-        assert_eq!(mouse_policy(&state, MouseMode::Local).0, true);
+        assert_eq!(mouse_policy(&state, MouseMode::Local), (true, false));
+    }
+
+    /// 远端光标一露出来就放开推断，回到绝对定位——官方也只有 `cursor_type == -1`
+    /// 这一个状态量，没有时长和迟滞。
+    #[test]
+    fn a_visible_cursor_drops_the_guess_immediately() {
+        let handle = handle();
+        let mut state = lock(&handle.shared);
+        state.viewing_enabled = true;
+        state.mouse.set_ready(true);
+        state.mouse.enable(MouseMode::Smart, false).unwrap();
+        state.guessed_relative = true;
+        state.remote_cursor.clear();
+        handle.refresh_mouse_policy(&mut state);
+        assert!(!state.guessed_relative);
+        assert_eq!(mouse_policy(&state, MouseMode::Smart), (false, false));
     }
 }

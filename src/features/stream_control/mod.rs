@@ -441,8 +441,9 @@ struct StreamControlState {
     restore_input_pending: bool,
     remote_cursor: crate::features::remote_cursor::RemoteCursorState,
     peer_mouse_relative: Option<bool>,
-    /// 被控端没对鼠标模式表态时，本地对「这是不是三维游戏」的推断：远端光标不见了，
-    /// 而人还在动鼠标（见 `StreamControlHandle::pointer_moved`）。
+    /// 被控端没对鼠标模式表态时，本地对「这是不是三维游戏」的推断：远端光标隐藏、
+    /// 而本地指针真的在动。官方的判据就是这个光标状态量，光标一露出来推断立刻作废
+    /// （见 `StreamControlHandle::pointer_moved`）。
     guessed_relative: bool,
     cursor_sync_needed: bool,
     cursor_desired_capture: bool,
