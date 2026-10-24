@@ -465,7 +465,13 @@ impl RemoteInput {
     }
     pub fn set_relative_mode(&self, relative: bool) {
         let mut s = self.lock();
+        if s.relative == relative {
+            return;
+        }
         s.relative = relative;
+        // 画面上「远端指针动不了」这类问题第一步就要看这条：相对位移开着的时候
+        // 本机指针是被锁住的，发出去的是一条条位移，而不是坐标。
+        tracing::info!(relative, mode = ?s.mode, "鼠标注入方式已切换");
         drop(s);
         self.repaint();
     }

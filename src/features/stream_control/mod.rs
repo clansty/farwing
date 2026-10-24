@@ -439,12 +439,11 @@ struct StreamControlState {
         tokio::sync::watch::Sender<Option<crate::features::viewing_settings::DevicePreferences>>,
     device_persistence_error: Option<String>,
     restore_input_pending: bool,
-    #[allow(
-        dead_code,
-        reason = "Smart mouse waits for special_game_mouse instead of inferring from a hidden cursor."
-    )]
     remote_cursor: crate::features::remote_cursor::RemoteCursorState,
     peer_mouse_relative: Option<bool>,
+    /// 被控端没对鼠标模式表态时，本地对「这是不是三维游戏」的推断：远端光标不见了，
+    /// 而人还在动鼠标（见 `StreamControlHandle::pointer_moved`）。
+    guessed_relative: bool,
     cursor_sync_needed: bool,
     cursor_desired_capture: bool,
     mouse_restore_point: Option<(i32, [f64; 2])>,
@@ -526,6 +525,7 @@ impl StreamControlHandle {
             remote_notice: None,
             remote_cursor: cursor.clone(),
             peer_mouse_relative: None,
+            guessed_relative: false,
             cursor_sync_needed: false,
             cursor_desired_capture: true,
             mouse_restore_point: None,

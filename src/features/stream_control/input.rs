@@ -242,6 +242,31 @@ impl StreamControlHandle {
         result
     }
 
+    /// 本地指针在动，而远端光标此刻是隐藏的。
+    ///
+    /// 被控端把指针锁进游戏之后就不再发光标（官方报的是 `cursor_type = -1`），
+    /// 而它的 `special_game_mouse` 只对账号白名单里的程序发——自己起 JVM 的
+    /// Minecraft 就不在里面。所以这里补一条本地推断：**远端光标不见了、人还在动
+    /// 鼠标**，那就是要相对位移，三种模式都一样（见 `mouse_policy`）。被控端在
+    /// **打字**时也会藏光标，只是那时候人手在键盘上，没有这条位移，误判不会发生。
+    pub(crate) fn pointer_moved(&self) {
+        let mut state = lock(&self.shared);
+        if state.guessed_relative
+            || state.peer_mouse_relative.is_some()
+            // 只看画面/已经用相对位移的两种模式不需要这条推断。
+            || matches!(state.mouse.mode(), MouseMode::View | MouseMode::Remote)
+            || !state.viewing_enabled
+            || !state.remote_cursor.hidden()
+        {
+            return;
+        }
+        state.guessed_relative = true;
+        tracing::info!("远端光标隐藏且本地指针在动，按三维游戏处理：切相对鼠标");
+        self.refresh_mouse_policy(&mut state);
+        drop(state);
+        self.mouse.repaint();
+    }
+
     pub(super) fn handle_mouse_command(
         &self,
         payload: &[u8],
@@ -316,6 +341,14 @@ impl StreamControlHandle {
     }
 
     pub(super) fn refresh_mouse_policy(&self, state: &mut StreamControlState) {
+        // 远端光标又出现了（或者它压根没藏过）：本地那条「这是游戏」的推断作废，
+        // 回到绝对定位。被控端明确表态时（`peer_mouse_relative`）也一并清掉，
+        // 免得那条旧推断在它下次沉默时又被捡起来。
+        if state.guessed_relative
+            && (!state.remote_cursor.hidden() || state.peer_mouse_relative.is_some())
+        {
+            state.guessed_relative = false;
+        }
         let mode = state.mouse.policy_mode();
         if !state.viewing_enabled || mode == MouseMode::View || self.microphone.needs_cleanup() {
             self.disable_microphone_locked(state);
@@ -363,7 +396,9 @@ impl StreamControlHandle {
         // A window that could not take it says so, and absolute positioning is
         // then the only honest way to aim, whatever the policy would prefer.
         let relative = relative && state.mouse.relative_available();
-        if mode == MouseMode::Smart && state.mouse.relative_mode() != relative {
+        // 每种模式都要跟一遍：三维游戏一来，「主控端鼠标」也得临时改成位移，
+        // 游戏一走再回到绝对（见 `mouse_policy`）。
+        if state.mouse.relative_mode() != relative {
             state.mouse.set_relative_mode(relative);
         }
         if state.cursor_desired_capture != wanted {
@@ -389,25 +424,36 @@ pub(super) fn smart_mouse_requested(state: &StreamControlState) -> bool {
     state.mouse.policy_mode() == MouseMode::Smart
 }
 
+/// 这一局是不是「三维游戏把指针拿走了」。被控端明确表态时以它为准（官方按程序
+/// 白名单发的 `special_game_mouse`），它不说话时才用本地的推断。
+fn game_took_pointer(state: &StreamControlState) -> bool {
+    state.peer_mouse_relative.unwrap_or(state.guessed_relative)
+}
+
+/// 这一局该怎么注入：第一个是「发相对位移吗」，第二个是「让被控端把它的指针
+/// 画进画面吗」。
 pub(super) fn mouse_policy(state: &StreamControlState, mode: MouseMode) -> (bool, bool) {
-    match mode {
-        MouseMode::View => (false, true),
-        MouseMode::Local => (false, false),
-        MouseMode::Remote => (true, true),
+    // 光标合成只跟模式有关：「主控端鼠标」里本机指针就是远端指针，不需要被控端画。
+    let wanted = match mode {
+        MouseMode::View | MouseMode::Remote => true,
+        MouseMode::Local => false,
+        // 智能鼠标：被控端表态相对时由它画；本地推断出来的游戏不去动这个开关——
+        // 那会让被控端重开一路采集，而游戏里本来就没有指针要画。
         MouseMode::Smart => match state.peer_mouse_relative {
-            Some(true) => (true, true),
-            Some(false) => (false, false),
-            // The host says a game took the mouse with `special_game_mouse`,
-            // and that report is what pairs relative input with the host
-            // drawing its own pointer into the picture. Until it arrives,
-            // absolute positioning is the only coherent choice: inferring
-            // relative input from a hidden cursor fires on an ordinary desktop
-            // -- Windows hides the pointer for anyone typing, for as long as
-            // they type -- and leaves the client sending deltas while nothing
-            // draws a pointer to aim with.
-            None => (false, false),
+            Some(opinion) => opinion,
+            None if state.guessed_relative => state.cursor_desired_capture,
+            None => false,
         },
-    }
+    };
+    // 指针一旦被前台程序锁走，绝对定位一项也写不进去：锁定中的指针只接受相对位移。
+    // 所以只要这一局是游戏，三种模式都发位移——「主控端鼠标」也一样，代价只是本机
+    // 不再有指针可看（游戏把自己的指针藏了）。
+    let relative = match mode {
+        MouseMode::View => false,
+        MouseMode::Remote => true,
+        MouseMode::Local | MouseMode::Smart => game_took_pointer(state),
+    };
+    (relative, wanted)
 }
 
 pub(super) fn fail_cursor_request(state: &mut StreamControlState, sequence: i64, error: String) {
@@ -436,5 +482,66 @@ pub(super) fn expire_cursor_request(state: &mut StreamControlState) {
             .performance
             .fail_stream_switch(sequence, error.clone());
         state.last_error = Some(error);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn handle() -> StreamControlHandle {
+        let profile = crate::media::ConnectionMediaProfile {
+            audio_only: false,
+            muted: false,
+            local_display: crate::media::LocalDisplayInfo::FALLBACK,
+            stream_fps: 60,
+            decoder_fps_cap: 60,
+            codec: Default::default(),
+            decoder: Default::default(),
+        };
+        StreamControlHandle::new(
+            profile,
+            crate::diagnostics::performance::PerformanceMonitor::new("test"),
+        )
+        .0
+    }
+
+    /// 被控端点名要相对之后，「主控端鼠标」也得改成位移：三维游戏把指针锁走时绝对
+    /// 定位一项也写不进去。游戏一走，它要回到自己的绝对定位。
+    #[test]
+    fn a_game_scene_forces_relative_in_every_mode() {
+        let handle = handle();
+        let mut state = lock(&handle.shared);
+        state.viewing_enabled = true;
+        assert_eq!(mouse_policy(&state, MouseMode::Local), (false, false));
+        assert_eq!(mouse_policy(&state, MouseMode::Remote), (true, true));
+        assert_eq!(mouse_policy(&state, MouseMode::Smart), (false, false));
+        assert_eq!(mouse_policy(&state, MouseMode::View), (false, true));
+
+        state.peer_mouse_relative = Some(true);
+        assert_eq!(mouse_policy(&state, MouseMode::Local).0, true);
+        assert_eq!(mouse_policy(&state, MouseMode::Smart), (true, true));
+
+        // 被控端说这个程序要绝对，比本地推断更权威。
+        state.peer_mouse_relative = Some(false);
+        state.guessed_relative = true;
+        assert_eq!(mouse_policy(&state, MouseMode::Local).0, false);
+        assert_eq!(mouse_policy(&state, MouseMode::Smart), (false, false));
+    }
+
+    /// 被控端不表态时（白名单里没有的三维游戏），本地推断进来那条路：光标藏着、
+    /// 人在动鼠标，就发相对位移，且不去动被控端的光标合成开关。
+    #[test]
+    fn a_local_guess_leaves_the_host_cursor_capture_alone() {
+        let handle = handle();
+        let mut state = lock(&handle.shared);
+        state.viewing_enabled = true;
+        state.cursor_desired_capture = true;
+        state.peer_mouse_relative = None;
+        state.guessed_relative = true;
+        assert_eq!(mouse_policy(&state, MouseMode::Smart), (true, true));
+        state.cursor_desired_capture = false;
+        assert_eq!(mouse_policy(&state, MouseMode::Smart), (true, false));
+        assert_eq!(mouse_policy(&state, MouseMode::Local).0, true);
     }
 }

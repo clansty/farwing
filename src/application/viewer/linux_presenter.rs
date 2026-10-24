@@ -978,7 +978,23 @@ impl ConnectingWindowsRunner {
         };
         if let DetachedStage::Playing(player) = &mut slot.stage {
             let forwarded = player.on_window_event(&window, &shell.context, &event, consumed);
-            if forwarded && matches!(event, WindowEvent::KeyboardInput { .. }) {
+            let owns_pointer = player.remote_owns_pointer();
+            if forwarded
+                && (matches!(event, WindowEvent::KeyboardInput { .. })
+                    || (owns_pointer
+                        && matches!(
+                            event,
+                            WindowEvent::MouseInput {
+                                state: ElementState::Pressed,
+                                ..
+                            } | WindowEvent::MouseWheel { .. }
+                        )))
+            {
+                // 已经转发给远端的事件不能同时交给本机 UI：按键会在本机挪动工具栏
+                // 焦点（egui-winit 对每个 Tab 都这么做）；相对位移模式下本机指针停在
+                // 最后一点上，这一下点击会被 egui 当成点在那儿的工具栏或菜单上。
+                // 只截「按下」与滚轮：松开截掉的话，万一按下的那一下没转发（比如
+                // 本地菜单正开着），egui 就会一直以为这个键还按着。
                 shell
                     .input
                     .egui_input_mut()
@@ -1290,10 +1306,28 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
         };
         if let Stage::Playing(player) = &mut self.stage {
             let forwarded = player.on_window_event(&window, &shell.context, &event, consumed);
-            if forwarded && matches!(event, WindowEvent::KeyboardInput { .. }) {
-                // 已经转发给远端的按键不能同时在本机挪动工具栏焦点（egui-winit 对
-                // 每个 Tab 都这么做）：把 egui 刚收进去的这条事件截掉。
-                shell.input.egui_input_mut().events.truncate(previous_events);
+            let owns_pointer = player.remote_owns_pointer();
+            if forwarded
+                && (matches!(event, WindowEvent::KeyboardInput { .. })
+                    || (owns_pointer
+                        && matches!(
+                            event,
+                            WindowEvent::MouseInput {
+                                state: ElementState::Pressed,
+                                ..
+                            } | WindowEvent::MouseWheel { .. }
+                        )))
+            {
+                // 已经转发给远端的事件不能同时交给本机 UI：按键会在本机挪动工具栏
+                // 焦点（egui-winit 对每个 Tab 都这么做）；相对位移模式下本机指针停在
+                // 最后一点上，这一下点击会被 egui 当成点在那儿的工具栏或菜单上——
+                // 用户报的「点一下却点到了设置菜单那个按钮」就是这条。只截按下与
+                // 滚轮：松开截掉的话，万一按下那一下没转发出去，egui 会以为键还按着。
+                shell
+                    .input
+                    .egui_input_mut()
+                    .events
+                    .truncate(previous_events);
             }
             if matches!(
                 event,
@@ -3162,6 +3196,13 @@ impl Player {
         }
     }
 
+    /// 本机指针此刻属于远端：相对位移模式下它被锁在窗口里、位置停在最后一次点过的
+    /// 地方（Wayland 没法把指针挪回去），所以**不能拿它在本机 UI 上做命中判定**——
+    /// 那个位置可能正压在工具栏按钮上，一次点击就把控制退掉、或者把设置菜单重新点开。
+    fn remote_owns_pointer(&self) -> bool {
+        self.input().relative_mode() && self.input().mode() != MouseMode::View
+    }
+
     /// The remote refuses input until every key and button held when control
     /// was granted has been released; nothing else reports that on Linux.
     fn confirm_neutral(&self) {
@@ -3352,7 +3393,11 @@ impl Player {
                 {
                     return false;
                 }
-                if self.switching() || !self.pointer_in_video || ui_dragging {
+                if self.switching() {
+                    return false;
+                }
+                // 指针属于远端时不做「点在不在画面上」的判断：位置是停住的，判不对。
+                if !self.remote_owns_pointer() && (!self.pointer_in_video || ui_dragging) {
                     return false;
                 }
                 self.input().button(self.owner, code, true);
@@ -3360,10 +3405,11 @@ impl Player {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 self.pointer_in_video = self.pointer_on_video(context);
+                let owns_pointer = self.remote_owns_pointer();
                 if self.switching()
                     || dragging
                     || self.local_input_blocked
-                    || !self.pointer_in_video
+                    || (!owns_pointer && !self.pointer_in_video)
                     || context.dragged_id().is_some()
                 {
                     return false;
@@ -3563,6 +3609,15 @@ impl Player {
         let dragging = input.owner_holds_buttons(self.owner);
         if !dragging && !self.pointer_in_video {
             return;
+        }
+        // 远端光标不见了、人还在画面上动鼠标：那就是三维游戏把指针锁走了。遮挡用的
+        // `CURSOR_HIDE_GRACE` 一起要，被控端打字时那种一闪一闪的「隐藏」不算。
+        // （见 `StreamControlHandle::pointer_moved`。）
+        if self
+            .hidden_since
+            .is_some_and(|since| since.elapsed() >= CURSOR_HIDE_GRACE)
+        {
+            self.control().pointer_moved();
         }
         let Some(rect) = self.video_rect else {
             return;
