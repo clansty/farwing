@@ -92,6 +92,17 @@ if command -v git >/dev/null 2>&1 && git -C "$ROOT" rev-parse --git-dir >/dev/nu
 fi
 
 export BUILDDIR CARGO_TARGET_DIR PKGDEST OPENUUYC_LOCAL_SRC="$ROOT"
+
+# 出的是给别人装的包，编译标志必须钉死：环境里只要残留一句 -C target-cpu=native
+# （跑性能对比时很常见），rustc 就会把 AVX-512 / AVX-VNNI 编进连运行时派发都没有的
+# 通用路径，包只能在构建机那一代 CPU 上跑。这里清一遍只是防外面传进来的：
+# /etc/makepkg.conf.d/rust.conf 会在 makepkg 启动时重新 export 它自己的 RUSTFLAGS，
+# 真起作用的那次覆盖在 PKGBUILD 的 build() 里。
+if [[ -n ${RUSTFLAGS:-}${CARGO_ENCODED_RUSTFLAGS:-}${CARGO_BUILD_RUSTFLAGS:-} ]]; then
+  warn "忽略继承来的编译标志（${RUSTFLAGS:-}${CARGO_ENCODED_RUSTFLAGS:-}${CARGO_BUILD_RUSTFLAGS:-}）"
+fi
+unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS
+
 cd "$SCRIPT_DIR"
 
 info "开始打包（BUILDDIR=${BUILDDIR}）"

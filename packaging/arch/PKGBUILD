@@ -125,6 +125,15 @@ pkgver() {
 
 build() {
   cd "$(_src_dir)"
+  # 这个包是要发给别人装的，编译器标志不能跟着本机走：makepkg.conf 里 CFLAGS 一旦是
+  # -march=native，cc-rs / cmake 编出来的内建 C 代码（静态 libopus、NetEq）就只认构建机
+  # 的 CPU，在别人的 v4 机器上照样 SIGILL。
+  export CFLAGS="-O2 -march=x86-64-v3 -mtune=generic"
+  export CXXFLAGS="$CFLAGS"
+  # 同理，而且必须在这里覆盖：/etc/makepkg.conf.d/rust.conf 把 RUSTFLAGS 钉成
+  # `-C opt-level=3 -C target-cpu=native`，那是在 makepkg 启动时 export 的，外面
+  # （build.sh 或命令行）传什么都拦不住，只有 build() 里再 export 一次才盖得住。
+  export RUSTFLAGS="-C target-cpu=x86-64-v3"
   # 与 .github/workflows/linux-deb.yml 一致；CARGO_TARGET_DIR 由调用方决定，
   # 不在这里写死，本地构建才能复用工作树自己的 target/。
   cargo build --release --locked --bin OpenUUYC
