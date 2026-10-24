@@ -22,6 +22,7 @@ usage() {
 
   -i, --install    打出后立刻 sudo pacman -U 装上
   -s, --syncdeps   缺构建依赖时用 sudo pacman -S 补上（透传给 makepkg）
+  -n, --noconfirm  不向 makepkg 确认任何事，CI 里必须带（否则装依赖那步会等人）
   -I, --isolated   不碰工作树的 target/，另起目录全量编译（很慢，第一次要
                    一二十分钟）；默认复用工作树的 target/ 做增量
   -h, --help       显示本帮助
@@ -43,6 +44,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -i | --install) install_pkg=true ;;
     -s | --syncdeps) makepkg_flags+=(--syncdeps) ;;
+    -n | --noconfirm) makepkg_flags+=(--noconfirm) ;;
     -I | --isolated) isolated=true ;;
     -h | --help)
       usage

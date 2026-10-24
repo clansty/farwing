@@ -2,7 +2,7 @@ name: Linux deb
 
 on:
   push:
-    branches: [main, linux-port]
+    branches: [main, linux-port, clansty]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:

@@ -1,0 +1,49 @@
+name: Windows
+
+on:
+  push:
+    branches: [main, linux-port, clansty]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `cargo dist`（xtask 的别名）自己做完三件事：编原生 OpenUUYC.exe、编 packaging 里
+      # 那个带 zstd payload 的自解压 launcher、再校验内嵌清单与 `--version` 启动握手。
+      # 产物是 target/dist/OpenUUYC-v<版本>-windows-x86_64.exe，也就是发布用的单文件。
+      # 整条链路只能在 Windows 上跑（xtask 与 packaging/build.rs 都用了 std::os::windows），
+      # 所以 Windows 的产物必须由这台 runner 出，Linux 交叉出来的没有这层外壳。
+      - name: Build
+        run: cargo dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: openuuyc-windows
+          path: target/dist/*.exe
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: openuuyc-windows
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: "*.exe"

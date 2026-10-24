@@ -1,0 +1,61 @@
+name: Arch
+
+on:
+  push:
+    branches: [main, linux-port, clansty]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  arch:
+    # Arch 容器里打，才能拿到跟用户一致的 makepkg 与系统库版本。
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # pkgver() 靠 `git describe --exact-match` 判断是不是在 tag 上：
+          # 浅克隆既没有 tag 也没有历史，版本号会退化成 .r<0>.g<hash>。
+          fetch-depth: 0
+
+      - name: Install build tools
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel rust clang cmake nasm git pkgconf sudo
+
+      - name: Build package
+        run: |
+          # makepkg 拒绝以 root 运行，容器里又只有 root，所以另起一个构建用户。
+          # --syncdeps 用它的 sudo 去装 PKGBUILD 里列出的 depends/makedepends。
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' >/etc/sudoers.d/builder
+          chown -R builder .
+          sudo -u builder env OPENUUYC_LOCAL_SRC="$PWD" ./packaging/arch/build.sh --syncdeps --noconfirm
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: openuuyc-arch
+          path: |
+            target/arch/*.pkg.tar.zst
+            target/arch/*.pkg.tar.zst.sha256
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: arch
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: openuuyc-arch
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            *.pkg.tar.zst
+            *.pkg.tar.zst.sha256
