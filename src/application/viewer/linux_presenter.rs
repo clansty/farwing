@@ -3622,15 +3622,11 @@ impl Player {
         if !dragging && !self.pointer_in_video {
             return;
         }
-        // 远端光标不见了、人还在画面上动鼠标：那就是三维游戏把指针锁走了。遮挡用的
-        // `CURSOR_HIDE_GRACE` 一起要，被控端打字时那种一闪一闪的「隐藏」不算。
+        // 远端光标不见了、人还在画面上动鼠标：那就是三维游戏把指针锁走了。立刻切，
+        // 不等遮挡用的 `CURSOR_HIDE_GRACE`——游戏里开一次背包（指针交还、光标又出现）
+        // 再关上，那半秒的延迟正好落在「已经在转视角」的时候，指针会乱跳。
         // （见 `StreamControlHandle::pointer_moved`。）
-        if self
-            .hidden_since
-            .is_some_and(|since| since.elapsed() >= CURSOR_HIDE_GRACE)
-        {
-            self.control().pointer_moved();
-        }
+        self.control().pointer_moved();
         let Some(rect) = self.video_rect else {
             return;
         };
