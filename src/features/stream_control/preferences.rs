@@ -130,4 +130,11 @@ impl StreamControlHandle {
             self.publish_device_preferences(&mut state);
         }
     }
+    pub(crate) fn set_fullscreen_toolbar(&self, enabled: bool) {
+        let mut state = lock(&self.shared);
+        if state.device_preferences.fullscreen_toolbar != enabled {
+            state.device_preferences.fullscreen_toolbar = enabled;
+            self.publish_device_preferences(&mut state);
+        }
+    }
 }

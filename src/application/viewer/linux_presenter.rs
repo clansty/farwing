@@ -1643,6 +1643,7 @@ struct Player {
     stream_control_ui: StreamControlUi,
     performance_mode: PerformancePanelMode,
     intercept_shortcuts: bool,
+    fullscreen_toolbar: bool,
     current: Option<DecodedVideoFrame>,
     video_size: Option<(u32, u32, u16)>,
     /// Content area of the last frame, used to map pointer positions.
@@ -1762,6 +1763,7 @@ impl Player {
             stream_control_ui: StreamControlUi::default(),
             performance_mode: PerformancePanelMode::Compact,
             intercept_shortcuts: true,
+            fullscreen_toolbar: true,
             current: None,
             video_size: None,
             video_rect: None,
@@ -2412,8 +2414,10 @@ impl Player {
         // push the first rows of the picture underneath it.
         let content = ui.available_rect_before_wrap();
         // 全屏时标题栏整条不画，操作栏改由浮条承担（见 `show_fullscreen_chrome`）。
-        self.fullscreen_chrome.sync(window.fullscreen().is_some());
-        if window.fullscreen().is_some() {
+        // 关掉「全屏工具栏」之后连浮条也没有，全屏只剩画面。
+        let floating = window.fullscreen().is_some() && self.fullscreen_toolbar;
+        self.fullscreen_chrome.sync(floating);
+        if floating {
             self.show_fullscreen_chrome(ui.ctx(), window);
         }
         self.video_rect = None;
@@ -2451,10 +2455,12 @@ impl Player {
         let preferences = self.session.stream_control.device_preferences();
         self.performance_mode = preferences.performance_mode;
         self.intercept_shortcuts = preferences.intercept_shortcuts;
+        self.fullscreen_toolbar = preferences.fullscreen_toolbar;
         let mut view = super::stream_menu::LocalViewSettings {
             performance_mode: self.performance_mode,
             performance_always_visible: preferences.performance_always_visible,
             intercept_shortcuts: self.intercept_shortcuts,
+            fullscreen_toolbar: self.fullscreen_toolbar,
             send_ctrl_alt_del: false,
         };
         let screen_id = self.session.screen_id();
@@ -2482,6 +2488,12 @@ impl Player {
             self.session
                 .stream_control
                 .set_intercept_shortcuts(view.intercept_shortcuts);
+        }
+        if self.fullscreen_toolbar != view.fullscreen_toolbar {
+            self.fullscreen_toolbar = view.fullscreen_toolbar;
+            self.session
+                .stream_control
+                .set_fullscreen_toolbar(view.fullscreen_toolbar);
         }
         if view.send_ctrl_alt_del {
             let _ = self

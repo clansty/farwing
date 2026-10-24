@@ -69,6 +69,7 @@ pub(super) struct LocalViewSettings {
     pub performance_mode: super::PerformancePanelMode,
     pub performance_always_visible: bool,
     pub intercept_shortcuts: bool,
+    pub fullscreen_toolbar: bool,
     pub send_ctrl_alt_del: bool,
 }
 
@@ -161,6 +162,15 @@ fn switch_row(ui: &mut egui::Ui, label: &str, value: &mut bool) -> egui::Respons
         egui::Rect::from_center_size(row.right_center() - vec2(8.0 + size.x / 2.0, 0.0), size);
     crate::ui::controls::paint_switch(ui, rect, *value);
     response
+}
+
+/// 关掉全屏工具栏之后，退出全屏只剩快捷键一条路，所以把当前绑定写在开关下面。
+fn fullscreen_shortcut_hint() -> String {
+    use crate::application::viewer_shortcuts::{self, Action};
+    viewer_shortcuts::binding_label(Action::Fullscreen).map_or_else(
+        || "尚未绑定全屏快捷键，关闭后退出不了全屏".to_owned(),
+        |label| format!("退出全屏：{label}"),
+    )
 }
 
 fn speaker_button(ui: &mut egui::Ui, volume: u8, muted: &mut bool) {
@@ -986,6 +996,13 @@ crate::ui::controls::observe_notice(ui.ctx(), "audio-output-disconnected", "音�
                                 }
                                 switch_row(ui, "拦截本机快捷键", &mut view.intercept_shortcuts)
                                     .on_hover_text("为此设备保存，同一设备的播放窗口共用。开启后，控制时优先将按键交给远端；关闭后允许本机快捷键响应。播放器自身快捷键始终保留。");
+                                switch_row(ui, "全屏工具栏", &mut view.fullscreen_toolbar)
+                                    .on_hover_text("关闭后全屏不再浮出顶部横条与操作栏，只剩画面；进出全屏都靠快捷键");
+                                ui.label(
+                                    RichText::new(fullscreen_shortcut_hint())
+                                        .size(crate::ui::theme::SMALL)
+                                        .color(MUTED),
+                                );
                                 let clipboard = handle.clipboard();
                                 let input=handle.microphone().selected_input();
                                 let devices=handle.microphone().input_devices();

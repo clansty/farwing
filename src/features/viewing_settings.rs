@@ -44,6 +44,9 @@ pub(crate) struct DevicePreferences {
     pub performance_mode: PerformancePanelMode,
     #[serde(skip_serializing_if = "is_true")]
     pub performance_always_visible: bool,
+    /// 全屏时是否浮出操作栏；关掉之后全屏只剩画面，进出全屏只靠快捷键。
+    #[serde(skip_serializing_if = "is_true")]
+    pub fullscreen_toolbar: bool,
 }
 fn is_true(value: &bool) -> bool {
     *value
@@ -62,6 +65,7 @@ impl Default for DevicePreferences {
             mouse_throttle_rate: Default::default(),
             performance_mode: PerformancePanelMode::Compact,
             performance_always_visible: true,
+            fullscreen_toolbar: true,
         }
     }
 }

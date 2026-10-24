@@ -67,6 +67,7 @@ pub(in crate::application::viewer) struct ThreadedWindowsApp {
     pub(in crate::application::viewer) egui_winit: egui_winit::State,
     pub(in crate::application::viewer) performance_mode: PerformancePanelMode,
     pub(in crate::application::viewer) intercept_shortcuts: bool,
+    pub(in crate::application::viewer) fullscreen_toolbar: bool,
     pub(in crate::application::viewer) startup_backdrop: Option<ConnectionProgressApp>,
     pub(in crate::application::viewer) last_window_size: PhysicalSize<u32>,
     pub(in crate::application::viewer) pending_aspect_size: Option<PhysicalSize<u32>>,
@@ -184,6 +185,7 @@ impl ThreadedWindowsApp {
             egui_winit: connecting.egui_winit,
             performance_mode: preferences.performance_mode,
             intercept_shortcuts: preferences.intercept_shortcuts,
+            fullscreen_toolbar: preferences.fullscreen_toolbar,
             startup_backdrop: Some(connecting.progress),
             last_window_size: window.inner_size(),
             pending_aspect_size: None,
@@ -309,7 +311,9 @@ impl ThreadedWindowsApp {
                     .is_none()
                     .then(|| winit::window::Fullscreen::Borderless(window.current_monitor()));
                 set_fullscreen(window, fullscreen);
-                self.fullscreen_chrome.sync(window.fullscreen().is_some());
+                // 关掉「全屏工具栏」后全屏只有画面，浮条不参与同步。
+                self.fullscreen_chrome
+                    .sync(window.fullscreen().is_some() && self.fullscreen_toolbar);
                 // A maximized window may keep the same outer size. Update
                 // the video origin even if no size-change event follows.
                 self.resize_targets(window, window.inner_size())?;
@@ -339,6 +343,7 @@ impl ThreadedWindowsApp {
             self.mouse.release(window);
             self.intercept_shortcuts = preferences.intercept_shortcuts;
         }
+        self.fullscreen_toolbar = preferences.fullscreen_toolbar;
     }
 
     pub(super) fn refresh_mouse(&mut self, window: &Window, event_loop: &ActiveEventLoop) {
@@ -481,17 +486,20 @@ impl ThreadedWindowsApp {
                 .device_preferences()
                 .performance_always_visible,
             intercept_shortcuts: self.intercept_shortcuts,
+            fullscreen_toolbar: self.fullscreen_toolbar,
             send_ctrl_alt_del: false,
         };
         let mut chrome_action = PlayerChromeAction::default();
         let fullscreen = window.fullscreen().is_some();
-        self.fullscreen_chrome.sync(fullscreen);
+        // 关掉「全屏工具栏」之后全屏只剩画面，浮条与它的让位都不出现。
+        let floating = fullscreen && self.fullscreen_toolbar;
+        self.fullscreen_chrome.sync(floating);
         let mut resize = None;
         let resize_aspect = self.current_presentation_size();
         let plugin_video_size = self.current_presentation_size();
         let output = self.egui_context.run_ui(input, |ui| {
             let ctx = ui.ctx().clone();
-            if fullscreen {
+            if floating {
                 chrome_action = self.fullscreen_chrome.show(
                     &ctx,
                     PlayerTitleBar {
@@ -505,7 +513,7 @@ impl ThreadedWindowsApp {
                         move_state: None,
                     },
                 );
-            } else {
+            } else if !fullscreen {
                 resize =
                     borderless_resize(ui, window, Some((&mut self.window_resize, resize_aspect)));
                 title_bar_panel(
@@ -634,6 +642,12 @@ impl ThreadedWindowsApp {
             self.intercept_shortcuts = view.intercept_shortcuts;
             self.stream_control
                 .set_intercept_shortcuts(view.intercept_shortcuts);
+        }
+        if self.fullscreen_toolbar != view.fullscreen_toolbar {
+            self.fullscreen_toolbar = view.fullscreen_toolbar;
+            self.stream_control
+                .set_fullscreen_toolbar(view.fullscreen_toolbar);
+            window.request_redraw();
         }
         if view.send_ctrl_alt_del && window.has_focus() {
             self.mouse.release(window);

@@ -184,9 +184,12 @@ pub(crate) fn match_key(key: u16, modifiers: u8) -> Option<Action> {
         .into_iter()
         .find(|a| s.bindings[a.index()] == Some(Binding { key, modifiers }))
 }
+/// 已绑定时给出可显示的组合键，未绑定时为 `None`。
+pub(crate) fn binding_label(action: Action) -> Option<String> {
+    Settings::unpack(revision()).bindings[action.index()].map(Binding::label)
+}
 pub(crate) fn label(action: Action) -> String {
-    Settings::unpack(revision()).bindings[action.index()]
-        .map_or_else(|| "未绑定".into(), Binding::label)
+    binding_label(action).unwrap_or_else(|| "未绑定".into())
 }
 pub(crate) fn capture_active() -> bool {
     let owner = runtime().capture.load(Ordering::Acquire);
