@@ -17,6 +17,7 @@ use anyhow::{Context as _, Result, bail, ensure};
 use ffmpeg_sys_next as ff;
 use std::ffi::CString;
 use std::ptr;
+use std::time::{Duration, Instant};
 
 /// `AVERROR(EAGAIN)`：这一次没有数据可取，下一帧再试。
 const EAGAIN: i32 = -ff::EAGAIN;
@@ -25,6 +26,17 @@ const EOF: i32 = -0x2046_4f45;
 /// VA-API 编码器 `rc_mode` 的 VBR。这个枚举只在编码器的 C 源码里，头文件里没有，
 /// 所以只能写字面量（见 `ffmpeg -h encoder=h264_vaapi`）。
 const VBR: i64 = 3;
+
+/// 换一次码率的代价是整上下文重开：一个 IDR 加一次码率控制冷启动。共享控制器
+/// 那条 5%/5Mbps 的门槛是给能原地重配的后端（NVENC 的 ReconfigureEncoder、AMF
+/// 与 QSV 的属性）定的；在 VA-API 上照搬，低带宽的估计抖动会一直触发重开，画面
+/// 就卡在「糊 → 慢慢清晰 → 立刻又糊」。所以这里自己加两道闸：相对死区，和两次
+/// 重开之间的最短间隔。
+const RECONFIGURE_DEADBAND: u64 = 15;
+const RECONFIGURE_INTERVAL: Duration = Duration::from_secs(2);
+/// 码率明显下跌时不等待：等下去就是拿超额码流继续压拥塞。
+const URGENT_DROP: u64 = 25;
+const URGENT_INTERVAL: Duration = Duration::from_millis(500);
 
 fn check(code: i32, what: &str) -> Result<()> {
     ensure!(code >= 0, "{what}失败（libavcodec {code}）");
@@ -59,8 +71,12 @@ unsafe fn open_context(
         num: rate.fps.max(1) as i32,
         den: 1,
     };
-    // 一个 GOP 就是一秒：库自己会在该发 IDR 的时候发，不用我们数。
-    (*context).gop_size = rate.fps.max(1) as i32;
+    // 关键帧不按 GOP 来。Windows 各后端都把自动 IDR 关掉了（NVENC 的 gopLength /
+    // idrPeriod 是 u32::MAX、AMF 的 IDRPeriod 是 0、QSV 不设 GopPicSize），只在
+    // 对端丢包反馈、换码率与重建时发。按 fps 每秒插一个 IDR，小带宽下这一帧就能把
+    // VBV 打爆，之后十几帧被码率控制压到极低质量——用户看到的是「糊 → 慢慢清晰 →
+    // 立刻又糊」。留一小时一个只是兜底，免得长跑漂移永远等不到复位。
+    (*context).gop_size = (rate.fps.max(1).saturating_mul(3600)) as i32;
     (*context).max_b_frames = 0;
     (*context).bit_rate = i64::from(rate.target.max(1));
     (*context).hw_frames_ctx = ff::av_buffer_ref(frames);
@@ -97,6 +113,8 @@ pub(crate) struct Encoder {
     rate: Rate,
     frame_rate: crate::media::encoding::rate::Controller,
     force_keyframe: bool,
+    /// 上一次真的重开编码上下文的时间；`None` 表示还没重开过。
+    reconfigured_at: Option<Instant>,
 }
 
 /// 支持的格式：8 位 4:2:0，其余的交给它自己的探测决定。
@@ -189,6 +207,7 @@ impl Encoder {
                 rate,
                 frame_rate: crate::media::encoding::rate::Controller::new(rate),
                 force_keyframe: true,
+                reconfigured_at: None,
             })
         }
     }
@@ -242,6 +261,10 @@ impl Encoder {
         let Some(update) = self.frame_rate.decide(rate) else {
             return Ok(false);
         };
+        if !update.control_changed && !self.reconfigure_worthwhile(&update) {
+            // 不提交这次决定：下一帧还会拿同一份反馈重算，等变化攒够或间隔到了再动。
+            return Ok(false);
+        }
         let previous = self.rate;
         self.rate = update.rate;
         if let Err(error) = self.reopen() {
@@ -250,8 +273,14 @@ impl Encoder {
             self.rate = previous;
             return Err(error);
         }
+        self.reconfigured_at = Some(Instant::now());
         self.frame_rate.commit(update);
         Ok(true)
+    }
+
+    /// 这次重开值不值：相对变化要过死区，且离上次重开够久。码率明显下跌时不等待。
+    fn reconfigure_worthwhile(&self, update: &crate::media::encoding::rate::Update) -> bool {
+        worth_reconfiguring(self.rate, update.rate, self.reconfigured_at)
     }
 
     /// 换一套码率，办法是把编码上下文重开一遍——`open_context` 上面说明了为什么
@@ -407,6 +436,23 @@ fn device() -> *mut ff::AVBufferRef {
     })
 }
 
+/// 这次重开值不值：相对变化要过死区，且离上次重开够久。码率明显下跌时不等待。
+fn worth_reconfiguring(before: Rate, after: Rate, since: Option<Instant>) -> bool {
+    let moved = |from: u32, to: u32| {
+        u64::from(from.abs_diff(to)) * 100 >= u64::from(from.max(to).max(1)) * RECONFIGURE_DEADBAND
+    };
+    if !moved(before.target, after.target) && !moved(before.peak, after.peak) {
+        return false;
+    }
+    let urgent = u64::from(after.target) * 100 < u64::from(before.target) * (100 - URGENT_DROP);
+    let interval = if urgent {
+        URGENT_INTERVAL
+    } else {
+        RECONFIGURE_INTERVAL
+    };
+    since.is_none_or(|at| at.elapsed() >= interval)
+}
+
 /// 码率控制：平均按 `target`、峰值按 `peak`，与 NVENC 那一侧同一个说法。
 ///
 /// Safe as long as `context` is a live context of this encoder.
@@ -436,6 +482,34 @@ fn burned_cpu() -> f64 {
 mod tests {
     use super::*;
     use crate::media::encoding::{Codec, QualityTarget};
+
+    /// 小带宽下估计值每秒都在抖，抖一下就要重开一次上下文——那是一个 IDR 加一次
+    /// 码率控制冷启动，画面就成了「糊 → 慢慢清晰 → 立刻又糊」。所以变化要攒够，
+    /// 且两次重开之间要隔开；只有明显下跌不等待。
+    #[test]
+    fn only_large_bitrate_changes_reopen_the_encoder() {
+        let rate = |target: u32| Rate {
+            target,
+            peak: target,
+            fps: 30,
+            quality: 1,
+            quality_target: QualityTarget {
+                bitrate: target,
+                fps: 30,
+            },
+        };
+        let just_now = Some(Instant::now());
+        let half_second_ago = Some(Instant::now() - Duration::from_millis(600));
+        let worth = worth_reconfiguring;
+        // 5% 的抖动不值得重开，攒到 17% 才动。
+        assert!(!worth(rate(4_000_000), rate(4_200_000), None));
+        assert!(worth(rate(4_000_000), rate(3_300_000), None));
+        // 刚重开过：同样的变化先等着，只有明显下跌不等待。
+        assert!(!worth(rate(4_000_000), rate(5_000_000), just_now));
+        assert!(!worth(rate(4_000_000), rate(2_000_000), just_now));
+        assert!(!worth(rate(4_000_000), rate(3_300_000), half_second_ago));
+        assert!(worth(rate(4_000_000), rate(2_000_000), half_second_ago));
+    }
 
     /// 中途把 `configure_rate` 抬上去，编码器到底跟不跟：`vaapi_encode_init_rate_control`
     /// 只在 `avcodec_open2` 里跑一次（它把算好的码率存进私有上下文，之后不再看
