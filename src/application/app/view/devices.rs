@@ -38,13 +38,28 @@ impl ListUi {
     pub(super) fn clear_tags(&mut self) {
         self.tags.clear();
     }
-    fn toggle_tag(&mut self, tag: &str) {
-        match self.tags.iter().position(|existing| existing == tag) {
-            Some(index) => {
-                self.tags.remove(index);
-            }
-            None => self.tags.push(tag.to_owned()),
+    /// 点标签按钮：已选中的再点一下就是取消；没选过的，如果它和已选标签还有共同的设备
+    /// 就叠加过滤，否则叠起来必定是空列表，那就把已选的全清掉、只留这一个。
+    fn click_tag(&mut self, tag: &str, rows: Option<&[Entry]>, store: Option<&tags::Store>) {
+        if let Some(index) = self.tags.iter().position(|existing| existing == tag) {
+            self.tags.remove(index);
+            return;
         }
+        // 清单还没读回来时无从判断有没有交集，按新增处理。
+        let has_overlap = match rows {
+            Some(rows) if !self.tags.is_empty() => rows.iter().any(|entry| {
+                let device_tags =
+                    store.map_or(&[][..], |store| store.tags(&entry.device.device_id));
+                std::iter::once(tag)
+                    .chain(self.tags.iter().map(String::as_str))
+                    .all(|wanted| device_tags.iter().any(|existing| existing == wanted))
+            }),
+            _ => true,
+        };
+        if !has_overlap {
+            self.tags.clear();
+        }
+        self.tags.push(tag.to_owned());
     }
 }
 
@@ -260,6 +275,8 @@ impl DeviceCenterApp {
         // 状态和标签同一行；标签多的账号这里会自然折到第二行。
         let active_tags = self.center_ui.device_lists[index].tags.clone();
         let tag_counts = self.tag_counts(rows.as_deref(), &active_tags);
+        let tag_rows = rows.as_deref();
+        let tag_store = self.tags.as_ref();
         let state = &mut self.center_ui.device_lists[index];
         ui.horizontal_wrapped(|ui| {
             for (filter, label, n) in [
@@ -277,7 +294,7 @@ impl DeviceCenterApp {
                         .selectable_label(picked, format!("#{tag}  {n}"))
                         .clicked()
                     {
-                        state.toggle_tag(tag);
+                        state.click_tag(tag, tag_rows, tag_store);
                     }
                 }
                 if !state.tags.is_empty() && ui.button("清除标签").clicked() {
