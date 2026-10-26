@@ -164,6 +164,7 @@ pub(crate) fn run_connecting_viewer_window(
     progress: std_mpsc::Receiver<ConnectionProgress>,
     session: std_mpsc::Receiver<ViewerWindowEvent>,
     display_sender: oneshot::Sender<ViewerDisplayHandle>,
+    retry: Option<RetrySender>,
 ) -> Result<()> {
     {
         presenter::run_connecting(presenter::ConnectingWindowsRunConfig {
@@ -171,9 +172,24 @@ pub(crate) fn run_connecting_viewer_window(
             progress,
             session,
             display_sender,
+            retry,
         })
     }
 }
+
+/// 断开后窗口给用户的两条路：马上重来一次，或者放弃。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RetryRequest {
+    Retry,
+    Dismiss,
+}
+
+/// 每个连接界面对应一条重试通道。界面一放下（换成播放器、关掉窗口），
+/// 这条通道就没有发送端了，连接任务据此判断错误还有没有人看得见。
+pub(crate) type RetrySender = mpsc::UnboundedSender<RetryRequest>;
+
+/// 断开后自动重试的间隔：按钮上的倒计时走完就自己再来一次。
+pub(crate) const AUTO_RETRY_DELAY: Duration = Duration::from_secs(15);
 
 pub(crate) enum ViewerWindowEvent {
     Close,
@@ -184,6 +200,7 @@ pub(crate) enum ViewerWindowEvent {
         window: Option<winit::window::WindowId>,
         progress: std_mpsc::Receiver<ConnectionProgress>,
         display: oneshot::Sender<ViewerDisplayHandle>,
+        retry: Option<RetrySender>,
     },
 }
 
@@ -197,6 +214,12 @@ pub(super) struct ConnectionProgressApp {
     background: Option<crate::application::wallpaper::Source>,
     wallpapers: crate::application::wallpaper::Wallpapers,
     update_started: Option<Instant>,
+    /// 断开后能把「重试」送回去的入口；独立屏窗口这类没有连接可重来的界面是 `None`。
+    retry: Option<RetrySender>,
+    /// 自动重试的到点时间，失败界面出现时开始计时。
+    retry_at: Option<Instant>,
+    /// 这次失败已经发出过重试，别再重复发。
+    retry_sent: bool,
 }
 
 impl ConnectionProgressApp {
@@ -212,6 +235,76 @@ impl ConnectionProgressApp {
             background: None,
             wallpapers: Default::default(),
             update_started: None,
+            retry: None,
+            retry_at: None,
+            retry_sent: false,
+        }
+    }
+
+    pub(super) fn with_retry(mut self, retry: Option<RetrySender>) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    /// 按钮上的倒计时秒数；`None` 表示这个窗口不会自动重试。
+    fn retry_seconds(&self) -> Option<u64> {
+        self.retry_at.map(|at| {
+            at.saturating_duration_since(Instant::now())
+                .as_secs_f64()
+                .ceil() as u64
+        })
+    }
+
+    /// 告诉连接任务：马上重来，或者用户已经放弃。
+    fn request_retry(&mut self, request: RetryRequest) {
+        if request == RetryRequest::Retry {
+            self.retry_sent = true;
+            // 已经发出去了，倒计时留在按钮上会让人以为还能再点一次。
+            self.retry_at = None;
+        }
+        if let Some(retry) = &self.retry {
+            let _ = retry.send(request);
+        }
+    }
+
+    /// 失败界面上的倒计时到点就自己重试一次。
+    fn countdown_expired(&mut self) {
+        if self.retry_sent
+            || self.retry.is_none()
+            || !matches!(self.current.state, ConnectionProgressState::Failed)
+        {
+            return;
+        }
+        if self.retry_at.is_some_and(|at| Instant::now() >= at) {
+            self.request_retry(RetryRequest::Retry);
+        }
+    }
+
+    /// 失败界面的两条路：马上重来（倒计时写在按钮上），或者关掉窗口。
+    fn draw_failure_actions(&mut self, ui: &mut egui::Ui, failed: bool) {
+        if failed && self.retry.is_some() {
+            let label = self.retry_seconds().map_or_else(
+                || "立即重试".to_owned(),
+                |seconds| format!("立即重试（{seconds} 秒）"),
+            );
+            if ui.add(crate::ui::controls::primary(&label)).clicked() {
+                self.request_retry(RetryRequest::Retry);
+                ui.ctx().request_repaint();
+            }
+            ui.add_space(6.0);
+        }
+        if ui
+            .add(crate::ui::controls::secondary(if failed {
+                "关闭窗口"
+            } else {
+                "取消连接"
+            }))
+            .clicked()
+        {
+            if failed {
+                self.request_retry(RetryRequest::Dismiss);
+            }
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
@@ -219,7 +312,12 @@ impl ConnectionProgressApp {
         while let Ok(mut progress) = self.receiver.try_recv() {
             match progress.state {
                 ConnectionProgressState::Updating(started) => self.update_started = Some(started),
-                ConnectionProgressState::Failed => self.update_started = None,
+                ConnectionProgressState::Failed => {
+                    self.update_started = None;
+                    // 错误摆在界面上的同时开始自动重试的倒计时。
+                    self.retry_at = Some(Instant::now() + AUTO_RETRY_DELAY);
+                    self.retry_sent = false;
+                }
                 _ => {}
             }
             if let Some(source) = progress.background.take() {

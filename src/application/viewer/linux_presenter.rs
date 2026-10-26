@@ -51,6 +51,7 @@ pub(crate) struct ConnectingWindowsRunConfig {
     pub progress: std_mpsc::Receiver<ConnectionProgress>,
     pub session: std_mpsc::Receiver<ViewerWindowEvent>,
     pub display_sender: tokio::sync::oneshot::Sender<ViewerDisplayHandle>,
+    pub retry: Option<super::RetrySender>,
 }
 
 pub(super) fn run(session: NativeViewerSession) -> Result<()> {
@@ -69,6 +70,7 @@ pub(super) fn run(session: NativeViewerSession) -> Result<()> {
             progress: std_mpsc::channel().1,
             session: receiver,
             display_sender: tokio::sync::oneshot::channel().0,
+            retry: None,
         },
         false,
     )
@@ -108,6 +110,8 @@ pub(crate) struct ConnectingWindowsRunner {
     alias: String,
     attributes: WindowAttributes,
     progress: Option<std_mpsc::Receiver<ConnectionProgress>>,
+    /// 拿走连接界面的重试入口；每次换界面都交给新的那一个。
+    retry: Option<super::RetrySender>,
     session: std_mpsc::Receiver<ViewerWindowEvent>,
     display_sender: Option<tokio::sync::oneshot::Sender<ViewerDisplayHandle>>,
     window: Option<Arc<Window>>,
@@ -173,6 +177,7 @@ impl ConnectingWindowsRunner {
                 .with_min_inner_size(LogicalSize::new(760.0, 520.0)),
             alias: config.alias.clone(),
             progress: Some(config.progress),
+            retry: config.retry,
             session: config.session,
             display_sender: needs_display.then_some(config.display_sender),
             window: None,
@@ -267,10 +272,10 @@ impl ConnectingWindowsRunner {
             let _ = sender.send(ViewerDisplayHandle::default());
         }
         if let Some(receiver) = self.progress.take() {
-            self.stage = Stage::Connecting(Box::new(ConnectionProgressApp::new(
-                self.alias.clone(),
-                receiver,
-            )));
+            self.stage = Stage::Connecting(Box::new(
+                ConnectionProgressApp::new(self.alias.clone(), receiver)
+                    .with_retry(self.retry.take()),
+            ));
         }
         self.window = Some(window);
         Ok(())
@@ -415,6 +420,7 @@ impl ConnectingWindowsRunner {
                     window: _,
                     progress,
                     display,
+                    retry,
                 } => {
                     self.close_detached_all();
                     self.screens = None;
@@ -431,8 +437,9 @@ impl ConnectingWindowsRunner {
                     if let Some(shell) = self.shell.as_mut() {
                         shell.presenter.clear_video();
                     }
-                    self.stage =
-                        Stage::Connecting(Box::new(ConnectionProgressApp::new(alias, progress)));
+                    self.stage = Stage::Connecting(Box::new(
+                        ConnectionProgressApp::new(alias, progress).with_retry(retry),
+                    ));
                 }
             }
         }

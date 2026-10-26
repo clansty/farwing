@@ -6,7 +6,7 @@ use super::{
 };
 use crate::account::client::AuthenticatedClient;
 use crate::application::viewer::{
-    ConnectionProgress, NativeViewerSession, ViewerDisplayHandle, ViewerWindowEvent,
+    ConnectionProgress, NativeViewerSession, RetryRequest, ViewerDisplayHandle, ViewerWindowEvent,
     run_connecting_viewer_window,
 };
 use crate::media::ConnectionMediaOptions;
@@ -113,6 +113,8 @@ pub(super) async fn run_viewer_window(
     });
     let task_cancel = cancel.clone();
     let terminal_sender = viewer_sender.clone();
+    // 断开后界面上的「立即重试」走这条通道回来；界面一放下它就断开。
+    let (retry_sender, retry_receiver) = tokio::sync::mpsc::unbounded_channel();
     let connection_task = tokio::spawn(async move {
         let mut reporter = reporter;
         let result = run_viewer_connection_owner(
@@ -132,6 +134,7 @@ pub(super) async fn run_viewer_window(
             },
             &task_cancel,
             &mut reporter,
+            retry_receiver,
         )
         .await;
         if !task_cancel.is_cancelled()
@@ -142,6 +145,7 @@ pub(super) async fn run_viewer_window(
                 // the owning UI without presenting a decoder/connection error.
                 let _ = terminal_sender.send(ViewerWindowEvent::Close);
             } else {
+                // 只在没人能显示错误界面时才走到这里，见 `run_viewer_connection_owner`。
                 reporter(ConnectionProgress::failed(format!("{error:#}")));
             }
         }
@@ -156,12 +160,19 @@ pub(super) async fn run_viewer_window(
                 progress: progress_receiver,
                 session: viewer_receiver,
                 display_sender,
+                retry: Some(retry_sender),
             },
         )
         .await
     } else {
         tokio::task::block_in_place(|| {
-            run_connecting_viewer_window(alias, progress_receiver, viewer_receiver, display_sender)
+            run_connecting_viewer_window(
+                alias,
+                progress_receiver,
+                viewer_receiver,
+                display_sender,
+                Some(retry_sender),
+            )
         })
     };
     cancel.cancel();
@@ -197,6 +208,7 @@ pub(super) async fn run_viewer_connection_owner(
     window: ViewerConnectionWindow,
     cancel: &CancellationToken,
     reporter: &mut ConnectionProgressReporter,
+    retry: tokio::sync::mpsc::UnboundedReceiver<RetryRequest>,
 ) -> Result<()> {
     let ViewerConnectionWindow {
         sender: viewer_sender,
@@ -213,49 +225,64 @@ pub(super) async fn run_viewer_connection_owner(
     let presence_stop = CancellationToken::new();
     let mut presence_task = None;
     let mut account_owner = None;
-    let result = async {
-        let client = if let Some(client)=hosted_client.clone(){client}else{Arc::new(AuthenticatedClient::from_saved_session()?)};
-        account_owner = Some(Arc::clone(&client));
-        let mut resolved = if let Some(request) = assist {
-            cancellable(cancel, assist::resolve(client, &alias, options, request, Some(reporter))).await?
-        } else {
-            cancellable(cancel, resolve_connection_with_client(client, &alias, options, Some(reporter), target_id.as_deref(), takeover, force_takeover)).await?
-        };
-        // Standalone processes keep the host presence room (设备在线状态；
-        // 被控权限开关已从界面移除，不开放被控). The account-ended token
-        // still closes the viewer so a revoked session cannot keep watching.
-        if owns_presence {
-            let client = Arc::clone(&resolved.client);
-            let stop = presence_stop.clone();
-            let cancel = cancel.clone();
-            let sender = viewer_sender.clone();
-            presence_task = Some(tokio::spawn(async move {
-                let ended = client.ended();
-                let presence = crate::session::presence::ActivePresence::start(client);
-                let mut tick = tokio::time::interval(Duration::from_millis(250));
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = ended.cancelled() => {
-                            cancel.cancel();
-                            let _ = sender.send(ViewerWindowEvent::Close);
-                            break;
-                        },
-                        _ = stop.cancelled() => break,
-                        _ = cancel.cancelled() => break,
-                        _ = tick.tick() => {
-                            while let Ok(event) = presence.events.try_recv() {
-                                if let crate::session::presence::PresenceEvent::Warning(message) = event {
-                                    tracing::warn!(%message, "standalone device presence");
+    // 窗口建好时就把显示句柄交了出来：先收下，重试时再透过 Reconnect 换新的。
+    let mut window_display = cancellable(cancel, async {
+        display_receiver.await.context("player display was not created")
+    })
+    .await?;
+    let silent: ConnectionProgressReporter = Arc::new(|_: ConnectionProgress| {});
+    let mut current = std::mem::replace(reporter, silent);
+    // 断开后用户可以在窗口里点重试：整段连接流程要能从头再来一遍。
+    let mut retry = retry;
+    let mut presence_pending = owns_presence;
+    let result = loop {
+        let mut display = std::mem::take(&mut window_display);
+        let attempt: Result<()> = {
+            let reporter = &mut current;
+            async {
+                let client = if let Some(client)=hosted_client.clone(){client}else{Arc::new(AuthenticatedClient::from_saved_session()?)};
+                account_owner = Some(Arc::clone(&client));
+                let mut resolved = if let Some(request) = assist.clone() {
+                    cancellable(cancel, assist::resolve(client, &alias, options, request, Some(reporter))).await?
+                } else {
+                    cancellable(cancel, resolve_connection_with_client(client, &alias, options, Some(reporter), target_id.as_deref(), takeover.clone(), force_takeover)).await?
+                };
+                // Standalone processes keep the host presence room (设备在线状态；
+                // 被控权限开关已从界面移除，不开放被控). The account-ended token
+                // still closes the viewer so a revoked session cannot keep watching.
+                // 重试沿用同一条 presence 房间，不重复进房。
+                if presence_pending {
+                    presence_pending = false;
+                    let client = Arc::clone(&resolved.client);
+                    let stop = presence_stop.clone();
+                    let cancel = cancel.clone();
+                    let sender = viewer_sender.clone();
+                    presence_task = Some(tokio::spawn(async move {
+                        let ended = client.ended();
+                        let presence = crate::session::presence::ActivePresence::start(client);
+                        let mut tick = tokio::time::interval(Duration::from_millis(250));
+                        loop {
+                            tokio::select! {
+                                biased;
+                                _ = ended.cancelled() => {
+                                    cancel.cancel();
+                                    let _ = sender.send(ViewerWindowEvent::Close);
+                                    break;
+                                },
+                                _ = stop.cancelled() => break,
+                                _ = cancel.cancelled() => break,
+                                _ = tick.tick() => {
+                                    while let Ok(event) = presence.events.try_recv() {
+                                        if let crate::session::presence::PresenceEvent::Warning(message) = event {
+                                            tracing::warn!(%message, "standalone device presence");
+                                        }
+                                    }
                                 }
                             }
                         }
-                    }
+                        presence.close().await;
+                    }));
                 }
-                presence.close().await;
-            }));
-        }
-        let mut display = cancellable(cancel, async { display_receiver.await.context("player display was not created") }).await?;
         let (switch_sender, mut switch_receiver) = tokio::sync::mpsc::channel::<crate::application::viewer::device_switch::SwitchRequest>(1);
         let mut retries = 0;
         let mut update_started = None;
@@ -306,7 +333,7 @@ pub(super) async fn run_viewer_connection_owner(
                     if update_attempt && !cancel.is_cancelled() && retry_session_failure(&error) && retries<5 {
                         retries+=1;
                         resolved.refresh_after_upgrade=true;
-                        display=update_reconnect_display(&resolved,reporter,cancel,&viewer_sender,update_started.context("更新等待状态已丢失")?).await?;
+                        display=update_reconnect_display(&resolved,reporter,cancel,&viewer_sender,&mut retry,update_started.context("更新等待状态已丢失")?).await?;
                         cancellable(cancel,async {tokio::time::sleep(crate::features::remote_upgrade::UPDATE_PROBE_INTERVAL).await;Ok(())}).await?;
                         continue;
                     }
@@ -363,13 +390,10 @@ pub(super) async fn run_viewer_connection_owner(
                         let wanted = *modes.borrow_and_update();
                         if wanted == audio_only { continue; }
                         session_control.mouse().disable();
-                        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
-                        let (display_tx, display_rx) = oneshot::channel();
-                        *reporter = Arc::new(move |progress| { let _ = progress_tx.send(progress); });
+                        let (reconnect, display_rx) = window_reconnect(
+                            resolved.summary.alias.clone(), None, reporter, &mut retry);
                         reporter(ConnectionProgress::working(1, if wanted { "切换为仅音频" } else { "恢复画面" }, "正在切换媒体模式"));
-                        viewer_sender.send(ViewerWindowEvent::Reconnect {
-                            alias:resolved.summary.alias.clone(), window:None, progress:progress_rx, display:display_tx,
-                        }).map_err(|_| anyhow!("媒体窗口已关闭"))?;
+                        viewer_sender.send(reconnect).map_err(|_| anyhow!("媒体窗口已关闭"))?;
                         let mode_display = cancellable(cancel, async { display_rx.await.context("媒体窗口未完成切换") }).await?;
                         close = None;
                         let switched = if wanted {
@@ -416,18 +440,14 @@ pub(super) async fn run_viewer_connection_owner(
                                 continue;
                             }
                         };
-                        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
-                        let (display_tx, display_rx) = oneshot::channel();
-                        *reporter = Arc::new(move |progress| { let _ = progress_tx.send(progress); });
+                        let (reconnect, display_rx) = window_reconnect(
+                            next.summary.alias.clone(), Some(request.window), reporter, &mut retry);
                         reporter(ConnectionProgress::working(1, "切换设备", format!("正在连接 {}", next.summary.alias)));
                         if let Some(background)=next.background.clone(){reporter(ConnectionProgress::background(background));}
                         // The UI releases input and joins every old screen/decoder,
                         // retaining the window in which the user selected the device.
                         let replacement = async {
-                            viewer_sender.send(ViewerWindowEvent::Reconnect {
-                                alias: next.summary.alias.clone(), window: Some(request.window),
-                                progress: progress_rx, display: display_tx,
-                            }).map_err(|_| anyhow!("player window closed during device switch"))?;
+                            viewer_sender.send(reconnect).map_err(|_| anyhow!("player window closed during device switch"))?;
                             display_rx.await.context("player did not acknowledge device switch")
                         };
                         let new_display = cancellable(cancel, replacement).await;
@@ -467,7 +487,7 @@ pub(super) async fn run_viewer_connection_owner(
                 resolved.refresh_after_upgrade = true;
                 resolved.takeover = None;
                 retries = 0;
-                display = update_reconnect_display(&resolved,reporter,cancel,&viewer_sender,started).await?;
+                display = update_reconnect_display(&resolved,reporter,cancel,&viewer_sender,&mut retry,started).await?;
                 continue;
             }
             if let Some(upgrade) = &upgrade { upgrade.retire(); }
@@ -476,19 +496,44 @@ pub(super) async fn run_viewer_connection_owner(
                     resolved.preferences = Some(session_control.preferences());
                     resolved.audio_preferences = Some(session_control.audio().settings());
                     retries += 1;
-                    let (progress_tx, progress_rx) = std::sync::mpsc::channel();
-                    let (display_tx, display_rx) = oneshot::channel();
-                    *reporter = Arc::new(move |progress| { let _ = progress_tx.send(progress); });
+                    let (reconnect, display_rx) = window_reconnect(
+                        resolved.summary.alias.clone(), None, reporter, &mut retry);
                     reporter(ConnectionProgress::working(4, "重建观看会话", format!("{error:#}；正在重新加入房间（{retries}/5）")));
                     if let Some(background)=resolved.background.clone(){reporter(ConnectionProgress::background(background));}
-                    viewer_sender.send(ViewerWindowEvent::Reconnect { alias: resolved.summary.alias.clone(), window: None, progress: progress_rx, display: display_tx })
+                    viewer_sender.send(reconnect)
                         .map_err(|_| anyhow!("player window closed during reconnect"))?;
                     display = cancellable(cancel, async { display_rx.await.context("player did not acknowledge room replacement") }).await?;
                 }
                 result => { if let Some(close) = close.as_ref() { close.close(); } return result; }
             }
         }
-    }.await;
+            }
+            .await
+        };
+        break match attempt {
+            // 断线的原因先摆在窗口里，等用户点「立即重试」或者让 15 秒倒计时走完。
+            // 界面已经不在了（换成播放器、关掉窗口）就没人看得见，交回主窗口报。
+            Err(error)
+                if !cancel.is_cancelled()
+                    && !retry.is_closed()
+                    && !room_released(&error)
+                    && error.downcast_ref::<takeover::Required>().is_none() =>
+            {
+                match await_retry(&error, &alias, &viewer_sender, cancel, &mut current, &mut retry)
+                    .await
+                {
+                    Ok(Some(fresh_display)) => {
+                        window_display = fresh_display;
+                        continue;
+                    }
+                    Ok(None) => Ok(()),
+                    Err(error) => Err(error),
+                }
+            }
+            attempt => attempt,
+        };
+    };
+    *reporter = current;
     monitor.send_replace(None);
     presence_stop.cancel();
     if let Some(task) = presence_task {
@@ -506,29 +551,86 @@ pub(super) async fn run_viewer_connection_owner(
     }
 }
 
+/// 窗口里换一个连接界面：新的进度通道和新的重试入口一起交出去，
+/// 旧界面的那条重试通道随它一起作废（界面本来就没人看了）。
+fn window_reconnect(
+    alias: String,
+    window: Option<winit::window::WindowId>,
+    reporter: &mut ConnectionProgressReporter,
+    retry: &mut tokio::sync::mpsc::UnboundedReceiver<RetryRequest>,
+) -> (
+    ViewerWindowEvent,
+    oneshot::Receiver<ViewerDisplayHandle>,
+) {
+    let (retry_tx, retry_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+    let (display_tx, display_rx) = oneshot::channel();
+    *retry = retry_rx;
+    *reporter = Arc::new(move |progress| {
+        let _ = progress_tx.send(progress);
+    });
+    (
+        ViewerWindowEvent::Reconnect {
+            alias,
+            window,
+            progress: progress_rx,
+            display: display_tx,
+            retry: Some(retry_tx),
+        },
+        display_rx,
+    )
+}
+
+/// 断开后把错误留在窗口里，等用户点「立即重试」或者让 15 秒倒计时走完。
+/// 返回 `Some(显示句柄)` 表示该从头连一遍，`None` 表示用户放弃。
+async fn await_retry(
+    error: &anyhow::Error,
+    alias: &str,
+    sender: &std::sync::mpsc::Sender<ViewerWindowEvent>,
+    cancel: &CancellationToken,
+    reporter: &mut ConnectionProgressReporter,
+    retry: &mut tokio::sync::mpsc::UnboundedReceiver<RetryRequest>,
+) -> Result<Option<ViewerDisplayHandle>> {
+    reporter(ConnectionProgress::failed(format!("{error:#}")));
+    let request = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => RetryRequest::Dismiss,
+        // 窗口关掉时发送端一起消失，也就没什么好重试的了。
+        request = retry.recv() => request.unwrap_or(RetryRequest::Dismiss),
+    };
+    if request != RetryRequest::Retry {
+        return Ok(None);
+    }
+    let (reconnect, display_rx) = window_reconnect(alias.to_owned(), None, reporter, retry);
+    reporter(ConnectionProgress::working(
+        1,
+        "重新连接",
+        format!("正在重新连接 {alias}"),
+    ));
+    sender
+        .send(reconnect)
+        .map_err(|_| anyhow!("观看窗口已关闭"))?;
+    cancellable(cancel, async { display_rx.await.context("观看窗口未完成重连") })
+        .await
+        .map(Some)
+}
+
 async fn update_reconnect_display(
     resolved: &ResolvedConnection,
     reporter: &mut ConnectionProgressReporter,
     cancel: &CancellationToken,
     sender: &std::sync::mpsc::Sender<ViewerWindowEvent>,
+    retry: &mut tokio::sync::mpsc::UnboundedReceiver<RetryRequest>,
     update_started: std::time::Instant,
 ) -> Result<ViewerDisplayHandle> {
-    let (progress_tx, progress_rx) = std::sync::mpsc::channel();
-    let (display_tx, display_rx) = oneshot::channel();
-    *reporter = Arc::new(move |progress| {
-        let _ = progress_tx.send(progress);
-    });
+    let (reconnect, display_rx) =
+        window_reconnect(resolved.summary.alias.clone(), None, reporter, retry);
     reporter(ConnectionProgress::updating(update_started));
     if let Some(background) = resolved.background.clone() {
         reporter(ConnectionProgress::background(background));
     }
     sender
-        .send(ViewerWindowEvent::Reconnect {
-            alias: resolved.summary.alias.clone(),
-            window: None,
-            progress: progress_rx,
-            display: display_tx,
-        })
+        .send(reconnect)
         .map_err(|_| anyhow!("更新等待窗口已关闭"))?;
     cancellable(cancel, async {
         display_rx.await.context("更新等待窗口已关闭")

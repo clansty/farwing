@@ -2,6 +2,7 @@
 use super::*;
 use crate::account::api::DeviceInfo;
 
+#[derive(Clone)]
 pub(crate) struct Approval {
     device_id: String,
 }
@@ -17,13 +18,13 @@ impl Approval {
         self.device_id == device_id
     }
 
-    pub(super) async fn verify(self, client: &AuthenticatedClient, target: &str) -> Result<bool> {
+    pub(super) async fn verify(&self, client: &AuthenticatedClient, target: &str) -> Result<bool> {
         anyhow::ensure!(self.permits(target), "接管确认对应的设备已变化，请重新选择");
         let list = client.list_devices().await?;
         self.verify_list(&list, target)
     }
 
-    fn verify_list(self, list: &crate::account::api::DeviceList, target: &str) -> Result<bool> {
+    fn verify_list(&self, list: &crate::account::api::DeviceList, target: &str) -> Result<bool> {
         anyhow::ensure!(self.permits(target), "接管确认对应的设备已变化，请重新选择");
         anyhow::ensure!(
             target != list.current_device.device_id,

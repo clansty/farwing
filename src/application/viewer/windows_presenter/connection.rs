@@ -39,6 +39,7 @@ pub(in crate::application::viewer) fn run(session: NativeViewerSession) -> Resul
             progress: std_mpsc::channel().1,
             session: receiver,
             display_sender: tokio::sync::oneshot::channel().0,
+            retry: None,
         },
         false,
     )
@@ -49,6 +50,7 @@ pub(crate) struct ConnectingWindowsRunConfig {
     pub progress: std_mpsc::Receiver<ConnectionProgress>,
     pub session: std_mpsc::Receiver<ViewerWindowEvent>,
     pub display_sender: tokio::sync::oneshot::Sender<ViewerDisplayHandle>,
+    pub retry: Option<crate::application::viewer::RetrySender>,
 }
 
 pub(in crate::application::viewer) fn run_connecting(
@@ -106,6 +108,8 @@ pub(crate) struct ConnectingWindowsRunner {
     pub(in crate::application::viewer) attributes: WindowAttributes,
     pub(in crate::application::viewer) alias: String,
     pub(in crate::application::viewer) progress: Option<std_mpsc::Receiver<ConnectionProgress>>,
+    /// 拿走连接界面的重试入口；每次换界面都交给新的那一个。
+    pub(in crate::application::viewer) retry: Option<crate::application::viewer::RetrySender>,
     pub(in crate::application::viewer) session: std_mpsc::Receiver<ViewerWindowEvent>,
     pub(in crate::application::viewer) display_sender:
         Option<tokio::sync::oneshot::Sender<ViewerDisplayHandle>>,
@@ -138,6 +142,7 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
                     progress,
                     self.repaint_proxy.clone(),
                     self.ui_generation,
+                    self.retry.take(),
                 ) {
                     Ok((mut app, display)) => {
                         if let Err(error) = app.render(&window) {
@@ -379,6 +384,7 @@ impl ConnectingWindowsRunner {
                 .with_min_inner_size(LogicalSize::new(760.0, 520.0)),
             alias: config.alias,
             progress: Some(config.progress),
+            retry: config.retry,
             session: config.session,
             display_sender: needs_display.then_some(config.display_sender),
             window: None,
@@ -446,6 +452,7 @@ impl ConnectingWindowsRunner {
                     window: preferred,
                     progress,
                     display,
+                    retry,
                 } => {
                     self.alias = alias;
                     if let Some(mut screens) = self.screens.take() {
@@ -472,6 +479,7 @@ impl ConnectingWindowsRunner {
                         progress,
                         self.repaint_proxy.clone(),
                         self.ui_generation,
+                        retry,
                     )?;
                     app.render(window)?;
                     self.connecting = Some(app);
@@ -551,6 +559,7 @@ impl WindowsConnectionApp {
         receiver: std_mpsc::Receiver<ConnectionProgress>,
         repaint_proxy: EventLoopProxy<UiEvent>,
         generation: u64,
+        retry: Option<crate::application::viewer::RetrySender>,
     ) -> Result<(Self, ViewerDisplayHandle)> {
         let egui_context = egui::Context::default();
         let window_id = window.id();
@@ -582,7 +591,7 @@ impl WindowsConnectionApp {
         Ok((
             Self {
                 audio: None,
-                progress: ConnectionProgressApp::new(alias, receiver),
+                progress: ConnectionProgressApp::new(alias, receiver).with_retry(retry),
                 presenter,
                 egui_context,
                 egui_winit,

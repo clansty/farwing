@@ -453,6 +453,8 @@ impl ScreenWindows {
                 receiver,
                 self.proxy.clone(),
                 self.generation,
+                // 独立屏窗口不握着连接，断开的原因归主窗口报，这里没有可重来的东西。
+                None,
             )?;
             connecting.render(&slot.window)?;
             (Some(connecting), display)

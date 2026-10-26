@@ -51,17 +51,13 @@ impl ConnectionProgressApp {
                         failed && index == active,
                     );
                 }
-                ui.add_space((ui.available_height() - controls::HEIGHT).max(16.0));
-                if ui
-                    .add(controls::secondary(if failed {
-                        "关闭窗口"
-                    } else {
-                        "取消连接"
-                    }))
-                    .clicked()
-                {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                }
+                let actions = if failed && self.retry.is_some() {
+                    controls::HEIGHT * 2.0 + 6.0
+                } else {
+                    controls::HEIGHT
+                };
+                ui.add_space((ui.available_height() - actions).max(16.0));
+                self.draw_failure_actions(ui, failed);
             });
         egui::CentralPanel::default()
             .frame(
@@ -156,6 +152,7 @@ impl ConnectionProgressApp {
 
     pub(super) fn draw(&mut self, ui: &mut egui::Ui) {
         self.drain();
+        self.countdown_expired();
         let failed = matches!(self.current.state, ConnectionProgressState::Failed);
         let ready = matches!(self.current.state, ConnectionProgressState::Ready);
         let ctx = ui.ctx().clone();
@@ -181,7 +178,11 @@ impl ConnectionProgressApp {
             ctx.request_repaint_after(Duration::from_millis(200));
             return;
         }
-        if !failed {
+        if failed {
+            // 失败界面平时没有别的东西催重画：倒计时要走，点过重试之后的连接进展
+            // 也得靠这一拍才被取出来。
+            ctx.request_repaint_after(Duration::from_millis(250));
+        } else {
             ctx.request_repaint_after(Duration::from_millis(33));
         }
         if self.details_open {
@@ -257,16 +258,7 @@ impl ConnectionProgressApp {
                             );
                         }
                         content.add_space(24.0);
-                        if content
-                            .add(controls::secondary(if failed {
-                                "关闭窗口"
-                            } else {
-                                "取消连接"
-                            }))
-                            .clicked()
-                        {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
+                        self.draw_failure_actions(&mut content, failed);
                         content.add_space(6.0);
                         if content
                             .add(controls::quiet_button(if self.details_open {
