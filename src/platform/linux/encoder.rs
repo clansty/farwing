@@ -10,12 +10,18 @@ use std::os::fd::AsFd;
 
 pub(crate) use crate::media::encoding::{Encoded, FrameTiming};
 
+/// 50 ms 一轮地等第一帧：五秒。
+const FIRST_PICTURE_TRIES: u32 = 100;
+
 pub(crate) fn probe(
     desktop: &mut Desktop,
     is_active: impl Fn() -> bool,
 ) -> Result<Vec<Capability>> {
+    // 门户的第一帧可能要等好几秒：流要先协商格式和缓冲，KWin 还可能等画面变化
+    // 才发帧。X11、NvFBC 和 wlr-screencopy 是同步应答，这段等待只在真的没有画面
+    // 时才花出去；连接被取消会提前退出。
     let mut frame = None;
-    for _ in 0..20 {
+    for _ in 0..FIRST_PICTURE_TRIES {
         if !is_active() {
             bail!("被控准备已取消");
         }
@@ -24,7 +30,11 @@ pub(crate) fn probe(
             break;
         }
     }
-    let frame = frame.context("尚未取得所选桌面画面")?;
+    let frame = match (frame, desktop.waiting()) {
+        (Some(frame), _) => frame,
+        (None, Some(stage)) => bail!("尚未取得所选桌面画面：{stage}"),
+        (None, None) => bail!("尚未取得所选桌面画面"),
+    };
     let mut candidates = Vec::new();
     if crate::media::encoding::nvenc::Api::load().is_ok() {
         for codec in [Codec::H264, Codec::H265, Codec::Av1] {

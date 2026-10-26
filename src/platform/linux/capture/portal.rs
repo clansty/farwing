@@ -340,6 +340,11 @@ impl Grab {
         self.stream.displayed_size()
     }
 
+    /// 迟迟等不到第一帧时，画面流停在哪一步；见 [`super::pipewire::Stream::stage`]。
+    pub fn stage(&self) -> String {
+        self.stream.stage()
+    }
+
     /// 零拷贝：把这一帧的显存缓冲直接交出去（内容仍在合成器池子里，靠缓冲上的
     /// 租约在帧用完时归还）。没有显存画面就给 `None`。
     pub fn next_hardware(&mut self, timeout: Duration) -> Result<Option<Arc<dmabuf::Buffer>>> {

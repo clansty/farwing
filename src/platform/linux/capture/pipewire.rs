@@ -555,6 +555,11 @@ struct State {
     format: Option<NegotiatedFormat>,
     streaming: bool,
     error: Option<String>,
+    /// 合成器送来的缓冲数，读不读得出画面都算。和 `unreadable` 一起构成
+    /// [`Stream::stage`] 给用户看的那句话。
+    buffers_seen: u64,
+    /// 最近一个读不出画面的缓冲：为什么读不出来，以及它自己报的数据类型。
+    unreadable: Option<String>,
     /// 上一次问过的缓冲类型：`Some(true)` 是显存，`Some(false)` 是系统内存，
     /// 第一次之前是 `None`。
     buffers_requested: Option<bool>,
@@ -600,7 +605,12 @@ unsafe extern "C" fn on_state_changed(
     let mut guard = lock(&callbacks.shared.state);
     mark_loop_thread(&mut guard);
     match state {
-        STATE_STREAMING => guard.streaming = true,
+        STATE_STREAMING => {
+            if !guard.streaming {
+                tracing::info!("PipeWire 画面流已开始传输");
+            }
+            guard.streaming = true;
+        }
         STATE_ERROR => {
             let text = if error.is_null() {
                 "未知错误".to_owned()
@@ -645,7 +655,9 @@ unsafe extern "C" fn on_param_changed(data: *mut c_void, id: u32, param: *const 
     state.buffers_requested = Some(dmabuf);
     drop(state);
     callbacks.shared.changed.notify_all();
-    tracing::debug!(?format, dmabuf, "PipeWire screencast format negotiated");
+    // info 级别：默认日志里也要能看见「格式谈成了没有、谈成多大」——首帧迟迟不来的
+    // 时候，这是唯一能区分「门户没回话」和「回话了但什么都没送」的证据。
+    tracing::info!(?format, dmabuf, "PipeWire 画面格式已协商");
     let buffers = buffers(dmabuf).aligned();
     let meta = crop_meta().aligned();
     let mut params = [buffers.as_ptr().cast::<c_void>(), meta.as_ptr().cast()];
@@ -677,9 +689,39 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
         mark_loop_thread(&mut state);
         state.format
     };
-    let picture =
-        format.and_then(|format| unsafe { read_picture(&callbacks.shared, newest, format) });
-    let holds = matches!(picture, Some(Delivered::Dmabuf(_)));
+    let picture = match format {
+        Some(format) => unsafe { read_picture(&callbacks.shared, newest, format) },
+        None => Err("画面格式还没协商".to_owned()),
+    };
+    // 缓冲自己带的是什么类型：`stage` 报告里要写进去，用户和日志都靠它判断是
+    // 门户送错了东西，还是我们没读出来。
+    let kind = unsafe {
+        let spa = (*newest).buffer;
+        (!spa.is_null() && (*spa).n_datas > 0 && !(*spa).datas.is_null())
+            .then(|| (*(*spa).datas).kind)
+    };
+    // 计数与「为什么读不出画面」一次锁记完，下面两条分支只管画面本身。
+    {
+        let mut state = lock(&callbacks.shared.state);
+        state.buffers_seen += 1;
+        if state.buffers_seen == 1 {
+            tracing::info!(
+                data_type = kind,
+                readable = picture.is_ok(),
+                "PipeWire 收到第一个缓冲"
+            );
+        }
+        if let Err(reason) = &picture {
+            if state.unreadable.is_none() {
+                tracing::warn!(data_type = kind, %reason, "PipeWire 缓冲里没有可读的画面");
+            }
+            state.unreadable = Some(match kind {
+                Some(kind) => format!("数据类型 {kind}：{reason}"),
+                None => reason.clone(),
+            });
+        }
+    }
+    let holds = matches!(picture, Ok(Delivered::Dmabuf(_)));
     if holds {
         // 同时只留一帧显存：池子本来就浅，上一帧还没被取走又要一帧会把池子抽干，
         // 之后合成器报 `Out of buffers`、整条流重来。丢这一帧只是少一帧，留着流
@@ -689,7 +731,7 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
             drop(state);
             return;
         }
-        state.picture = picture;
+        state.picture = picture.ok();
         state.sequence += 1;
         drop(state);
         callbacks.shared.changed.notify_all();
@@ -697,7 +739,7 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
     }
     // 系统内存的画面此刻已经拷完，缓冲直接还回去。
     unsafe { (api.stream_queue_buffer)(callbacks.stream, newest) };
-    if let Some(picture) = picture {
+    if let Ok(picture) = picture {
         let mut state = lock(&callbacks.shared.state);
         state.picture = Some(picture);
         state.sequence += 1;
@@ -706,7 +748,8 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
     }
 }
 
-/// Copy a buffer's pixels out as tightly packed BGRA, or import a DMA-BUF.
+/// Copy a buffer's pixels out as tightly packed BGRA, or import a DMA-BUF; the
+/// error says why a buffer held no picture.
 ///
 /// # Safety
 /// `pw` must be a buffer the stream just dequeued.
@@ -714,16 +757,20 @@ unsafe fn read_picture(
     shared: &Shared,
     pw: *mut PwBuffer,
     negotiated: NegotiatedFormat,
-) -> Option<Delivered> {
+) -> std::result::Result<Delivered, String> {
     let NegotiatedFormat {
         format,
         width,
         height,
         modifier,
     } = negotiated;
-    let spa = unsafe { &*(*pw).buffer };
+    let spa = unsafe { (*pw).buffer };
+    if spa.is_null() {
+        return Err("缓冲指针为空".to_owned());
+    }
+    let spa = unsafe { &*spa };
     if spa.n_datas == 0 || spa.datas.is_null() {
-        return None;
+        return Err("缓冲里没有数据块".to_owned());
     }
     // 缓冲自己的类型说了算，不是格式里的修饰符：门户谈崩之后格式还带着它。
     // 交付过来的缓冲带的是单一类型，不是请求时的位掩码。
@@ -745,21 +792,21 @@ unsafe fn read_dmabuf(
     width: u32,
     height: u32,
     modifier: Option<u64>,
-) -> Option<Delivered> {
+) -> std::result::Result<Delivered, String> {
     // 只认线性（`DRM_FORMAT_MOD_LINEAR`）。Scaler 只会按线性导入，别的排布读出来
     // 就是花屏；门户没给修饰符（`None`/`INVALID`）也一样没法导。
     if modifier != Some(DRM_MOD_LINEAR) {
         tracing::debug!(?modifier, "DMA-BUF 不是线性排布，这一帧不采");
-        return None;
+        return Err("DMA-BUF 不是线性排布".to_owned());
     }
     // VA-API 只认 AR24/XR24 这两种 32 位 BGRA 排布。
     let Some(fourcc) = drm_fourcc(format) else {
         tracing::debug!(format, "DMA-BUF 的 SPA 格式不是 BGRA/BGRX，这一帧不采");
-        return None;
+        return Err("DMA-BUF 的 SPA 格式不是 BGRA/BGRX".to_owned());
     };
     let data = unsafe { &*spa.datas };
     if data.fd < 0 || data.chunk.is_null() {
-        return None;
+        return Err("DMA-BUF 缓冲没有描述符".to_owned());
     }
     let chunk = unsafe { &*data.chunk };
     let stride = if chunk.stride > 0 {
@@ -771,23 +818,24 @@ unsafe fn read_dmabuf(
     // 单平面线性缓冲实测都是 0，不是就当作没协商到。
     if chunk.offset != 0 {
         tracing::debug!(offset = chunk.offset, "DMA-BUF 平面有偏移，这一帧不采");
-        return None;
+        return Err(format!("DMA-BUF 平面有偏移 {}", chunk.offset));
     }
     if width == 0 || height == 0 || stride < width * 4 {
         tracing::debug!(width, height, stride, "DMA-BUF 尺寸不合理，这一帧不采");
-        return None;
+        return Err(format!("DMA-BUF 尺寸不合理（{width}×{height}，行宽 {stride}）"));
     }
     // 流的句柄：租约靠它保证归还时流还活着。取不到（流正在销毁）就不采这一帧。
     let session = shared
         .session
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .upgrade()?;
+        .upgrade()
+        .ok_or_else(|| "画面流正在销毁".to_owned())?;
     // 门户的 fd 随 `pw_buffer` 回收，不能长期攥着；dup 一份自己拿着。
     // SAFETY: `data.fd` 是刚交付的缓冲上的有效描述符。
     let prime = unsafe { BorrowedFd::borrow_raw(data.fd as RawFd) }
         .try_clone_to_owned()
-        .ok()?;
+        .map_err(|error| format!("复制 DMA-BUF 描述符失败：{error}"))?;
     let size = u64::from(stride) * u64::from(height);
     let buffer = Arc::new(dmabuf::Buffer::import(
         prime,
@@ -803,7 +851,7 @@ unsafe fn read_dmabuf(
         })),
     ));
     tracing::debug!(fourcc, width, height, stride, "DMA-BUF 画面已导入");
-    Some(Delivered::Dmabuf(buffer))
+    Ok(Delivered::Dmabuf(buffer))
 }
 
 /// SPA 的 `spa_video_format` 对应到哪个 DRM fourcc。
@@ -819,12 +867,28 @@ fn drm_fourcc(format: u32) -> Option<u32> {
 }
 
 /// 共享内存那条路：门户已经拷进 memfd，这里按行读到紧密的 BGRA。
-fn read_shm(spa: &SpaBuffer, format: u32, width: u32, height: u32) -> Option<Delivered> {
+fn read_shm(
+    spa: &SpaBuffer,
+    format: u32,
+    width: u32,
+    height: u32,
+) -> std::result::Result<Delivered, String> {
     let data = unsafe { &*spa.datas };
-    if data.data.is_null() || data.chunk.is_null() {
-        // 既不是 DMA-BUF 又没有可读的指针：空缓冲。
-        return None;
+    if data.chunk.is_null() {
+        return Err("缓冲没有 chunk".to_owned());
     }
+    // PipeWire 只映射合成器标了「可映射」的缓冲。KWin 的共享内存缓冲没标，到手
+    // 就是光秃秃一个 MemFd（`data.data` 为空），得自己 mmap 才读得到像素——
+    // 不映射的话每帧都读不出画面，而流本身看着一直是好的。
+    let mapped;
+    let source: &[u8] = if !data.data.is_null() {
+        unsafe { std::slice::from_raw_parts(data.data.cast::<u8>(), data.maxsize as usize) }
+    } else if data.kind == DATA_MEM_FD && data.fd >= 0 {
+        mapped = MemFdMap::new(data.fd as RawFd, data.mapoffset, data.maxsize)?;
+        mapped.bytes()
+    } else {
+        return Err("缓冲没有映射到内存，也不是能自己映射的 MemFd".to_owned());
+    };
     let chunk = unsafe { &*data.chunk };
     let stride = if chunk.stride > 0 {
         chunk.stride as usize
@@ -850,10 +914,11 @@ fn read_shm(spa: &SpaBuffer, format: u32, width: u32, height: u32) -> Option<Del
     let base = (chunk.offset % data.maxsize.max(1)) as usize;
     let needed = base + (y + h).saturating_sub(1) * stride + (x + w) * 4;
     if w == 0 || h == 0 || needed > data.maxsize as usize {
-        return None;
+        return Err(format!(
+            "缓冲放不下 {width}×{height} 的画面（行宽 {stride}，偏移 {base}，大小 {}）",
+            data.maxsize
+        ));
     }
-    let source =
-        unsafe { std::slice::from_raw_parts(data.data.cast::<u8>(), data.maxsize as usize) };
     // 这些像素只有编码器会读，而两条编码路径都只取色彩通道（软件路径交给 yuv
     // 的 BGRA 转换，VA-API 路径交给 bgra_to_yuv420），alpha 字节从来没人看。
     // 为它单独扫一遍画面纯属浪费——2880x1800 上实测 2.8ms/帧——所以缓冲里
@@ -880,11 +945,70 @@ fn read_shm(spa: &SpaBuffer, format: u32, width: u32, height: u32) -> Option<Del
             }
         }
     }
-    Some(Delivered::Shm {
+    Ok(Delivered::Shm {
         width: w as u32,
         height: h as u32,
         pixels,
     })
+}
+
+/// 一帧之内有效的 MemFd 只读映射。
+///
+/// `mmap` 要求偏移按页对齐，而缓冲的 `mapoffset` 不必是整页，所以多映射前面
+/// 那一小段，读的时候再跳过。
+struct MemFdMap {
+    pointer: *mut c_void,
+    length: usize,
+    /// 目标数据在映射里的起点。
+    start: usize,
+    size: usize,
+}
+
+impl MemFdMap {
+    fn new(fd: RawFd, offset: u32, size: u32) -> std::result::Result<Self, String> {
+        if size == 0 {
+            return Err("MemFd 缓冲大小为 0".to_owned());
+        }
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as u64;
+        let aligned = u64::from(offset) / page * page;
+        let start = (u64::from(offset) - aligned) as usize;
+        let length = start + size as usize;
+        // SAFETY: PipeWire 在缓冲归还前一直开着这个描述符，映射是只读的共享
+        // 映射，随 `Drop` 在缓冲还回去之前解除。
+        let pointer = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                length,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd,
+                aligned as libc::off_t,
+            )
+        };
+        if pointer == libc::MAP_FAILED {
+            return Err(format!(
+                "映射 MemFd 缓冲失败：{}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(Self {
+            pointer,
+            length,
+            start,
+            size: size as usize,
+        })
+    }
+
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: 映射覆盖 `start + size` 字节，且活得和 `self` 一样久。
+        unsafe { std::slice::from_raw_parts(self.pointer.cast::<u8>().add(self.start), self.size) }
+    }
+}
+
+impl Drop for MemFdMap {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.pointer, self.length) };
+    }
 }
 
 /// 一到多帧画面，和它背后那条 PipeWire 流。
@@ -1184,6 +1308,18 @@ impl Stream {
             .map_or((0, 0), |format| (format.width, format.height))
     }
 
+    /// 迟迟等不到第一帧时，流走到了哪一步：没开始传输、没谈成格式、还没送缓冲，
+    /// 或者送来的缓冲读不出画面。每一种都指向不同的原因。
+    pub fn stage(&self) -> String {
+        let state = lock(&self.shared.state);
+        stage(
+            state.streaming,
+            state.format.map(|format| (format.width, format.height)),
+            state.buffers_seen,
+            state.unreadable.as_deref(),
+        )
+    }
+
     /// The next frame newer than the last one returned, waiting up to
     /// `timeout`. `None` when nothing new arrived.
     pub fn next(&mut self, timeout: Duration) -> Result<Option<Delivered>> {
@@ -1209,6 +1345,27 @@ impl Stream {
                 .wait_timeout(state, deadline - now)
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
+        }
+    }
+}
+
+fn stage(
+    streaming: bool,
+    format: Option<(u32, u32)>,
+    buffers_seen: u64,
+    unreadable: Option<&str>,
+) -> String {
+    match (streaming, format, buffers_seen, unreadable) {
+        (false, None, _, _) => "门户的画面流没有开始传输".to_owned(),
+        (true, None, _, _) => "门户的画面流已开始，但没有协商出画面格式".to_owned(),
+        (_, Some((width, height)), 0, _) => format!(
+            "画面格式已协商（{width}×{height}），但合成器还没送来画面；有的桌面在画面静止时不发帧"
+        ),
+        (_, Some(_), buffers_seen, Some(reason)) => {
+            format!("合成器送来了 {buffers_seen} 个缓冲，但读不出画面（{reason}）")
+        }
+        (_, Some(_), buffers_seen, None) => {
+            format!("合成器送来了 {buffers_seen} 个缓冲，画面还在处理")
         }
     }
 }
@@ -1297,6 +1454,77 @@ mod tests {
             unsafe { shm.as_ptr().cast::<u32>().add(24).read() },
             (1 << DATA_MEM_PTR) | (1 << DATA_MEM_FD)
         );
+    }
+
+    #[test]
+    fn the_stage_names_where_the_first_picture_stopped() {
+        assert_eq!(
+            stage(false, None, 0, None),
+            "门户的画面流没有开始传输".to_owned()
+        );
+        assert!(stage(true, None, 0, None).contains("没有协商出画面格式"));
+        assert!(stage(true, Some((1920, 1080)), 0, None).contains("1920×1080"));
+        assert!(
+            stage(true, Some((1920, 1080)), 3, Some("数据类型 2：缓冲为空"))
+                .contains("数据类型 2：缓冲为空")
+        );
+    }
+
+    /// KWin 交过来的共享内存缓冲 PipeWire 没映射：只有一个 MemFd、`data.data`
+    /// 为空。这里自己映射（`mapoffset` 还不是整页对齐），再按普通缓冲读出来。
+    #[test]
+    fn an_unmapped_memfd_buffer_is_mapped_and_read() {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        let fd = unsafe { libc::memfd_create(c"openuuyc-test".as_ptr(), 0) };
+        assert!(fd >= 0, "memfd_create");
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        // 2×2 的 BGRX，正好两行，行宽 8，写在偏移 100（不是整页，也不是 8 的倍数）。
+        let offset = 100u32;
+        let pixels = [
+            1u8, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255,
+        ];
+        file.seek(SeekFrom::Start(u64::from(offset))).expect("seek");
+        file.write_all(&pixels).expect("write");
+        let mut chunk = SpaChunk {
+            offset: 0,
+            size: pixels.len() as u32,
+            stride: 8,
+            flags: 0,
+        };
+        let mut data = SpaData {
+            kind: DATA_MEM_FD,
+            flags: 0,
+            fd: i64::from(file.as_raw_fd()),
+            mapoffset: offset,
+            maxsize: pixels.len() as u32,
+            data: std::ptr::null_mut(),
+            chunk: &mut chunk,
+        };
+        let mut buffer = SpaBuffer {
+            n_metas: 0,
+            n_datas: 1,
+            metas: std::ptr::null_mut(),
+            datas: &mut data,
+        };
+        let picture = read_shm(&buffer, VIDEO_BGRX, 2, 2).expect("MemFd 缓冲读不出画面");
+        let Delivered::Shm {
+            width,
+            height,
+            pixels: read,
+        } = picture
+        else {
+            panic!("共享内存那条路交回了显存画面");
+        };
+        assert_eq!((width, height), (2, 2));
+        assert_eq!(read, pixels);
+        // 缓冲装不下这个格式时要说明白，而不是安静地失败。
+        data.maxsize = 8;
+        let Err(error) = read_shm(&buffer, VIDEO_BGRX, 2, 2) else {
+            panic!("装不下的缓冲居然读出了画面");
+        };
+        assert!(error.contains("放不下"), "{error}");
+        drop(buffer);
     }
 
     /// SPA 的 `spa_video_format` 到 DRM fourcc 的映射：只有 BGRA/BGRX 是我们

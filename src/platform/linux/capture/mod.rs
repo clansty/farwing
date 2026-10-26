@@ -417,6 +417,15 @@ impl Desktop {
         self.backend.name()
     }
 
+    /// 还没拿到第一帧时，后端能说出卡在哪一步吗：门户会报它的画面流走到了哪里，
+    /// 其余后端都是「要帧才采」，没有可等的东西。
+    pub fn waiting(&self) -> Option<String> {
+        match &self.backend {
+            Backend::Portal(grab) => Some(grab.stage()),
+            _ => None,
+        }
+    }
+
     /// Neither backend captures HDR.
     pub fn hdr_available(&self) -> bool {
         false
