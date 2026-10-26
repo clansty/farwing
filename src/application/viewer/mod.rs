@@ -34,6 +34,8 @@ mod windows_cursor;
 
 #[cfg(not(windows))]
 mod linux_drag;
+#[cfg(target_os = "linux")]
+mod linux_gamepad;
 #[cfg(not(windows))]
 pub(crate) mod linux_keyboard;
 #[cfg(not(windows))]

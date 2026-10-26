@@ -32,8 +32,8 @@ libxfixes3, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, \
 libvulkan1 | libegl1, \
 fonts-noto-cjk | fonts-wqy-microhei | fonts-arphic-uming"""
 # gio（libglib2.0-bin）与 rsvg-convert（librsvg2-bin）用来拼被控端的拖动预览图，
-# 缺了它们拖出去就没有预览图。
-recommends = "libpulse0, libpipewire-0.3-0, gnome-keyring | kwalletmanager, libglib2.0-bin, librsvg2-bin"
+# 缺了它们拖出去就没有预览图。libsdl2-2.0-0 给主控读手柄，缺了就是「本机没有手柄」。
+recommends = "libpulse0, libpipewire-0.3-0, gnome-keyring | kwalletmanager, libglib2.0-bin, librsvg2-bin, libsdl2-2.0-0"
 suggests = "ethtool"
 assets = [
     ["target/release/OpenUUYC", "usr/bin/", "755"],

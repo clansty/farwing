@@ -806,6 +806,7 @@ impl ConnectingWindowsRunner {
                 // 独立窗口只守着自己那块屏，新屏归主窗口。
                 redraw |= player.refresh_catalog(&slot.window, &[]);
                 let frame = player.poll();
+                player.poll_gamepad(&slot.window);
                 redraw |= player.error.is_some();
                 if frame || redraw {
                     slot.next_repaint = Some(Instant::now());
@@ -1463,6 +1464,9 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
             // leave an arriving frame waiting for the pass in progress.
             player.park_stranded();
             let frame = player.poll();
+            if let Some(window) = self.window.as_ref() {
+                player.poll_gamepad(window);
+            }
             // 解码器出错的弹窗也要画出来，哪怕之后再没有新帧。
             redraw |= player.error.is_some();
             if frame {
@@ -1509,11 +1513,13 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
         let mut wake = self.next_repaint;
         if let Stage::Playing(player) = &self.stage {
             wake = earliest(wake, Some(player.next_refresh));
+            wake = earliest(wake, player.gamepad.deadline());
         }
         for slot in &self.detached {
             wake = earliest(wake, slot.next_repaint);
             if let DetachedStage::Playing(player) = &slot.stage {
                 wake = earliest(wake, Some(player.next_refresh));
+                wake = earliest(wake, player.gamepad.deadline());
             }
         }
         event_loop.set_control_flow(wake.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
@@ -1640,6 +1646,7 @@ struct Player {
     wake: Option<FrameWakeBridge>,
     /// Identifies this window to `RemoteInput`, which arbitrates between windows.
     owner: u64,
+    gamepad: super::linux_gamepad::GamepadCapture,
     stream_control_ui: StreamControlUi,
     performance_mode: PerformancePanelMode,
     intercept_shortcuts: bool,
@@ -1745,6 +1752,10 @@ impl Player {
         };
         let drag =
             super::linux_drag::WindowDrag::new(owner, &session.stream_control, linked.clone());
+        let gamepad = super::linux_gamepad::GamepadCapture::new(
+            session.stream_control.mouse().clone(),
+            owner,
+        );
         Ok(Self {
             shortcuts: super::linux_shortcuts::Shortcuts::new(window),
             drag,
@@ -1764,6 +1775,7 @@ impl Player {
             window_id,
             wake: Some(wake),
             owner,
+            gamepad,
             stream_control_ui: StreamControlUi::default(),
             performance_mode: PerformancePanelMode::Compact,
             intercept_shortcuts: true,
@@ -1866,6 +1878,9 @@ impl Player {
     fn update_input_gate(&mut self, context: &egui::Context, window: &Arc<Window>) {
         let blocked = self.local_ui_owns_input(context);
         if blocked && !self.local_input_blocked {
+            // 本机界面接手输入时手柄也要停：远端已经收不到键鼠，手柄还按着就是
+            // 一边操作本地菜单一边把摇杆推给远端。
+            self.gamepad.pause();
             self.release_keys();
             self.input().pause_owner(self.owner);
             self.release_pointer(window);
@@ -1880,6 +1895,20 @@ impl Player {
 
     fn input(&self) -> &crate::features::remote_input::RemoteInput {
         self.session.stream_control.mouse()
+    }
+
+    fn poll_gamepad(&mut self, window: &Window) {
+        let active = self.focused
+            && window.is_minimized() != Some(true)
+            && !self.frame_paused
+            && self.video_size.is_some()
+            && !self.local_input_blocked
+            && !self.stream_control_ui.open
+            && !self.switching()
+            && !self.control().drag_drop().interactive()
+            && self.input().mode() != MouseMode::View
+            && !self.input().waiting_for_neutral();
+        self.gamepad.tick(active);
     }
 
     /// 用户点了某块屏的 tab。点的是正在显示的那块，就等于取消这次切换（open 任务
@@ -3111,6 +3140,7 @@ impl Player {
             self.input().fail(error.to_string());
         }
         if !enabled {
+            self.gamepad.pause();
             self.release_keys();
         }
     }
@@ -3244,6 +3274,9 @@ impl Player {
 
     fn on_focus_changed(&mut self, window: &Arc<Window>, focused: bool) {
         self.focused = focused;
+        if !focused {
+            self.gamepad.pause();
+        }
         if !focused && self.control().drag_drop().handoff_pending() {
             // A drag being handed out of the window keeps its button state;
             // the handoff releases remote input itself.
@@ -3696,6 +3729,7 @@ impl Player {
 
 impl Drop for Player {
     fn drop(&mut self) {
+        self.gamepad.pause();
         if let Some(linked) = &self.linked {
             linked.unwatch(self.owner);
         }
