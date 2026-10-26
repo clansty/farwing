@@ -704,7 +704,9 @@ impl ThreadedWindowsApp {
             self.fit_window_to_current_aspect(window);
         }
         self.last_aspect_video_size = current_video_size;
-        if chrome_action.exit_fullscreen && window.fullscreen().is_some() {
+        if chrome_action.toggle_fullscreen
+            || (chrome_action.exit_fullscreen && window.fullscreen().is_some())
+        {
             self.apply_shortcut(window, ViewerShortcut::Fullscreen)?;
         }
         if chrome_action.close {

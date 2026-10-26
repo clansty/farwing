@@ -38,9 +38,13 @@ pub(crate) enum ViewerCaptionIcon {
     Microphone,
     Clipboard,
     Quality,
-    /// 只有 Linux 播放器的标题栏用它（Windows 的 caption 里没有全屏按钮）。它在
-    /// 全屏时不可见，用来进入全屏；退出全屏走全屏浮条里的窗口按钮。
+    /// 进入全屏。窗口化时在标题栏最右边（键盘、触屏、游戏模式都能点到），全屏后
+    /// 换成 [`ViewerCaptionIcon::ExitFullscreen`] 留在浮条里。
     Fullscreen,
+    /// 退出全屏，只出现在全屏浮条里。Linux 播放器不画它——浮条里的窗口按钮在全屏
+    /// 时本来就是这个作用——所以非 Windows 的构建里它是死代码。
+    #[cfg_attr(not(windows), allow(dead_code))]
+    ExitFullscreen,
     Minimize,
     Maximize,
     Restore,
@@ -53,8 +57,16 @@ pub(crate) fn viewer_caption_button(
     selected: bool,
     tooltip: &str,
 ) -> egui::Response {
+    let width = if matches!(
+        icon,
+        ViewerCaptionIcon::Fullscreen | ViewerCaptionIcon::ExitFullscreen
+    ) {
+        theme::VIEWER_FULLSCREEN_BUTTON_WIDTH
+    } else {
+        theme::VIEWER_CAPTION_BUTTON
+    };
     let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(theme::VIEWER_CAPTION_BUTTON, theme::VIEWER_CAPTION_BUTTON),
+        egui::vec2(width, theme::VIEWER_CAPTION_BUTTON),
         egui::Sense::click(),
     );
     let fill = if !ui.is_enabled() {
@@ -86,6 +98,8 @@ pub(crate) fn viewer_caption_button(
                 ui.is_enabled(),
                 match icon {
                     ViewerCaptionIcon::Minimize => "最小化",
+                    ViewerCaptionIcon::Fullscreen => "全屏",
+                    ViewerCaptionIcon::ExitFullscreen => "退出全屏",
                     ViewerCaptionIcon::Close => "关闭",
                     _ => "窗口操作",
                 },
@@ -206,12 +220,25 @@ fn paint_caption_icon(
                 painter.circle_filled(egui::pos2(center.x + knob, center.y + offset), 2.0, color);
             }
         }
-        ViewerCaptionIcon::Fullscreen => {
-            // 四个外扩的直角，就是常见的「进入全屏」样子。
+        ViewerCaptionIcon::Fullscreen | ViewerCaptionIcon::ExitFullscreen => {
+            // 四个直角，就是常见的「进入/退出全屏」样子。进入时直角在外、笔朝里收；
+            // 退出时直角往里缩、笔朝外画，两者一眼能分开。
+            let exiting = matches!(icon, ViewerCaptionIcon::ExitFullscreen);
+            let (distance, direction, reach) = if exiting {
+                (egui::vec2(3.0, 2.0), 1.0, 4.0)
+            } else {
+                (egui::vec2(6.5, 6.5), -1.0, 4.5)
+            };
             for (x, y) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
-                let corner = center + egui::vec2(6.5 * x, 6.5 * y);
-                painter.line_segment([corner, corner - egui::vec2(4.5 * x, 0.0)], stroke);
-                painter.line_segment([corner, corner - egui::vec2(0.0, 4.5 * y)], stroke);
+                let corner = center + egui::vec2(distance.x * x, distance.y * y);
+                painter.line_segment(
+                    [corner, corner + egui::vec2(reach * direction * x, 0.0)],
+                    stroke,
+                );
+                painter.line_segment(
+                    [corner, corner + egui::vec2(0.0, reach * direction * y)],
+                    stroke,
+                );
             }
         }
         ViewerCaptionIcon::Minimize => {
