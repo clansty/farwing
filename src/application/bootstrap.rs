@@ -75,6 +75,10 @@ pub fn handoff() {
 // no cached runtime to enter, no resource origin and no launcher to signal.
 #[cfg(not(windows))]
 pub fn initialize() -> Result<()> {
+    // 必须在解析参数、开线程之前跑：它改写的是本进程的环境变量，子进程
+    //（终端里的 shell、打开的文件）都会继承。
+    #[cfg(target_os = "linux")]
+    crate::platform::linux::gamescope::initialize_environment();
     Ok(())
 }
 #[cfg(not(windows))]

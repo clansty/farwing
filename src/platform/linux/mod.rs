@@ -14,6 +14,7 @@ pub(crate) mod drag_drop;
 pub(crate) mod encoder;
 pub(crate) mod ffmpeg;
 pub(crate) mod file_locations;
+pub(crate) mod gamescope;
 pub(crate) mod graphics;
 pub(crate) mod host_service;
 pub(crate) mod input;

@@ -49,6 +49,10 @@ pub struct GuiOptions {
 }
 
 pub fn run(options: GuiOptions) -> Result<()> {
+    // Gamescope 里没有桌面会话替我们拉起钱包，得在开图形、读账号之前先把
+    // 凭据服务叫醒。
+    #[cfg(target_os = "linux")]
+    crate::platform::linux::gamescope::prepare_wallet();
     // The installed Windows service's user-side backend and its migration
     // recovery; Linux has no installed service.
     #[cfg(windows)]

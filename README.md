@@ -4,7 +4,7 @@
 
 OpenUUYC 是用 Rust 编写的 UU 远程第三方客户端，支持 Windows 和 Linux，支持主控、被控和远程协助。
 
-后续计划支持 Linux 等其他平台，移植工作请先通过 [Issue](https://github.com/djkcyl/openuuyc/issues) 沟通。
+Linux 版原生支持 X11、Wayland 与 Gamescope（含 SteamOS 游戏模式），无需 Wine 或 Proton。
 
 ## 下载与使用
 
@@ -85,6 +85,7 @@ Linux 版可以登录、管理设备、观看和控制远端桌面，界面走 w
 - **设备资料**：上报本机真实硬件，取自主机名、`/etc/os-release` 与内核版本、`/proc`、DMI 主板信息、PCI 显卡（按 `pci.ids` 命名）和默认路由所在网卡。SMBIOS 系统 UUID 只有 root 能读，因此系统标识由 `/etc/machine-id` 派生，重装系统后视为新设备。壁纸按“正在运行的 shell 或壁纸守护进程 → 当前桌面环境自己的配置 → 其它 shell 的落盘状态”依次尝试：noctalia（IPC，退回落盘状态）、caelestia、illogical-impulse、swww、hyprpaper、swaybg/wbg、KDE Plasma、GNOME 与 Budgie、Cinnamon、MATE、XFCE、LXQt、COSMIC；一路都读不到时诊断页会列出试过哪些来源以及各自的原因，不会拿别的桌面留下的旧设置顶替。上报的是 16:9 的壁纸卡片，默认在右上角叠一个程序图标，「连接设置 → 设备名片」里可以关掉，只发壁纸本身。
 - **安装与托盘**：`openuuyc.desktop` 登记了 `x-scheme-handler/uuremote`，因此协助邀请链接也能交给本程序打开，但默认打开方式由用户决定（`xdg-mime default openuuyc.desktop x-scheme-handler/uuremote`），安装包不会替用户抢走官方客户端或 wine 里的登记。没有 Windows 那样的“安装服务”，直接运行构建出的程序。关闭窗口隐藏到托盘（StatusNotifierItem；GNOME 需 AppIndicator 扩展，Ubuntu 默认启用），桌面没有托盘时关闭窗口即退出；面板比程序晚起来时每 2 秒重试，托盘一出现就改回关闭收进托盘。登录自启是一个 systemd 用户服务：发行包把 `openuuyc.service` 装到 `/usr/lib/systemd/user/`（`WantedBy=graphical-session.target`，所以它跟着图形会话起停，也没有“登录前被控”），用 `systemctl --user enable openuuyc.service` 开启；便携运行时程序会按当前可执行文件在 `~/.config/systemd/user/` 写一份同名单元。桌面到不了 `graphical-session.target` 时（XFCE、MATE、Cinnamon、普通 X 会话，以及没有 systemd 的发行版），开关改写 XDG 自启动条目 `~/.config/autostart/openuuyc.desktop`，由桌面的会话管理器启动，在桌面的“启动应用程序”里停用它开关也显示为关闭；两种只会留一种，关闭开关时两种都删。直接启动、既不接这个 target 也不处理 XDG 自启动的合成器（没有 uwsm 或 dex 的 sway、Hyprland 等）两种都不会被拉起，请在合成器配置里自行启动 `OpenUUYC gui --background`。它以 `gui --background` 运行，完全不建窗口也不建绘制表面，只在托盘里；再点一次图标会把已经在跑的实例叫到前台：启动器给出的启动通知令牌（Wayland 的 `XDG_ACTIVATION_TOKEN`、X11 的 `DESKTOP_STARTUP_ID`）随请求转交，用来把窗口提到前台并结束启动反馈，合成器或窗口管理器仍可能按自己的防抢焦点策略只做提示。被控设置里的「开机自启」开关直接读写这个单元的启用状态，与 `systemctl --user enable/disable` 完全等价。`systemctl --user stop`（以及 SIGTERM）走的是正常退出，本机在线状态会被正常撤销而不是被直接杀掉；服务模式下日志同时进 journal：`journalctl --user -u openuuyc`。
 - **未接入**：批注与白板（主控发送和被控接收；被控收到批注请求会拒绝）、播放器侧的插件效果链（插件管理页与节点图编辑器能打开，但没有执行链）、HDR、全局快捷键（快捷键仅在播放窗口获得焦点时生效），以及诊断页中的解码检查。
+- **Gamescope / SteamOS 游戏模式**：把原生程序加进 Steam 当作非 Steam 游戏即可，不需要指定兼容性工具。启动时会把 `WAYLAND_DISPLAY` 与 `GAMESCOPE_WAYLAND_DISPLAY` 解析成绝对路径（Steam 会改 `XDG_RUNTIME_DIR`，名字还是相对的就找不到合成器），并在没手动设 `WINIT_X11_SCALE_FACTOR` 时固定为 1 倍——Gamescope 报的物理尺寸不是掌机的 DPI，不固定的话窗口与输入会按两个比例缩放；别处（非 Gamescope）不动环境变量，终端里的 shell 照旧继承会话自己的值。控制中心按当前屏尺寸打开。游戏模式没有桌面会话替我们拉起钱包，所以凭据服务在开图形之前就被激活，登录态仍存在系统钱包里；装了 KWallet 时它的解锁窗口会被关联到当前 Steam 应用，免得弹在后面。
 - **凭据**：登录态保存在系统密钥环（Secret Service），需要运行 gnome-keyring、KWallet 等服务；没有明文回退。
 
 Wayland 下窗口的拖动与缩放由合成器接管，因此不支持窗口吸附等 Windows 专有行为。
