@@ -1174,6 +1174,24 @@ crate::ui::controls::observe_notice(ui.ctx(), "clipboard-error", "剪贴板同�
                             );
                             ui.add_space(7.0);
                         }
+                        if snapshot.mouse_preference == MouseMode::Local {
+                            let mut force = handle.device_preferences().force_local_cursor;
+                            if switch_row(ui, "强制显示本地鼠标指针", &mut force)
+                                .on_hover_text("被控端偶发地把光标藏起来时，「主控端鼠标」会变成一个没有指针的画面；开启后本机始终显示自己的指针")
+                                .changed()
+                            {
+                                handle.set_force_local_cursor(force);
+                            }
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new("远端的光标形状与隐藏状态一概不看，本机指针一直显示。")
+                                        .size(crate::ui::theme::TINY)
+                                        .color(MUTED),
+                                )
+                                .wrap(),
+                            );
+                            ui.add_space(7.0);
+                        }
                         separator(ui);
                         let preferences = handle.device_preferences();
                         let mut throttle = preferences.mouse_throttle;

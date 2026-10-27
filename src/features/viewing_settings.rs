@@ -41,6 +41,9 @@ pub(crate) struct DevicePreferences {
     pub intercept_shortcuts: bool,
     pub mouse_throttle: bool,
     pub mouse_throttle_rate: crate::features::remote_input::MouseThrottleRate,
+    /// 只在「主控端鼠标」下生效：被控端偶发地把光标藏起来（既不上报形状也不画进
+    /// 画面）时，本机仍然显示自己的指针，不让画面里一个指针都没有。
+    pub force_local_cursor: bool,
     pub performance_mode: PerformancePanelMode,
     #[serde(skip_serializing_if = "is_true")]
     pub performance_always_visible: bool,
@@ -63,6 +66,7 @@ impl Default for DevicePreferences {
             intercept_shortcuts: true,
             mouse_throttle: false,
             mouse_throttle_rate: Default::default(),
+            force_local_cursor: false,
             performance_mode: PerformancePanelMode::Compact,
             performance_always_visible: true,
             fullscreen_toolbar: true,

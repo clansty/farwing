@@ -2584,6 +2584,15 @@ impl Player {
             self.cursor_note("locked");
             return;
         }
+        // 「主控端鼠标」+ 强制本机指针：被控端偶发地把光标藏起来（既不给形状也
+        // 不画进画面）时，跟着它的状态量走就只剩一个没有指针的画面。这一档本机
+        // 永远自己画指针，远端的光标状态一概不看。
+        if self.session.stream_control.force_local_cursor() {
+            window.set_cursor_visible(true);
+            self.cursor = None;
+            self.cursor_note("forced local");
+            return;
+        }
         let controlling = self.session.stream_control.mouse().mode() != MouseMode::View;
         // An ordinary Windows desktop flaps this flag: it hides the pointer for
         // a keystroke and shows it on the next mouse move, several times a

@@ -266,6 +266,8 @@ impl StreamControlHandle {
             || state.peer_mouse_relative.is_some()
             // 只看画面/已经用相对位移的两种模式不需要这条推断。
             || matches!(state.mouse.mode(), MouseMode::View | MouseMode::Remote)
+            // 用户要求强制本机指针时，这条推断就没有立足点了（见 `force_local_cursor`）。
+            || force_local_cursor(&state)
             || !state.viewing_enabled
             || !state.remote_cursor.hidden()
         {
@@ -441,6 +443,15 @@ pub(super) fn smart_mouse_requested(state: &StreamControlState) -> bool {
     state.mouse.policy_mode() == MouseMode::Smart
 }
 
+/// 「主控端鼠标」+ 强制本机指针。用户挑这一档就是在说：远端的光标状态量不可信，
+/// 本机指针一直显示。下面那条「远端隐藏 + 本机指针在动 = 三维游戏」的推断唯一的
+/// 证据就是那个状态量，所以这里一并把它关掉，否则推断会把鼠标切成位移、连本机
+/// 指针也一起藏掉——正好是用户要躲的那个「画面里一个指针都没有」。
+pub(super) fn force_local_cursor(state: &StreamControlState) -> bool {
+    state.device_preferences.force_local_cursor
+        && state.device_preferences.mouse_mode == MouseMode::Local
+}
+
 /// 这一局是不是「三维游戏把指针拿走了」。被控端明确表态时以它为准（官方按程序
 /// 白名单发的 `special_game_mouse`），它不说话时才用本地的推断。
 fn game_took_pointer(state: &StreamControlState) -> bool {
@@ -569,5 +580,43 @@ mod tests {
         handle.refresh_mouse_policy(&mut state);
         assert!(!state.guessed_relative);
         assert_eq!(mouse_policy(&state, MouseMode::Smart), (false, false));
+    }
+
+    /// 强制本机指针只属于「主控端鼠标」：别的模式远端本来就该自己画指针，别把
+    /// 这条开关也搬过去。
+    #[test]
+    fn forcing_the_local_cursor_belongs_to_the_local_mode() {
+        let handle = handle();
+        let mut state = lock(&handle.shared);
+        state.device_preferences.force_local_cursor = true;
+        state.device_preferences.mouse_mode = MouseMode::Smart;
+        assert!(!force_local_cursor(&state));
+        state.device_preferences.mouse_mode = MouseMode::Local;
+        assert!(force_local_cursor(&state));
+        state.device_preferences.force_local_cursor = false;
+        assert!(!force_local_cursor(&state));
+    }
+
+    /// 强制本机指针的时候不再拿「远端光标隐藏 + 本机指针在动」当游戏信号：那条
+    /// 推断会把鼠标切成位移、连本机指针一起藏掉，正是用户要躲的那个「画面里一个
+    /// 指针都没有」。
+    #[test]
+    fn forcing_the_local_cursor_disables_the_hidden_cursor_guess() {
+        use crate::features::remote_cursor::encode_shape;
+        let handle = handle();
+        let mut state = lock(&handle.shared);
+        state.viewing_enabled = true;
+        state.mouse.set_ready(true);
+        state.mouse.enable(MouseMode::Local, false).unwrap();
+        state.device_preferences.mouse_mode = MouseMode::Local;
+        state.device_preferences.force_local_cursor = true;
+        state
+            .remote_cursor
+            .receive(&encode_shape(None, 0, [0.5, 0.5]))
+            .unwrap();
+        assert!(state.remote_cursor.hidden());
+        drop(state);
+        handle.pointer_moved();
+        assert!(!lock(&handle.shared).guessed_relative);
     }
 }

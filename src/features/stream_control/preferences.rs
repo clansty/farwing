@@ -116,6 +116,26 @@ impl StreamControlHandle {
         }
         Ok(())
     }
+    pub(crate) fn set_force_local_cursor(&self, enabled: bool) {
+        let mut state = lock(&self.shared);
+        if state.device_preferences.force_local_cursor != enabled {
+            state.device_preferences.force_local_cursor = enabled;
+            self.publish_device_preferences(&mut state);
+        }
+        // 这条推断的唯一证据就是「远端光标隐藏」，而强制本机指针正是在说这个
+        // 状态量不可信，所以开着的这一档直接作废它，别把已经切过去的位移留在原处。
+        if enabled && state.guessed_relative {
+            state.guessed_relative = false;
+            self.refresh_mouse_policy(&mut state);
+        }
+        drop(state);
+        self.mouse.repaint();
+    }
+    /// 用户点名「主控端鼠标」又要求强制本机指针：播放器自己画指针，不再跟着
+    /// 远端的光标状态量藏它。
+    pub(crate) fn force_local_cursor(&self) -> bool {
+        super::input::force_local_cursor(&lock(&self.shared))
+    }
     pub(crate) fn set_performance_mode(&self, mode: PerformancePanelMode) {
         let mut state = lock(&self.shared);
         if state.device_preferences.performance_mode != mode {

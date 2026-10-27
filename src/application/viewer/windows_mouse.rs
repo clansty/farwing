@@ -809,7 +809,11 @@ impl WindowMouse {
         let mut point = POINT::default();
         let hovering =
             unsafe { GetCursorPos(&mut point) }.is_ok() && target.position(point, false).is_some();
-        if !relative && hovering {
+        // 「主控端鼠标」+ 强制本机指针：远端给的光标形状和「光标藏起来了」这个状态
+        // 都不再参与，本机指针一直用自己的箭头。被控端偶发藏光标时，这才是画面上
+        // 唯一还看得见的指针。
+        let forced = control.force_local_cursor() && !relative;
+        if !relative && hovering && !forced {
             if let Some(remote) = control.remote_cursor() {
                 let changed = self
                     .shape
@@ -911,7 +915,9 @@ impl WindowMouse {
         }
         // Controlled mode gets its cursor from the video. Smart-hidden and
         // forced-relative modes also hide the local pointer, as official UU.
-        window.set_cursor_visible(!relative && (!hovering || !control.remote_cursor_hidden()));
+        window.set_cursor_visible(
+            forced || (!relative && (!hovering || !control.remote_cursor_hidden())),
+        );
         self.using_cursor |= relative;
         router().install(target);
         super::windows_keyboard::set_target(self.owner, &self.input, intercept_shortcuts);
