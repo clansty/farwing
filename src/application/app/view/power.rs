@@ -5,6 +5,8 @@ pub(super) struct PowerConfirmation {
     device: DeviceInfo,
     action: PowerAction,
     generation: u64,
+    /// 只有重启会用到：重新上线后自动发起远程连接。
+    auto_connect: bool,
 }
 
 impl DeviceCenterApp {
@@ -17,11 +19,12 @@ impl DeviceCenterApp {
             device,
             action,
             generation: self.login_generation,
+            auto_connect: false,
         });
     }
 
     pub(super) fn power_confirmation(&mut self, ctx: &egui::Context) {
-        let Some(confirm) = self.center_ui.power.take() else {
+        let Some(mut confirm) = self.center_ui.power.take() else {
             return;
         };
         if confirm.generation != self.login_generation || self.logout_pending {
@@ -50,16 +53,28 @@ impl DeviceCenterApp {
                         }
                     }
                 }
+                if confirm.action == PowerAction::Reboot {
+                    ui.add_space(10.0);
+                    ui.checkbox(&mut confirm.auto_connect, "上线后自动连接");
+                    ui.label(RichText::new("观察到设备离线后重新上线，自动发起远程连接。").small().color(MUTED));
+                }
                 if let Some(issue) = &issue { ui.colored_label(AMBER, issue.to_string()); }
                 let (accept, dismiss) = crate::ui::controls::dialog_actions(ui, Some(crate::ui::controls::DialogAction::new(&format!("确认{}", confirm.action.label())).enabled(issue.is_none()).danger(confirm.action != PowerAction::Wake)), Some("取消"));
                 commit = accept;
                 cancel |= dismiss;
             });
         if commit {
+            // 先记下「上线后自动连接」的约定，交不出去（队列满了/后台没了）就作废。
+            self.power_auto_connect = confirm
+                .auto_connect
+                .then(|| confirm.device.device_id.clone());
             self.queue_mutation(DeviceMutation::Power {
                 device: confirm.device,
                 action: confirm.action,
             });
+            if !self.mutation_pending {
+                self.power_auto_connect = None;
+            }
         } else if !cancel && !response.should_close() {
             self.center_ui.power = Some(confirm);
         }

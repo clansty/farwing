@@ -198,6 +198,8 @@ struct DeviceCenterApp {
     queued_mutation: Option<DeviceMutation>,
     power_progress: std::collections::BTreeMap<String, power::PowerProgress>,
     pending_power: Option<power::PendingPower>,
+    /// 用户在这一轮电源操作里勾了「上线后自动连接」的设备；请求受理后就交给 `PowerProgress`。
+    power_auto_connect: Option<String>,
     selected_device_id: Option<String>,
     local_display: LocalDisplayInfo,
     media: ConnectionMediaOptions,
@@ -262,6 +264,7 @@ impl DeviceCenterApp {
             queued_mutation: None,
             power_progress: Default::default(),
             pending_power: None,
+            power_auto_connect: None,
             selected_device_id: None,
             local_display,
             media,
@@ -408,7 +411,7 @@ impl DeviceCenterApp {
                     {
                         continue;
                     }
-                    self.observe_power(&devices);
+                    let back_online = self.observe_power(&devices);
                     self.devices = Some(devices);
                     self.normalize_selection();
                     self.refreshed_at = Some(Instant::now());
@@ -417,6 +420,7 @@ impl DeviceCenterApp {
                         self.status = StatusMessage::success("设备状态已刷新");
                     }
                     self.login_restoring = false;
+                    self.auto_connect_after_power(&back_online);
                 }
                 GuiEvent::Catalog(generation, result, account_name) => {
                     if generation != self.login_generation
@@ -466,6 +470,7 @@ impl DeviceCenterApp {
                         continue;
                     }
                     self.mutation_pending = false;
+                    let failed = result.is_err();
                     self.status = match result {
                         Ok(MutationOutcome::Changed { message, .. }) => {
                             StatusMessage::success(message)
@@ -478,6 +483,10 @@ impl DeviceCenterApp {
                     };
                     self.center_ui.finish_device_operation();
                     self.pending_power = None;
+                    if failed {
+                        // 电源请求没落地，勾过的「上线后自动连接」也就作废。
+                        self.power_auto_connect = None;
+                    }
                 }
                 GuiEvent::Detail(generation, id, result) => {
                     if generation == self.login_generation

@@ -12,6 +12,8 @@ pub(super) struct PowerProgress {
     pub action: PowerAction,
     pub message: String,
     pub waiting: bool,
+    /// 用户勾了「上线后自动连接」，观察到重新上线就要替他发起远程连接。
+    auto_connect: bool,
     started: Instant,
     saw_offline: bool,
 }
@@ -23,16 +25,17 @@ pub(super) struct PendingPower {
 }
 
 impl PowerProgress {
-    fn observe(&mut self, devices: &DeviceList) {
+    /// 返回 true 表示设备刚刚回到在线，且用户约好了这一轮要自动连接（只会返回一次）。
+    fn observe(&mut self, devices: &DeviceList) -> bool {
         if !self.waiting {
-            return;
+            return false;
         }
         let Some(device) = devices
             .my_binded_devices
             .iter()
             .find(|d| d.device_id == self.device.device_id)
         else {
-            return;
+            return false;
         };
         self.saw_offline |= device.status == "DISCONNECTED";
         let observed = match self.action {
@@ -48,7 +51,11 @@ impl PowerProgress {
                 PowerAction::Reboot => "已观察到设备离线后重新上线",
             }
             .into();
+            let auto_connect = self.auto_connect && self.action == PowerAction::Reboot;
+            self.auto_connect = false;
+            return auto_connect;
         }
+        false
     }
 
     pub fn elapsed(&self) -> u64 {
@@ -85,6 +92,10 @@ impl DeviceCenterApp {
         let saw_offline = self.pending_power.take().is_some_and(|p| {
             p.id == accepted.device.device_id && p.action == accepted.action && p.saw_offline
         });
+        let auto_connect = self
+            .power_auto_connect
+            .take()
+            .is_some_and(|id| id == accepted.device.device_id);
         let message = accepted.receipt.summary(accepted.action);
         self.power_progress.insert(
             accepted.device.device_id.clone(),
@@ -93,6 +104,7 @@ impl DeviceCenterApp {
                 action: accepted.action,
                 message,
                 waiting: true,
+                auto_connect,
                 started: Instant::now(),
                 saw_offline,
             },
@@ -105,15 +117,32 @@ impl DeviceCenterApp {
         }
     }
 
-    pub(super) fn observe_power(&mut self, devices: &DeviceList) {
+    /// 收集这一轮设备清单里「刚刚上线且约好了自动连接」的设备。
+    pub(super) fn observe_power(&mut self, devices: &DeviceList) -> Vec<String> {
         if let Some(pending) = &mut self.pending_power {
             pending.saw_offline |= devices
                 .my_binded_devices
                 .iter()
                 .any(|d| d.device_id == pending.id && d.status == "DISCONNECTED");
         }
+        let mut back_online = Vec::new();
         for progress in self.power_progress.values_mut() {
-            progress.observe(devices);
+            if progress.observe(devices) {
+                back_online.push(progress.device.device_id.clone());
+            }
+        }
+        back_online
+    }
+
+    /// 重启完成后替用户发起连接；设备清单刚更新过，选中项可以安全改写。
+    pub(super) fn auto_connect_after_power(&mut self, back_online: &[String]) {
+        for id in back_online {
+            self.selected_device_id = Some(id.clone());
+            self.start_viewer_mode(false);
+            // 接管确认一次只能问一台，剩下的等这一轮处理完再说。
+            if self.takeover_confirmation.is_some() {
+                break;
+            }
         }
     }
 
@@ -123,6 +152,8 @@ impl DeviceCenterApp {
         for progress in self.power_progress.values_mut() {
             if progress.waiting && progress.elapsed() >= 120 {
                 progress.waiting = false;
+                // 等待都超时了，别再惦记着替他连。
+                progress.auto_connect = false;
                 progress.message = match progress.action {
                     PowerAction::Wake => "等待超时，尚未确认上线；请检查远端电源及唤醒条件",
                     PowerAction::Shutdown => "等待超时，尚未确认设备离线；请检查远端状态",
