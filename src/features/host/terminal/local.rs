@@ -478,13 +478,11 @@ fn list_sessions(path: &std::path::Path) -> Result<()> {
 }
 
 fn attach_client(path: &std::path::Path, session: Option<&str>, new: bool) -> Result<()> {
-    use std::os::fd::AsRawFd;
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    if !is_terminal(stdin.as_raw_fd()) {
+    use crate::features::terminal::tty;
+    if !tty::is_terminal() {
         bail!("请在终端里运行，输入不是一个终端");
     }
-    let (cols, rows) = terminal_size(stdout.as_raw_fd());
+    let (cols, rows) = tty::size();
     let mut stream = connect(path, true)?;
     // 名字里不会有引号之外的麻烦：会话名在服务端已经过滤掉控制字符。
     let request = if new {
@@ -515,7 +513,7 @@ fn attach_client(path: &std::path::Path, session: Option<&str>, new: bool) -> Re
         bail!("{}", reply["message"].as_str().unwrap_or("接入失败"));
     }
 
-    let _raw = RawMode::enter(stdin.as_raw_fd())?;
+    let _raw = tty::RawMode::enter()?;
     let stop = Arc::new(AtomicBool::new(false));
 
     // socket -> 本机屏幕
@@ -558,7 +556,7 @@ fn attach_client(path: &std::path::Path, session: Option<&str>, new: bool) -> Re
     let mut applied = (cols, rows);
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(SIZE_TICK);
-        let size = terminal_size(1);
+        let size = tty::size();
         if size != applied && size != (0, 0) {
             applied = size;
             let mut payload = [0u8; 4];
@@ -574,88 +572,10 @@ fn attach_client(path: &std::path::Path, session: Option<&str>, new: bool) -> Re
     Ok(())
 }
 
-fn is_terminal(fd: i32) -> bool {
-    // SAFETY: `isatty` 只读一个 fd。
-    unsafe { libc::isatty(fd) == 1 }
-}
-
-fn terminal_size(fd: i32) -> (u16, u16) {
-    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
-    // SAFETY: `fd` 由调用方保证是打开的终端，`size` 是有效的 winsize。
-    let filled = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ as libc::c_ulong, &mut size) };
-    if filled != 0 || size.ws_col == 0 || size.ws_row == 0 {
-        return (80, 24);
-    }
-    (size.ws_col, size.ws_row)
-}
-
-/// raw 模式的作用域守卫：无论怎么退出都把终端还给 shell。
-struct RawMode {
-    fd: i32,
-    original: libc::termios,
-}
-
-impl RawMode {
-    fn enter(fd: i32) -> Result<Self> {
-        // SAFETY: `tcgetattr` 只写我们提供的 termios。
-        let mut original: libc::termios = unsafe { std::mem::zeroed() };
-        if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
-            bail!("无法读取终端设置");
-        }
-        let mut raw = original;
-        // SAFETY: `cfmakeraw` 只改结构体字段。
-        unsafe { libc::cfmakeraw(&mut raw) };
-        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
-            bail!("无法切换终端到原始模式");
-        }
-        // 这里以前会发 DECSET 1007 关掉 alternateScroll（让备屏里的滚轮
-        // 不变成方向键）。但不是每个终端都认这个扩展模式，不认的那个会
-        // 把 `[PARSE ERROR] Unsupported screen mode: 1007 (private)` 打在
-        // 屏幕上；而 attach 的 stdout 可能正是用户启动它的那个终端。
-        // 滚轮问题留在文档里说明，不再动终端的模式。
-        Ok(Self { fd, original })
-    }
-}
-
-impl Drop for RawMode {
-    fn drop(&mut self) {
-        // 只复位样式和光标；备用屏幕的切换交给终端自己，别在这里替它
-        // 决定，也免得再给不认扩展模式的终端塞它不认识的东西。
-        terminal_control(b"\x1b[0m\x1b[?25h");
-        // SAFETY: fd 在作用域内一直有效，original 来自 tcgetattr。
-        unsafe {
-            libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
-        }
-    }
-}
-
-/// 往本机终端写一段控制序列；不支持的终端会忽略。
-fn terminal_control(sequence: &[u8]) {
-    let mut stdout = std::io::stdout();
-    let _ = stdout.write_all(sequence);
-    let _ = stdout.flush();
-}
-
 /// 在系统终端模拟器里接上会话。
 pub(crate) fn open_in_terminal(session: u32) -> Result<()> {
     let exe = std::env::current_exe().context("找不到当前程序路径")?;
-    let (program, args) = terminal_emulator().context("找不到可用的终端模拟器")?;
-    let mut command = std::process::Command::new(&program);
-    command.args(args);
-    command.args(attach_arguments(&exe, session));
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("启动 {program} 失败"))?;
-    // 很多模拟器把窗口交给已有的服务进程后自己立刻退出（gnome-terminal、
-    // `kitty --single-instance`）；不回收的话，每点一次「在本地打开」就会在
-    // 控制中心下面留一个僵尸。
-    std::thread::Builder::new()
-        .name("terminal emulator".into())
-        .spawn(move || {
-            let _ = child.wait();
-        })
-        .context("无法等待终端模拟器退出")?;
-    Ok(())
+    crate::features::terminal::launch::open(attach_arguments(&exe, session))
 }
 
 /// 在系统终端里重新运行本程序本身，再接上会话。
@@ -669,57 +589,6 @@ fn attach_arguments(exe: &std::path::Path, session: u32) -> Vec<std::ffi::OsStri
         "terminal".into(),
         session.to_string().into(),
     ]
-}
-
-/// 找一个能运行命令的终端模拟器。`$TERMINAL` 优先，再试常见的几个。
-fn terminal_emulator() -> Option<(String, Vec<String>)> {
-    if let Some(setting) = std::env::var_os("TERMINAL").and_then(|value| value.into_string().ok()) {
-        // `$TERMINAL` 是用户自己的选择，可能带着自己的参数（`foot -e`）。
-        let mut words = setting.split_whitespace();
-        if let Some(program) = words.next()
-            && in_path(program)
-        {
-            return Some((program.to_owned(), words.map(str::to_owned).collect()));
-        }
-    }
-    const CANDIDATES: &[(&str, &[&str])] = &[
-        ("xdg-terminal-exec", &[]),
-        ("foot", &["-e"]),
-        ("alacritty", &["-e"]),
-        ("kitty", &["-e"]),
-        ("konsole", &["-e"]),
-        ("ghostty", &["-e"]),
-        ("wezterm", &["start", "--"]),
-        ("gnome-terminal", &["--"]),
-        ("xterm", &["-e"]),
-    ];
-    CANDIDATES
-        .iter()
-        .find(|(program, _)| in_path(program))
-        .map(|(program, args)| {
-            (
-                (*program).to_owned(),
-                args.iter().map(|arg| (*arg).to_owned()).collect(),
-            )
-        })
-}
-
-fn in_path(program: &str) -> bool {
-    let path = std::path::Path::new(program);
-    if path.components().count() > 1 {
-        return path.is_file();
-    }
-    std::env::var_os("PATH")
-        .map(|paths| {
-            std::env::split_paths(&paths).any(|directory| {
-                let candidate = directory.join(program);
-                candidate.is_file()
-                    && std::fs::metadata(&candidate)
-                        .map(|meta| meta.permissions().mode() & 0o111 != 0)
-                        .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false)
 }
 
 #[cfg(test)]
