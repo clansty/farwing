@@ -15,6 +15,10 @@
 //! - Wayland (`xdg_activation_v1`): the token activates the window's surface,
 //!   through winit's own connection.
 //!
+//! The same machinery raises the control center when the click came from the
+//! notification area: there is no launcher to hand us a token, so [`focus`]
+//! asks the compositor for one itself.
+//!
 //! [startup-notification spec]: https://specifications.freedesktop.org/startup-notification-spec/startup-notification-latest.txt
 use anyhow::{Context, Result, bail};
 use winit::raw_window_handle::{
@@ -86,6 +90,36 @@ pub(crate) fn raise(window: &Window, token: &str, show: impl FnOnce()) -> Result
     }
 }
 
+/// Raise and focus an already mapped window for a click that did not come with
+/// a launcher's token — the notification area's "打开 OpenUUYC", or a
+/// notification action.
+///
+/// Wayland has no channel from the tray host to pass the click's input serial,
+/// so the token this asks for carries a placeholder serial. Compositors are
+/// free to downgrade that to an urgency hint; niri's
+/// `honor-xdg-activation-with-invalid-serial` and `on-xdg-activate` window rule
+/// turn it into a real focus. X11 uses the pager source of
+/// `_NET_ACTIVE_WINDOW`, which window managers accept without a timestamp.
+pub(crate) fn focus(window: &Window) -> Result<()> {
+    let display = window
+        .display_handle()
+        .context("读取窗口的显示连接失败")?
+        .as_raw();
+    match window.window_handle().context("读取窗口句柄失败")?.as_raw() {
+        RawWindowHandle::Xlib(handle) => x11::focus(handle.window as u32),
+        RawWindowHandle::Xcb(handle) => x11::focus(handle.window.get()),
+        RawWindowHandle::Wayland(handle) => {
+            let RawDisplayHandle::Wayland(display) = display else {
+                bail!("Wayland 窗口没有 Wayland 显示连接");
+            };
+            // SAFETY: both pointers come from the live winit window, which
+            // outlives this call.
+            unsafe { wayland::focus(display.display.as_ptr(), handle.surface.as_ptr()) }
+        }
+        _ => bail!("这个窗口系统不支持窗口激活"),
+    }
+}
+
 pub(super) mod x11 {
     use anyhow::{Context, Result};
     use x11rb::connection::Connection;
@@ -112,6 +146,17 @@ pub(super) mod x11 {
             activate(&connection, &atoms, root, window, timestamp(token))?;
         }
         complete(&connection, &atoms, root, token)?;
+        connection.flush()?;
+        Ok(())
+    }
+
+    /// Raise a window that is already mapped. Source 1 marks the request as a
+    /// pager's, which window managers honour without a user timestamp.
+    pub(in super::super) fn focus(window: u32) -> Result<()> {
+        let (connection, screen) = x11rb::connect(None).context("连接 X 服务器失败")?;
+        let root = connection.setup().roots[screen].root;
+        let atoms = Atoms::new(&connection)?.reply()?;
+        activate(&connection, &atoms, root, window, x11rb::CURRENT_TIME)?;
         connection.flush()?;
         Ok(())
     }
@@ -214,11 +259,18 @@ mod wayland {
     use anyhow::{Context, Result};
     use wayland_client::backend::{Backend, ObjectId};
     use wayland_client::globals::{GlobalListContents, registry_queue_init};
-    use wayland_client::protocol::{wl_registry, wl_surface::WlSurface};
+    use wayland_client::protocol::{wl_registry, wl_seat::WlSeat, wl_surface::WlSurface};
     use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
-    use wayland_protocols::xdg::activation::v1::client::xdg_activation_v1::XdgActivationV1;
+    use wayland_protocols::xdg::activation::v1::client::{
+        xdg_activation_token_v1::{self, XdgActivationTokenV1},
+        xdg_activation_v1::XdgActivationV1,
+    };
 
-    struct State;
+    #[derive(Default)]
+    struct State {
+        /// 合成器在 `done` 里给出的令牌；拒绝激活时是空串。
+        token: Option<String>,
+    }
 
     impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
         fn event(
@@ -232,6 +284,22 @@ mod wayland {
         }
     }
     wayland_client::delegate_noop!(State: ignore XdgActivationV1);
+    wayland_client::delegate_noop!(State: ignore WlSeat);
+
+    impl Dispatch<XdgActivationTokenV1, ()> for State {
+        fn event(
+            state: &mut Self,
+            _: &XdgActivationTokenV1,
+            event: xdg_activation_token_v1::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            if let xdg_activation_token_v1::Event::Done { token } = event {
+                state.token = Some(token);
+            }
+        }
+    }
 
     /// Activate winit's surface with `token` over winit's own connection, on
     /// a private event queue so winit's events are left alone.
@@ -263,8 +331,70 @@ mod wayland {
             .context("合成器不支持 xdg_activation_v1，无法激活窗口")?;
         activation.activate(token.to_owned(), &surface);
         activation.destroy();
-        queue.roundtrip(&mut State).context("激活窗口失败")?;
+        queue
+            .roundtrip(&mut State::default())
+            .context("激活窗口失败")?;
         Ok(())
+    }
+
+    /// 托盘点击发生在状态栏进程里，Wayland 没有把那次点击的输入序号交给我们
+    /// 的通道。这里用一个占位序号换令牌：合成器可以只把它当紧急提示，niri 的
+    /// `honor-xdg-activation-with-invalid-serial` 则会当成真正的聚焦请求。
+    ///
+    /// # Safety
+    ///
+    /// `display` and `surface` must be the live `wl_display` and `wl_surface`
+    /// of a window that outlives this call.
+    pub(super) unsafe fn focus(
+        display: *mut std::ffi::c_void,
+        surface: *mut std::ffi::c_void,
+    ) -> Result<()> {
+        // SAFETY: the caller guarantees the display and a live wl_surface proxy.
+        let connection =
+            Connection::from_backend(unsafe { Backend::from_foreign_display(display.cast()) });
+        let surface = unsafe { ObjectId::from_ptr(WlSurface::interface(), surface.cast()) }
+            .context("窗口的 Wayland 表面无效")?;
+        let surface =
+            WlSurface::from_id(&connection, surface).context("窗口的 Wayland 表面无效")?;
+        let (globals, mut queue) =
+            registry_queue_init::<State>(&connection).context("枚举 Wayland 全局对象失败")?;
+        let activation: XdgActivationV1 = globals
+            .bind(&queue.handle(), 1..=1, ())
+            .context("合成器不支持 xdg_activation_v1，无法激活窗口")?;
+        let seat: WlSeat = globals
+            .bind(&queue.handle(), 1..=1, ())
+            .context("合成器没有 wl_seat，无法激活窗口")?;
+        // 先带上占位序号（niri 的 honor-xdg-activation-with-invalid-serial 靠它
+        // 真正聚焦）；合成器不认就退回不带序号的令牌，至少把窗口标成紧急。
+        let token = match request_token(&activation, &mut queue, &surface, Some(&seat))? {
+            Some(token) => token,
+            None => request_token(&activation, &mut queue, &surface, None)?
+                .context("合成器没有发放激活令牌")?,
+        };
+        activation.activate(token, &surface);
+        activation.destroy();
+        queue
+            .roundtrip(&mut State::default())
+            .context("激活窗口失败")?;
+        Ok(())
+    }
+
+    fn request_token(
+        activation: &XdgActivationV1,
+        queue: &mut wayland_client::EventQueue<State>,
+        surface: &WlSurface,
+        seat: Option<&WlSeat>,
+    ) -> Result<Option<String>> {
+        let mut state = State::default();
+        let token = activation.get_activation_token(&queue.handle(), ());
+        if let Some(seat) = seat {
+            token.set_serial(0, seat);
+        }
+        token.set_surface(surface);
+        token.commit();
+        queue.roundtrip(&mut state).context("申请激活令牌失败")?;
+        token.destroy();
+        Ok(state.token.filter(|token| !token.is_empty()))
     }
 }
 

@@ -706,6 +706,21 @@ impl Runner {
 }
 
 impl DesktopWindow {
+    /// 显示并尽量把窗口叫到前台。Windows 交给 winit；Linux 的托盘点击没有启动器
+    /// 令牌，而 winit 的 `focus_window` 在 Wayland 上是空操作，所以自己走
+    /// xdg_activation / `_NET_ACTIVE_WINDOW`。
+    fn show_and_focus(&mut self) {
+        self.window.set_visible(true);
+        self.window.set_minimized(false);
+        #[cfg(target_os = "linux")]
+        if let Err(error) = crate::platform::linux::startup_notify::focus(&self.window) {
+            tracing::debug!(error = %format!("{error:#}"), "无法主动聚焦控制中心");
+        }
+        #[cfg(not(target_os = "linux"))]
+        self.window.focus_window();
+        self.context.request_repaint();
+    }
+
     /// Show the control center for a launch elsewhere. With the launcher's
     /// token the window is raised past focus-stealing prevention and the
     /// launch feedback ends; without one, or if that fails, it is shown as
@@ -723,12 +738,11 @@ impl DesktopWindow {
             })
             .is_ok()
         });
-        if !raised {
-            self.window.set_visible(true);
-            self.window.set_minimized(false);
-            self.window.focus_window();
+        if raised {
+            self.context.request_repaint();
+        } else {
+            self.show_and_focus();
         }
-        self.context.request_repaint();
     }
 
     fn schedule(&mut self, when: Instant) {
@@ -1172,10 +1186,7 @@ impl ApplicationHandler<Event> for Windows {
             }
             Event::Request(Request::ShowMain) => {
                 if let Some(state) = &mut self.main.state {
-                    state.window.set_visible(true);
-                    state.window.set_minimized(false);
-                    state.window.focus_window();
-                    state.context.request_repaint();
+                    state.show_and_focus();
                 } else if self.main.hidden.is_some()
                     && let Err(error) = self.main.create(event_loop)
                 {
