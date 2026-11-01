@@ -978,6 +978,13 @@ impl ConnectingWindowsRunner {
         };
         let window = slot.window.clone();
         let shell = &mut slot.shell;
+        // 画面上的触点算远端输入，其余留给本地界面。
+        if let WindowEvent::Touch(touch) = &event
+            && let DetachedStage::Playing(player) = &mut slot.stage
+            && player.touch(&shell.context, &window, touch)
+        {
+            return;
+        }
         let previous_events = shell.input.egui_input_mut().events.len();
         let response = shell.input.on_window_event(&window, &event);
         let consumed = match event {
@@ -1299,6 +1306,13 @@ impl ApplicationHandler<UiEvent> for ConnectingWindowsRunner {
         let (Some(window), Some(shell)) = (self.window.clone(), self.shell.as_mut()) else {
             return;
         };
+        // 画面上的触点算远端输入，其余留给本地界面。
+        if let WindowEvent::Touch(touch) = &event
+            && let Stage::Playing(player) = &mut self.stage
+            && player.touch(&shell.context, &window, touch)
+        {
+            return;
+        }
         let previous_events = shell.input.egui_input_mut().events.len();
         let response = shell.input.on_window_event(&window, &event);
         // egui-winit calls every Tab press consumed so that it can move focus,
@@ -3311,6 +3325,22 @@ impl Player {
             self.input().pause_owner(self.owner);
             self.control().drag_drop().cancel_gesture(true);
         }
+    }
+
+    /// 把一个触摸屏触点交给远端；返回 false 表示留给 egui。
+    fn touch(
+        &mut self,
+        context: &egui::Context,
+        window: &Arc<Window>,
+        touch: &winit::event::Touch,
+    ) -> bool {
+        self.update_input_gate(context, window);
+        // 本地界面正持有输入或在拖文件时，新触点归本地界面；已经按下的照样能抬起。
+        let spot = (!self.local_input_blocked && !self.control().drag_drop().interactive())
+            .then(|| self.point_mapper(context)(touch.location, false))
+            .flatten()
+            .map(|point| (point.screen, point.x, point.y));
+        super::touch::forward(self.control(), self.owner, touch, spot)
     }
 
     /// Returns true when the event was consumed by remote input.

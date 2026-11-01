@@ -247,6 +247,10 @@ impl RawRouter {
             return;
         };
         let input = target.control.mouse();
+        // 触摸就按触摸发，绝不再当成 Windows 替它合成的鼠标。
+        if crate::platform::windows::input::system::touch_promoted() {
+            return;
+        }
         if crate::platform::windows::input::system::own_message() && !input.accepts_host_input() {
             return;
         }
@@ -399,6 +403,13 @@ impl RawRouter {
             return false;
         }
         let mouse = unsafe { raw.data.mouse };
+        // Windows 从一个触摸或笔触点提升出来的鼠标：触点本身已经走
+        // `WindowMouse::touch` 发过了。
+        if crate::platform::windows::input::system::touch_message(mouse.ulExtraInformation as usize)
+            || crate::platform::windows::input::system::touch_promoted()
+        {
+            return false;
+        }
         let host_input = mouse.ulExtraInformation as usize
             == crate::platform::windows::input::system::INPUT_MARKER;
         let input = target.control.mouse();
@@ -641,6 +652,33 @@ impl WindowMouse {
 
     pub fn wheel(&self, delta: winit::event::MouseScrollDelta) {
         router().wheel(self.owner, delta);
+    }
+
+    /// 转发画面上的一个触摸屏触点。属于本地界面时返回 false，让事件原样交给
+    /// egui。
+    pub fn touch(
+        &self,
+        window: &Window,
+        context: &egui::Context,
+        control: &StreamControlHandle,
+        track: i32,
+        video_size: &VideoSize,
+        event: &winit::event::Touch,
+    ) -> bool {
+        let Some(target) = Target::for_window(window, control, context, track, video_size) else {
+            return false;
+        };
+        // winit 报的是客户区坐标；position() 要的是屏幕坐标，所以显式来回换一次。
+        let mut point = POINT {
+            x: event.location.x.round() as i32,
+            y: event.location.y.round() as i32,
+        };
+        // 拖文件占着指针时新触点不再进远端；已经按下的触点照样能抬起。
+        let spot = (!control.drag_drop().interactive()
+            && unsafe { ClientToScreen(HWND(target.hwnd as _), &mut point).as_bool() })
+        .then(|| target.position(point, false))
+        .flatten();
+        super::touch::forward(control, self.owner, event, spot)
     }
 
     fn release_capture(&mut self, window: &Window) -> bool {

@@ -241,6 +241,20 @@ impl ThreadedWindowsApp {
             }
             return Ok(());
         }
+        // 原生触摸透传排在这之后：控制期间的画面触点算远端输入，其余留给本地界面。
+        if let WindowEvent::Touch(touch) = event
+            && self.mouse.touch(
+                window,
+                &self.egui_context,
+                &self.stream_control,
+                self._session.track_index,
+                &self.renderer.current_video_size,
+                touch,
+            )
+        {
+            window.request_redraw();
+            return Ok(());
+        }
         let response = self.egui_winit.on_window_event(window, event);
         if let WindowEvent::Focused(focused) = event {
             tracing::debug!(focused, mouse_mode = ?self.stream_control.mouse().mode(),

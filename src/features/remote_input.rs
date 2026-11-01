@@ -2,6 +2,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
+use crate::features::host::input::wire::Point;
 use crate::protocol::gamepad::{GamepadEvent, GamepadState, GamepadVibration, MAX_GAMEPADS};
 use crate::protocol::keyboard::KeyboardKey;
 use anyhow::{Result, bail};
@@ -10,7 +11,9 @@ use tokio::sync::Notify;
 
 pub(crate) mod polling;
 mod recovery;
+pub(crate) mod touch;
 pub(crate) use recovery::{InputRecovery, InputWork};
+pub(crate) use touch::{Phase, Spot};
 
 #[cfg(test)]
 mod tests;
@@ -96,6 +99,12 @@ pub(crate) enum InputEvent {
         interrupt: bool,
     },
     Gamepad(GamepadEvent),
+    /// 原生触摸，也是唯一走二进制的输入类型：`kind` 加一整组触点快照，
+    /// 按被控端的线上格式编码，不走 JSON。
+    Touch {
+        kind: u8,
+        points: Vec<Point>,
+    },
     Heartbeat,
 }
 
@@ -114,6 +123,7 @@ impl InputEvent {
                 | Self::Wheel { .. }
                 | Self::AssistButton { .. }
                 | Self::Gamepad(_)
+                | Self::Touch { .. }
         )
     }
     pub fn send_timeout(&self) -> std::time::Duration {
@@ -135,9 +145,17 @@ impl InputEvent {
             Self::Button { down: false, .. }
                 | Self::Key { down: false, .. }
                 | Self::AssistButton { down: false, .. }
+                | Self::Touch { kind: 3 | 4, .. }
         ) || matches!(self, Self::Gamepad(event) if event.release())
     }
     pub(crate) fn encode(&self) -> Vec<u8> {
+        // 被控端按第一个字节分派：'{' 开 JSON，别的都是 protobuf 控制信封。
+        // 触摸是唯一走二进制那条的输入类型。
+        if let Self::Touch { kind, points } = self {
+            return crate::features::stream_control::encode_touch_input(
+                crate::features::host::input::wire::encode_touch(*kind, points),
+            );
+        }
         let value = match *self {
             Self::Absolute { screen, x, y } => serde_json::json!({
                 "action":"mouse_move_absolute", "screen_id":screen, "abs_x":x, "abs_y":y }),
@@ -159,6 +177,7 @@ impl InputEvent {
             } => key.encode(down, lock, interrupt),
             Self::Gamepad(event) => event.json(),
             Self::Heartbeat => serde_json::json!({"heartbeat":"kbd_heartbeat"}),
+            Self::Touch { .. } => unreachable!("touch encodes above"),
         };
         serde_json::to_vec(&value).expect("finite mouse events serialize")
     }
@@ -229,6 +248,7 @@ struct State {
     keyboard_platform: i32,
     accept_host_input: bool,
     queue: VecDeque<InputEvent>,
+    touch: touch::Forwarder,
     in_flight: bool,
     in_flight_assist: Option<u64>,
     epoch: u64,
@@ -678,6 +698,8 @@ impl RemoteInput {
             s.owner = None;
             s.held = [false; 5];
             s.keys.clear();
+            // 传输已经没了，远端触摸由被控端自己的引擎兜底抬起。
+            s.touch.clear();
             s.keyboard_generation = s.keyboard_generation.wrapping_add(1);
             s.queue.clear();
             s.in_flight = false;
@@ -799,6 +821,11 @@ impl RemoteInput {
             }
         }
         s.held = [false; 5];
+        // 远端的触点像按住的键一样抬起；这一帧是释放义务，会绕过背压，
+        // 所以失去控制之后不会有手指一直按着。
+        if let Some((kind, points)) = s.touch.clear() {
+            s.queue.push_back(InputEvent::Touch { kind, points });
+        }
         Self::release_gamepads_locked(s);
         s.owner = None;
     }
@@ -841,6 +868,10 @@ impl RemoteInput {
                     }
                     s.held[index] = false;
                 }
+            }
+            // 放在上面的清空之后，这一帧抬手才不会跟着被清掉。
+            if let Some((kind, points)) = s.touch.clear() {
+                s.queue.push_back(InputEvent::Touch { kind, points });
             }
             // A file drag keeps only its submitted left-button hold, never
             // a controller or vibration owned by the window losing focus.
@@ -1063,6 +1094,79 @@ impl RemoteInput {
         self.wake.notify_one();
     }
 
+    /// 转发一个触摸屏触点：`native` 为真（由手势的第一根手指决定）时发原生帧，
+    /// 否则模拟左键。事件属于本地界面、或者现在轮不到我们控制时返回 false，
+    /// 把它留给 egui。
+    pub fn touch(
+        &self,
+        owner: u64,
+        phase: Phase,
+        id: u32,
+        pressure: f64,
+        spot: Option<Spot>,
+        native: bool,
+    ) -> bool {
+        let mut s = self.lock();
+        let mut next = s.touch.clone();
+        let mut step = next.step(phase, id, pressure, spot, native);
+        if step == touch::Step::Local {
+            return false;
+        }
+        if s.owner != Some(owner) {
+            // 只有新按下的触点才能夺走控制权。夺权会抬起上一个所有者的触点，
+            // 所以要在剩下的状态上重新推一次。
+            if phase != Phase::Start || !Self::claim(&mut s, owner) {
+                return false;
+            }
+            next = s.touch.clone();
+            step = next.step(phase, id, pressure, spot, native);
+        } else if !matches!(
+            step,
+            touch::Step::Frame(3 | 4, _)
+                | touch::Step::Pointer {
+                    button: Some(false),
+                    ..
+                }
+        ) && !Self::claim(&mut s, owner)
+        {
+            // 抬起是释放义务，其余都要先拿到控制权。
+            return false;
+        }
+        s.touch = next;
+        match step {
+            touch::Step::Local => return false,
+            touch::Step::Held => {}
+            touch::Step::Frame(kind, points) => {
+                // kind 2 的快照互相取代；其他 kind 都是不能被合并掉的边沿。
+                // 抬起无条件入队，和按键、按钮的 UP 一样算释放义务。
+                if kind == 2
+                    && let Some(InputEvent::Touch {
+                        kind: 2,
+                        points: old,
+                    }) = s.queue.back_mut()
+                {
+                    *old = points;
+                } else if matches!(kind, 3 | 4) {
+                    s.queue.push_back(InputEvent::Touch { kind, points });
+                } else {
+                    Self::push(&mut s, InputEvent::Touch { kind, points });
+                }
+                drop(s);
+                self.wake.notify_one();
+            }
+            touch::Step::Pointer { at, button } => {
+                drop(s);
+                if let Some((screen, x, y)) = at {
+                    self.absolute(owner, screen, x, y);
+                }
+                if let Some(down) = button {
+                    self.button(owner, 1, down);
+                }
+            }
+        }
+        true
+    }
+
     pub fn wheel(&self, owner: u64, delta: i32, horizontal: bool) {
         if delta == 0 {
             return;
@@ -1258,6 +1362,16 @@ impl RemoteInput {
                     *y = ny;
                 }
                 (InputEvent::Heartbeat, Some(InputEvent::Heartbeat)) => {}
+                (
+                    InputEvent::Touch { kind, points },
+                    Some(InputEvent::Touch {
+                        kind: next_kind,
+                        points: next_points,
+                    }),
+                ) if *kind == 2 && *next_kind == 2 => {
+                    // 全量快照：最新的一帧单独就决定了触点集合，中间那帧是多余的。
+                    *points = next_points.clone();
+                }
                 (
                     InputEvent::Gamepad(GamepadEvent::Update { index, state }),
                     Some(InputEvent::Gamepad(GamepadEvent::Update {
@@ -2094,5 +2208,193 @@ mod gamepad_tests {
         assert!(hold.current());
         hold.cancel();
         assert!(!hold.current());
+    }
+}
+
+#[cfg(test)]
+mod touch_tests {
+    use super::*;
+
+    fn controlling() -> RemoteInput {
+        let input = RemoteInput::default();
+        input.set_ready(true);
+        input.enable(MouseMode::Remote, false).unwrap();
+        input.confirm_neutral(input.activation_generation());
+        input
+    }
+
+    async fn event(input: &RemoteInput) -> QueuedInputEvent {
+        match tokio::time::timeout(Duration::from_secs(1), input.next())
+            .await
+            .unwrap()
+        {
+            InputWork::Event(event) => event,
+            InputWork::Recovery(_) => panic!("unexpected recovery"),
+        }
+    }
+
+    fn contacts(points: &[Point]) -> Vec<(u32, f64, f64)> {
+        points.iter().map(|p| (p.id, p.x, p.y)).collect()
+    }
+
+    /// 编码后的字节走被控端真正收到它的那条路：先解 protobuf 信封，再解触摸帧。
+    fn decode(bytes: &[u8]) -> (u8, Vec<(u32, f64, f64)>) {
+        let inner = crate::features::stream_control::publisher::input_event(bytes)
+            .expect("protobuf envelope decodes")
+            .expect("is an input event");
+        match crate::features::host::input::wire::touch(inner.as_slice())
+            .expect("touch frame decodes")
+            .expect("is a touch event")
+        {
+            crate::features::host::input::wire::Event::Touch { kind, points } => {
+                (kind, contacts(&points))
+            }
+            _ => panic!("expected a touch event"),
+        }
+    }
+
+    fn touch(
+        input: &RemoteInput,
+        owner: u64,
+        phase: Phase,
+        id: u32,
+        at: Option<(f64, f64)>,
+    ) -> bool {
+        input.touch(owner, phase, id, 0.5, at.map(|(x, y)| (0, x, y)), true)
+    }
+
+    #[tokio::test]
+    async fn frames_travel_the_binary_channel_and_decode() {
+        let input = controlling();
+        assert!(touch(&input, 1, Phase::Start, 4, Some((0.25, 0.75))));
+        let first = event(&input).await;
+        assert!(!first.event.release());
+        let bytes = first.event.encode();
+        assert_ne!(bytes.first(), Some(&b'{'));
+        assert_eq!(decode(&bytes), (1, vec![(4, 0.25, 0.75)]));
+        // 第二个手指以带两个触点的全量快照加入。
+        assert!(touch(&input, 1, Phase::Start, 9, Some((0.5, 0.5))));
+        let second = event(&input).await;
+        assert_eq!(
+            decode(&second.event.encode()),
+            (2, vec![(4, 0.25, 0.75), (9, 0.5, 0.5)])
+        );
+        // 一根手指抬起是不含它的快照，最后一根用 kind 3。
+        assert!(touch(&input, 1, Phase::End, 4, Some((0.3, 0.7))));
+        let partial = event(&input).await;
+        assert_eq!(decode(&partial.event.encode()), (2, vec![(9, 0.5, 0.5)]));
+        assert!(touch(&input, 1, Phase::End, 9, None));
+        let lift = event(&input).await;
+        assert!(lift.event.release());
+        assert_eq!(decode(&lift.event.encode()), (3, vec![]));
+    }
+
+    #[tokio::test]
+    async fn snapshots_coalesce_before_submission() {
+        let input = controlling();
+        touch(&input, 1, Phase::Start, 4, Some((0.1, 0.1)));
+        let press = event(&input).await;
+        input.complete(&press, Ok(()));
+        // 第一帧移动还在路上，后面的快照折进它。
+        touch(&input, 1, Phase::Move, 4, Some((0.2, 0.2)));
+        let mut pending = event(&input).await;
+        for i in 0..50 {
+            assert!(touch(
+                &input,
+                1,
+                Phase::Move,
+                4,
+                Some((0.2 + f64::from(i) * 0.001, 0.2))
+            ));
+        }
+        assert_eq!(input.lock().queue.len(), 1);
+        assert!(input.refresh_pending(&mut pending));
+        assert!(input.lock().queue.is_empty());
+        // 线上是 f32；0.249 按 f32 的方式取整。
+        assert_eq!(
+            decode(&pending.event.encode()),
+            (2, vec![(4, f64::from(0.249_f32), f64::from(0.2_f32))])
+        );
+        input.complete(&pending, Ok(()));
+        // 边沿事件从不折叠：抬起自己占一帧。
+        touch(&input, 1, Phase::End, 4, None);
+        assert_eq!(input.lock().queue.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn losing_control_lifts_held_touches() {
+        let input = controlling();
+        touch(&input, 1, Phase::Start, 4, Some((0.5, 0.5)));
+        let press = event(&input).await;
+        input.complete(&press, Ok(()));
+        input.enable(MouseMode::View, false).unwrap();
+        let lift = event(&input).await;
+        assert!(lift.event.release());
+        assert_eq!(decode(&lift.event.encode()), (3, vec![]));
+        // 手势尾巴既不转发也不复活触点。
+        assert!(!touch(&input, 1, Phase::Move, 4, Some((0.6, 0.6))));
+        assert!(!touch(&input, 1, Phase::End, 4, None));
+    }
+
+    #[tokio::test]
+    async fn another_window_takes_over_without_reviving_contacts() {
+        let input = controlling();
+        touch(&input, 1, Phase::Start, 4, Some((0.5, 0.5)));
+        let press = event(&input).await;
+        input.complete(&press, Ok(()));
+        // 不持有输入的窗口发来的移动被拒。
+        assert!(!touch(&input, 2, Phase::Move, 4, Some((0.6, 0.6))));
+        // 那里的新触点可以夺权：先抬起窗口 1 的手指，再只用自己开手势。
+        assert!(touch(&input, 2, Phase::Start, 7, Some((0.25, 0.25))));
+        let lift = event(&input).await;
+        assert_eq!(decode(&lift.event.encode()), (3, vec![]));
+        input.complete(&lift, Ok(()));
+        let open = event(&input).await;
+        assert_eq!(decode(&open.event.encode()), (1, vec![(7, 0.25, 0.25)]));
+    }
+
+    #[tokio::test]
+    async fn emulated_gesture_drives_the_left_button() {
+        let input = controlling();
+        assert!(input.touch(1, Phase::Start, 4, 0.5, Some((3, 0.25, 0.5)), false));
+        let moved = event(&input).await;
+        assert!(matches!(
+            moved.event,
+            InputEvent::Absolute {
+                screen: 3,
+                x: 0.25,
+                y: 0.5
+            }
+        ));
+        input.complete(&moved, Ok(()));
+        let press = event(&input).await;
+        assert!(matches!(
+            press.event,
+            InputEvent::Button {
+                button: 1,
+                down: true
+            }
+        ));
+        input.complete(&press, Ok(()));
+        // 第二根手指被吃掉，不到远端。
+        assert!(input.touch(1, Phase::Start, 5, 0.5, Some((3, 0.75, 0.5)), true));
+        assert!(input.lock().queue.is_empty());
+        assert!(input.touch(1, Phase::End, 4, 0.0, None, false));
+        let release = event(&input).await;
+        assert!(matches!(
+            release.event,
+            InputEvent::Button {
+                button: 1,
+                down: false
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_ui_contacts_are_not_consumed() {
+        let input = controlling();
+        assert!(!touch(&input, 1, Phase::Start, 4, None));
+        assert!(!touch(&input, 1, Phase::Move, 4, Some((0.5, 0.5))));
+        assert_eq!(input.lock().queue.len(), 0);
     }
 }

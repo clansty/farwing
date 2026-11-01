@@ -75,6 +75,17 @@ pub(crate) fn encode_port_mapping(payload: Vec<u8>) -> Vec<u8> {
     .encode_to_vec()
 }
 
+/// 二进制输入通道上的原生触摸；被控端对这个负载不读 seq/timestamp，
+/// 和端口映射帧完全一样。
+pub(crate) fn encode_touch_input(payload: Vec<u8>) -> Vec<u8> {
+    PbControlMessage {
+        seq: 0,
+        timestamp: 0,
+        payload: Some(PbPayload::InputEvent(payload)),
+    }
+    .encode_to_vec()
+}
+
 pub(crate) fn decode_port_mapping(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
     Ok(match PbControlMessage::decode(bytes)?.payload {
         Some(PbPayload::PortMappingFrame(frame)) => Some(frame),

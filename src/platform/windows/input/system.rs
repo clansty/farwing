@@ -15,6 +15,17 @@ pub(crate) fn own_message() -> bool {
     unsafe { GetMessageExtraInfo().0 as usize == INPUT_MARKER }
 }
 
+/// Windows 把触摸或笔的触点提升成的鼠标消息：它的附加信息低 32 位带
+/// `MI_WP_SIGNATURE`。
+pub(crate) fn touch_message(extra: usize) -> bool {
+    extra as u32 & 0xffff_ff00 == 0xff51_5700
+}
+
+/// 正在派发的这条消息是 [`touch_message`] 描述的那种。
+pub(crate) fn touch_promoted() -> bool {
+    touch_message(unsafe { GetMessageExtraInfo().0 as usize })
+}
+
 pub(crate) fn send(items: &[INPUT]) -> Result<()> {
     if items.is_empty() {
         return Ok(());

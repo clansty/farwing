@@ -80,6 +80,9 @@ pub(crate) struct DualCapability {
     pub frame_quality_capability: Vec<FrameQualityCapability>,
     #[serde(skip)]
     preferred_hardware: Vec<FrameQualityCapability>,
+    /// 对端是 OpenUUYC：凡是申报了 SDR10 的版本，都接受桌面控制器发来的原生触摸。
+    #[serde(skip)]
+    pub openuuyc_host: bool,
 }
 
 impl DualCapability {
@@ -177,6 +180,7 @@ impl DualCapability {
             }
         }
         Self {
+            openuuyc_host: remote.openuuyc_sdr_10bit,
             preferred_codec: local
                 .preferred_codec
                 .filter(|c| matches!(c, 1 | 2 | 5))

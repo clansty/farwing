@@ -40,7 +40,7 @@ use wire::{
 };
 pub(crate) use wire::{
     decode_port_mapping, encode_pb_echo_request, encode_port_mapping,
-    encode_read_only_feature_flags,
+    encode_read_only_feature_flags, encode_touch_input,
 };
 
 pub(crate) mod annotation;

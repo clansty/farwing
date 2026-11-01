@@ -58,6 +58,25 @@ impl StreamControlHandle {
         Some((screen.id, screen.width, screen.height))
     }
 
+    /// 转发画面上的一个触摸屏触点。触摸帧里不带屏幕，被控端只会把它放到自己
+    /// 当前那块屏上；只有触点确实在那块屏、且对端是 OpenUUYC 被控端（官方被控端
+    /// 怎么处理桌面控制器的触摸没验证过）时，手势才走原生。其余情况由它的第一根
+    /// 手指驱动左键。
+    pub(crate) fn touch(
+        &self,
+        owner: u64,
+        phase: crate::features::remote_input::Phase,
+        id: u32,
+        pressure: f64,
+        spot: Option<crate::features::remote_input::Spot>,
+    ) -> bool {
+        let native = spot.is_some_and(|(screen, ..)| {
+            let s = lock(&self.shared);
+            s.current_screen_id == screen && s.capability.as_ref().is_some_and(|c| c.openuuyc_host)
+        });
+        self.mouse().touch(owner, phase, id, pressure, spot, native)
+    }
+
     pub(crate) fn take_mouse_restore_point(&self, track: i32) -> Option<[f64; 2]> {
         let mut s = lock(&self.shared);
         let screen = s
