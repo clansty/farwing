@@ -60,6 +60,15 @@ pub(super) fn capture_loop(
     let mut zero_copy_allowed = true;
     let mut metrics = metrics::Metrics::default();
     let mut paused_capture_at = None::<Instant>;
+    // 采集线程注册 MMCSS，避免被同机编码/后台任务抢占；失败不影响采集。
+    #[cfg(windows)]
+    let _capture_priority = match crate::platform::windows::mmcss::CapturePriority::enter() {
+        Ok(priority) => Some(priority),
+        Err(error) => {
+            tracing::warn!(%error, "host capture MMCSS registration failed");
+            None
+        }
+    };
     let mut pipeline = None::<pipeline::Pipeline>;
 
     while !cancel.is_cancelled() && handle.requested() {
