@@ -9,9 +9,12 @@ pub(super) struct Stage {
 }
 impl Stage {
     pub fn record(&mut self, elapsed: Duration) {
-        self.count += 1;
-        self.total += elapsed;
-        self.maximum = self.maximum.max(elapsed);
+        self.absorb(1, elapsed, elapsed);
+    }
+    pub fn absorb(&mut self, count: u64, total: Duration, maximum: Duration) {
+        self.count += count;
+        self.total += total;
+        self.maximum = self.maximum.max(maximum);
     }
     fn average_ms(&self) -> f64 {
         self.total.as_secs_f64() * 1000.0 / self.count.max(1) as f64
@@ -56,6 +59,14 @@ impl Default for Metrics {
     }
 }
 impl Metrics {
+    /// 把独立编码线程的统计并进本采样窗口。
+    pub fn absorb(&mut self, stats: super::pipeline::Stats) {
+        self.encoded_frames += stats.encoded;
+        self.encode
+            .absorb(stats.encode_count, stats.encode_total, stats.encode_max);
+        self.send_drops += stats.send_drops;
+        self.transfer_busy += stats.busy;
+    }
     pub fn report(&mut self, target_fps: u32, source_adapter: u64, encoder_adapter: u64) {
         let elapsed = self.started.elapsed();
         if elapsed < Duration::from_secs(5) {

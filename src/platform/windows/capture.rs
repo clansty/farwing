@@ -369,6 +369,21 @@ impl Frame {
     }
 }
 
+/// 未经缩放的 DXGI 帧。纹理已经复制进采集→编码的共享环，`lease` 负责
+/// 让编码线程等 GPU 写入完成。
+pub(crate) struct RawCapture {
+    pub width: u32,
+    pub height: u32,
+    pub captured: std::time::Instant,
+    pub is_new: bool,
+    pub hdr_metadata: Option<crate::media::video_color::HdrMetadata>,
+    pub rotation: DXGI_MODE_ROTATION,
+    pub white: f32,
+    pub source_hdr: Option<crate::media::video_color::HdrMetadata>,
+    pub request: super::preprocess::Request,
+    pub lease: super::transfer::pipeline::FrameLease,
+}
+
 enum Backend {
     Session(Box<session::Session>),
     Dxgi(Duplication),
@@ -523,6 +538,32 @@ impl Desktop {
     pub fn hardware_active(&self) -> bool {
         false
     }
+    /// 当前 DXGI 输出的原始纹理规格；只有这条后端能走共享环。
+    pub fn raw_desc(&self) -> Option<(u32, u32, u32)> {
+        match &self.backend {
+            Backend::Dxgi(d) => d.raw_desc().ok(),
+            _ => None,
+        }
+    }
+
+    /// 抓一帧原始桌面纹理，直接复制进 `sender` 的共享环。调用方随后只需
+    /// 把返回的 lease 交给编码线程，不需要在本线程做缩放/色彩转换。
+    pub fn next_raw(
+        &mut self,
+        timeout: u32,
+        quality: i32,
+        hdr: bool,
+        maximum: (u32, u32),
+        sender: &mut super::transfer::pipeline::Sender,
+    ) -> Result<Option<RawCapture>> {
+        if let Backend::Dxgi(d) = &mut self.backend {
+            let result = d.next_raw(timeout, quality, hdr, maximum, sender);
+            self.available = result.is_ok();
+            return result;
+        }
+        Ok(None)
+    }
+
     pub fn next(
         &mut self,
         timeout: u32,
@@ -818,6 +859,118 @@ impl Duplication {
             }
             .context("无法采集当前桌面；请检查屏幕、锁屏或其他采集程序")?;
             Ok(duplication)
+        }
+    }
+
+    fn raw_desc(&self) -> Result<(u32, u32, u32)> {
+        let desc = unsafe {
+            self.duplication
+                .as_ref()
+                .context("DXGI采集对象缺失")?
+                .GetDesc()
+        };
+        let mode = desc.ModeDesc;
+        ensure!(
+            mode.Width > 0 && mode.Height > 0 && mode.Width <= 16384 && mode.Height <= 16384,
+            "采集纹理尺寸无效"
+        );
+        // ModeDesc 已经是旋转后的逻辑尺寸；duplication 纹理本身还是
+        // 旋转前的 framebuffer。90/270 时要把宽高换回来建共享环。
+        let rotated = matches!(
+            self.rotation,
+            DXGI_MODE_ROTATION_ROTATE90 | DXGI_MODE_ROTATION_ROTATE270
+        );
+        let (width, height) = if rotated {
+            (self.screen.height, self.screen.width)
+        } else {
+            (self.screen.width, self.screen.height)
+        };
+        Ok((width, height, mode.Format.0 as u32))
+    }
+
+    fn next_raw(
+        &mut self,
+        timeout_ms: u32,
+        quality: i32,
+        hdr: bool,
+        maximum: (u32, u32),
+        sender: &mut super::transfer::pipeline::Sender,
+    ) -> Result<Option<RawCapture>> {
+        let request = super::preprocess::Request {
+            quality,
+            maximum,
+            hdr,
+        };
+        unsafe {
+            let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+            let mut resource = None;
+            self.release_frame()?;
+            let duplication = self.duplication.as_ref().context("DXGI采集对象缺失")?;
+            match duplication.AcquireNextFrame(timeout_ms.min(50), &mut info, &mut resource) {
+                Ok(()) => self.frame_acquired = true,
+                Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(None),
+                Err(error) => return Err(error).context("桌面采集失效，需要重建所选屏幕采集"),
+            }
+
+            let captured = std::time::Instant::now();
+            if info.LastPresentTime == 0 {
+                self.release_frame()?;
+                return Ok(None);
+            }
+            let texture: ID3D11Texture2D = resource.context("采集未返回纹理")?.cast()?;
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            texture.GetDesc(&mut desc);
+            ensure!(
+                matches!(
+                    desc.Format,
+                    DXGI_FORMAT_B8G8R8A8_UNORM
+                        | DXGI_FORMAT_R8G8B8A8_UNORM
+                        | DXGI_FORMAT_R16G16B16A16_FLOAT
+                ),
+                "不支持的采集像素格式：{}",
+                desc.Format.0
+            );
+            ensure!(
+                desc.Width > 0
+                    && desc.Height > 0
+                    && desc.Width <= 16384
+                    && desc.Height <= 16384,
+                "采集纹理尺寸无效"
+            );
+            let lease = match sender.send_texture(&texture) {
+                Ok(Some(lease)) => lease,
+                Ok(None) => {
+                    self.release_frame()?;
+                    return Ok(None);
+                }
+                Err(error) => {
+                    let _ = self.release_frame();
+                    return Err(error);
+                }
+            };
+            self.release_frame()?;
+            self.quality = Some(request);
+            self.presented_since_repair = true;
+            // 有些虚拟显示器会把 Rotation 报成 90/270，但 duplication 纹理
+            // 本身已经和 screen 的逻辑尺寸一致；此时再转一次会把 2160x1920
+            // 变成 1920x2160，编码器会拒绝输入。
+            let rotation = if (desc.Width, desc.Height) == (self.screen.width, self.screen.height) {
+                DXGI_MODE_ROTATION_IDENTITY
+            } else {
+                self.rotation
+            };
+            Ok(Some(RawCapture {
+                width: desc.Width,
+                height: desc.Height,
+                captured,
+                is_new: true,
+                hdr_metadata: if hdr { self.source_hdr } else { None },
+                rotation,
+                white: self.sdr_white,
+                source_hdr: self.source_hdr,
+                request,
+                lease,
+            }))
         }
     }
 

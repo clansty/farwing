@@ -172,6 +172,13 @@ pub(crate) struct Frame {
     pub is_new: bool,
     pub hdr_metadata: Option<crate::media::video_color::HdrMetadata>,
 }
+/// Windows 专用 GPU 流水线的占位类型；Linux 采集始终走 CPU 路径。
+pub(crate) struct RawCapture {
+    pub width: u32,
+    pub height: u32,
+    pub captured: Instant,
+}
+
 impl Frame {
     /// 这一帧的像素是不是留在显存里。编码器照着它决定用哪条路——它是帧自己的
     /// 属性，所以走「上一帧原样再发一次」那条路时也不会说错。
@@ -385,6 +392,11 @@ pub(crate) struct Desktop {
 }
 
 impl Desktop {
+    /// Linux 没有 DXGI 原始纹理交付路径。
+    pub fn raw_desc(&self) -> Option<(u32, u32, u32)> {
+        None
+    }
+
     /// 打开一路采集。门户那边要线性 dma-buf 还是共享内存由合成器挑（见
     /// `pipewire::format_object`），拿到显存帧也只在上层要求时才当显存用。
     pub fn open_selected(selected: &Screen) -> Result<Self> {

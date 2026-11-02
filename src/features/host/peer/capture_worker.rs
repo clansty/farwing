@@ -19,6 +19,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 mod metrics;
+mod pipeline;
 
 pub(super) fn capture_loop(
     mut screen: capture::Screen,
@@ -59,6 +60,7 @@ pub(super) fn capture_loop(
     let mut zero_copy_allowed = true;
     let mut metrics = metrics::Metrics::default();
     let mut paused_capture_at = None::<Instant>;
+    let mut pipeline = None::<pipeline::Pipeline>;
 
     while !cancel.is_cancelled() && handle.requested() {
         let iteration_started = Instant::now();
@@ -151,6 +153,10 @@ pub(super) fn capture_loop(
         }
         wanted.maximum = candidate.maximum_for(wanted.requested_maximum);
         wanted.fps = wanted.fps.min(candidate.fps).min(screen.fps).max(1);
+        if let Some(active) = pipeline.as_mut() {
+            let stats = active.stats();
+            metrics.absorb(stats);
+        }
         metrics.report(wanted.fps, screen.adapter, candidate.capability.adapter);
         let maximum_quality = negotiated.maximum_quality(
             wanted.format,
@@ -224,6 +230,7 @@ pub(super) fn capture_loop(
                 }
                 desktop = None;
                 encoder = None;
+                pipeline = None;
                 current = None;
                 transfer = None;
                 encoding_device = None;
@@ -286,10 +293,143 @@ pub(super) fn capture_loop(
             }
         }
         let wait_ms = ((1000.0 / f64::from(wanted.fps)).round() as u32).max(1);
+        let raw_pipeline_eligible = cfg!(windows)
+            && hardware
+            && candidate.capability.backend == crate::features::host::format::Backend::Nvidia
+            && candidate.capability.adapter == screen.adapter
+            && !wanted.cursor_capture
+            && pipeline.is_some()
+            && current.is_some_and(|(old_size, old_candidate, old_zero_copy)| {
+                old_size == output_size(screen.width, screen.height, wanted.quality)
+                    && old_candidate == (candidate_id, wanted.color)
+                    && !old_zero_copy
+            });
         let capture_started = Instant::now();
         // AcquireNextFrame already blocks until the next desktop present (or
         // this timeout). Sleeping to a separate deadline first makes the loop
         // wake just after that present and wait a whole extra refresh.
+        if raw_pipeline_eligible {
+            let stream = desktop.as_mut().context("缺少采集源")?;
+            let raw = pipeline
+                .as_mut()
+                .expect("raw pipeline exists")
+                .next_raw(
+                    stream,
+                    // 目标 60Hz 时 17ms 超时会让偶发的 present 抖动直接变成
+                    // 33ms 的空档；让 Acquire 多等一会，帧一到就返回。
+                    wait_ms.max(50),
+                    wanted.quality,
+                    wanted.color.is_hdr(),
+                    wanted.maximum,
+                );
+            metrics.capture.record(capture_started.elapsed());
+            let Some(raw) = raw? else {
+                continue;
+            };
+            metrics.new_frames += 1;
+            let size = output_size(raw.width, raw.height, wanted.quality);
+            // 目标已经等于屏幕刷新率时不再按时间戳二次限速；present
+            // 抖动本身不该让我们的门限再丢一帧。
+            let minimum_interval = Duration::from_secs_f64(1.0 / f64::from(wanted.fps));
+            if wanted.fps < screen.fps
+                && last_frame.is_some_and(|at| {
+                    raw.captured.saturating_duration_since(at) < minimum_interval.mul_f64(0.9)
+                })
+            {
+                continue;
+            }
+            let peak = transport.media_rate().min(bounds.maximum);
+            let codec_minimum = crate::features::host::parameters::MIN_ENCODER_RATE;
+            if peak < codec_minimum {
+                continue;
+            }
+            let (media_rate, discard_frame) =
+                admission.next(peak, codec_minimum, transport.cwnd_ratio());
+            if discard_frame {
+                metrics.admission_drops += 1;
+                continue;
+            }
+            let rate = crate::features::host::format::Rate {
+                target: bounds.initial.max(300_000),
+                peak: bounds.initial.max(300_000),
+                fps: wanted.fps,
+                quality: wanted.quality,
+                quality_target,
+            };
+            let captured_at = raw.captured;
+            let submit_started = Instant::now();
+            let accepted = pipeline
+                .as_mut()
+                .expect("raw pipeline exists")
+                .submit_raw(raw, rate);
+            metrics.transfer.record(submit_started.elapsed());
+            metrics.work.record(iteration_started.elapsed());
+            match accepted {
+                Ok(true) => {
+                    last_frame = Some(captured_at);
+                    handle.source(
+                        &screen,
+                        desktop.as_ref().map_or("DXGI", |d| d.backend_name()),
+                    );
+                    if let Some(active) = pipeline.as_ref() {
+                        let diagnostics = super::super::ActiveEncoding {
+                            preferred_gpu: negotiated.preference().0,
+                            preferred_codec: negotiated.preference().1,
+                            selection: negotiated
+                                .selection_reason(&candidate.capability, !failed.is_empty()),
+                            backend: candidate.capability.backend,
+                            adapter: candidate.capability.adapter,
+                            format: wanted.format,
+                            size,
+                            fps: wanted.fps,
+                            target_bps: media_rate,
+                            path: active.path().to_owned(),
+                        };
+                        if last_diagnostics.as_ref() != Some(&diagnostics) {
+                            handle.video(Some(diagnostics.clone()));
+                            last_diagnostics = Some(diagnostics);
+                        }
+                    }
+                    let mut active = lock(&config);
+                    if active.revision == wanted.revision {
+                        active.reported_quality = wanted.quality;
+                    }
+                    let state = Published {
+                        screen: screen.clone(),
+                        capturing: true,
+                        visible: true,
+                        quality: wanted.quality,
+                        fps: wanted.fps,
+                        format: wanted.format,
+                        budget_size,
+                        encoder: Some(candidate.capability.backend),
+                        capture: desktop.as_ref().map_or("DXGI", |d| d.backend_name()).into(),
+                    };
+                    publication.send_if_modified(|old| {
+                        if *old != state {
+                            *old = state;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                }
+                Ok(false) => metrics.transfer_busy += 1,
+                Err(error) => {
+                    let detail = pipeline
+                        .as_ref()
+                        .and_then(|pipeline| pipeline.error())
+                        .unwrap_or_default();
+                    tracing::warn!(%error, %detail, ?candidate_id, "host encode pipeline submit failed; rebuilding");
+                    failed.insert(candidate_id);
+                    pipeline = None;
+                    encoder = None;
+                    current = None;
+                    keyframe.store(true, Ordering::Release);
+                }
+            }
+            continue;
+        }
         let captured = desktop.as_mut().context("缺少采集源")?.next(
             wait_ms,
             wanted.quality,
@@ -304,6 +444,7 @@ pub(super) fn capture_loop(
         if generation != capture_state.generation {
             generation = capture_state.generation;
             encoder = None;
+            pipeline = None;
             cached = None;
             current = None;
             last_frame = None;
@@ -402,6 +543,16 @@ pub(super) fn capture_loop(
         // instead of relying on NVENC's handling of the capture context.
         let isolated_nvenc = hardware
             && candidate.capability.backend == crate::features::host::format::Backend::Nvidia;
+        // 只有独立 NVENC 设备、同卡这条路径才走 GPU 交付流水线；跨卡和
+        // AMF/oneVPL/软件编码继续走原来的串行路径。
+        let pipeline_eligible = cfg!(windows)
+            && hardware
+            && candidate.capability.backend == crate::features::host::format::Backend::Nvidia
+            && candidate.capability.adapter == screen.adapter
+            && !wanted.cursor_capture
+            && desktop
+                .as_ref()
+                .is_some_and(|desktop| desktop.raw_desc().is_some());
         let device =
             if !hardware || (!isolated_nvenc && candidate.capability.adapter == screen.adapter) {
                 source_device.clone()
@@ -429,6 +580,84 @@ pub(super) fn capture_loop(
                 }
                 encoding_device.as_ref().unwrap().1.clone()
             };
+        if !pipeline_eligible && pipeline.is_some() {
+            // 后端/设备切换回串行编码路径时，流水线持有的 current 不能冒充
+            // 已创建好的本地编码器。
+            pipeline = None;
+            current = None;
+            encoder = None;
+        }
+        if pipeline_eligible {
+            let rate = crate::features::host::format::Rate {
+                target: bounds.initial.max(300_000),
+                peak: bounds.initial.max(300_000),
+                fps: wanted.fps,
+                quality: wanted.quality,
+                quality_target,
+            };
+            let needs_rebuild = current.is_none_or(|(old_size, old_candidate, old_zero_copy)| {
+                old_size != size
+                    || old_candidate != (candidate_id, wanted.color)
+                    || old_zero_copy != zero_copy
+                    || pipeline.is_none()
+            });
+            if needs_rebuild {
+                let rebuilding = Instant::now();
+                drop(pipeline.take());
+                let close_ms = rebuilding.elapsed().as_secs_f64() * 1000.;
+                let raw_desc = desktop
+                    .as_ref()
+                    .context("缺少采集源")?
+                    .raw_desc()
+                    .context("采集源不再提供DXGI原始纹理")?;
+                match pipeline::Pipeline::new(
+                    source_device,
+                    device.clone(),
+                    raw_desc,
+                    size,
+                    wanted.format,
+                    rate,
+                    wanted.color,
+                    sender.clone(),
+                    keyframe.clone(),
+                    encode_cancel.clone(),
+                    started,
+                ) {
+                    Ok(created) => {
+                        tracing::info!(
+                            ?size,
+                            ?candidate_id,
+                            close_ms,
+                            elapsed_ms = rebuilding.elapsed().as_secs_f64() * 1000.,
+                            "host encode pipeline replacement completed"
+                        );
+                        handle.encoder(
+                            created.implementation(),
+                            created.maximum_size(),
+                            &screen,
+                            desktop.as_ref().context("缺少采集源")?.backend_name(),
+                        );
+                        pipeline = Some(created);
+                        current = Some((size, (candidate_id, wanted.color), zero_copy));
+                        frame_metadata.clear();
+                        encode_errors = 0;
+                        keyframe.store(true, Ordering::Release);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error,?candidate_id,"host encode pipeline initialization failed; disabling this candidate");
+                        failed.insert(candidate_id);
+                        pipeline = None;
+                        encoder = None;
+                        current = None;
+                        cached = None;
+                        continue;
+                    }
+                }
+            }
+            // 首帧只用来建立编码流水线；从下一帧开始走 next_raw，把缩放和
+            // NVENC 都留在编码线程，采集线程只做 Acquire + 共享纹理复制。
+            continue;
+        }
         // 同一块卡、同一个后端时先试原地重配（目前只有 QSV 会答 true）：尺寸变了
         // 不必拆掉重建整个驱动会话。零拷贝那一维必须没变——它换的是编码器吃哪种帧，
         // 那种变化只能重建。
@@ -644,6 +873,7 @@ pub(super) fn capture_loop(
                 if capture::device_lost(source_device) {
                     tracing::warn!(%error,"capture graphics device was removed; recreating selected source");
                     encoder = None;
+                    pipeline = None;
                     current = None;
                     cached = None;
                     desktop = None;
@@ -673,6 +903,7 @@ pub(super) fn capture_loop(
                     // reopen that same encoder after its consecutive failures.
                     failed.insert(candidate_id);
                     encoder = None;
+                    pipeline = None;
                     current = None;
                     cached = None;
                     last_frame = None;
