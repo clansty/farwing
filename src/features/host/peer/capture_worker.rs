@@ -246,11 +246,6 @@ pub(super) fn capture_loop(
             std::thread::sleep(Duration::from_millis(20));
             continue;
         }
-        if sender.capacity() == 0 {
-            metrics.backpressure_waits += 1;
-            std::thread::sleep(Duration::from_millis(2));
-            continue;
-        }
         if desktop.is_none() {
             runtime.begin_gpu_work(negotiated.gpu_compatibility);
             desktop = Some(capture::Desktop::open_selected(&screen)?);
@@ -471,7 +466,9 @@ pub(super) fn capture_loop(
             }
         }
         if current.is_none_or(|(old_size, old_candidate, old_zero_copy)| {
-            old_size != size || old_candidate != (candidate_id, wanted.color) || old_zero_copy != zero_copy
+            old_size != size
+                || old_candidate != (candidate_id, wanted.color)
+                || old_zero_copy != zero_copy
         }) {
             let rebuilding = Instant::now();
             // Release before replacement to avoid consuming a second driver
@@ -752,7 +749,19 @@ pub(super) fn capture_loop(
             {
                 frame_metadata.pop_first();
             }
-            sender.blocking_send(frame).context("画面发送队列已关闭")?;
+            // 发送端过慢时丢这一帧，让采集/编码继续跑；丢掉的可能是 P 帧，
+            // 下一帧强制 IDR，避免解码器沿着一条已经断掉的参考链继续解。
+            match sender.try_send(frame) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(frame)) => {
+                    metrics.send_drops += 1;
+                    keyframe.store(true, Ordering::Release);
+                    drop(frame);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    anyhow::bail!("画面发送队列已关闭");
+                }
+            }
         }
     }
     Ok(())
