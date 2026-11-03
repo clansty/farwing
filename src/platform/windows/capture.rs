@@ -953,11 +953,15 @@ impl Duplication {
             self.presented_since_repair = true;
             // 有些虚拟显示器会把 Rotation 报成 90/270，但 duplication 纹理
             // 本身已经和 screen 的逻辑尺寸一致；此时再转一次会把 2160x1920
-            // 变成 1920x2160，编码器会拒绝输入。
-            let rotation = if (desc.Width, desc.Height) == (self.screen.width, self.screen.height) {
-                DXGI_MODE_ROTATION_IDENTITY
-            } else {
-                self.rotation
+            // 变成 1920x2160，编码器会拒绝输入。180 度旋转的宽高和未旋转时
+            // 相同，不能用「尺寸没变」推断方向，否则画面会上下颠倒。
+            let rotation = match self.rotation {
+                DXGI_MODE_ROTATION_ROTATE90 | DXGI_MODE_ROTATION_ROTATE270
+                    if (desc.Width, desc.Height) == (self.screen.width, self.screen.height) =>
+                {
+                    DXGI_MODE_ROTATION_IDENTITY
+                }
+                rotation => rotation,
             };
             Ok(Some(RawCapture {
                 width: desc.Width,
