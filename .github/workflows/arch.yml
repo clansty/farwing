@@ -16,16 +16,20 @@ jobs:
     runs-on: ubuntu-latest
     container: archlinux:latest
     steps:
+      # 必须先装 git 再 checkout：archlinux 镜像里没有 git 时，actions/checkout
+      # 会退回下载源码 tarball，工作区没有 .git；pkgver() 里的 git describe /
+      # rev-parse 全部失败，版本号会变成 .r0.gnogit，每次构建都一样。
+      - name: Install build tools
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel rust clang cmake nasm git pkgconf sudo
+
       - uses: actions/checkout@v7
         with:
           # pkgver() 靠 `git describe --exact-match` 判断是不是在 tag 上：
           # 浅克隆既没有 tag 也没有历史，版本号会退化成 .r<0>.g<hash>。
           fetch-depth: 0
-
-      - name: Install build tools
-        run: |
-          pacman -Syu --noconfirm --needed \
-            base-devel rust clang cmake nasm git pkgconf sudo
+          fetch-tags: true
 
       - name: Build package
         run: |
