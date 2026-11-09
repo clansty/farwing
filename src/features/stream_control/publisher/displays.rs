@@ -495,13 +495,34 @@ pub(crate) async fn receive_session(
                     session.refresh()?;
                     // Preserve the original target before normalizing -1. Only
                     // an explicit media-only request may select a new source.
+                    //
+                    // 主控切屏有两种写法：PC 端只报屏幕标识、分辨率留空；iOS 和 macOS
+                    // 会把目标屏当前的分辨率一起带上——按协议的约定，普通显示动作本来就
+                    // 要带上该屏当前的画面矩形，只有真要换分辨率时 resolution_type 才会
+                    // 是 2/3/4，尺寸也换成另一套。以前只认前者，后者的切屏请求全被当成
+                    // 改分辨率，落到下面按屏幕找已有采集的分支，「显示器尚未开始采集」
+                    // ——主控那边就是切了没反应。判据因此放宽成「带的尺寸属于已知的某块
+                    // 屏」：等于目标屏或当前正在采集那块屏的模式，都算「没想改分辨率」。
+                    // 像素尺寸不参与比较，它和画面尺寸是同一个模式的两面。
+                    let same_mode = |width: u32, height: u32| {
+                        let dimension = |value: i32, actual: u32| {
+                            value <= 0 || u32::try_from(value).is_ok_and(|value| value == actual)
+                        };
+                        dimension(setting.resolution_width, width)
+                            && dimension(setting.resolution_height, height)
+                    };
+                    let echoes_known_mode = session
+                        .info(setting.screen_id)
+                        .is_ok_and(|info| same_mode(info.screen.width, info.screen.height))
+                        || session
+                            .slots
+                            .iter()
+                            .filter_map(|slot| slot.screen.as_ref())
+                            .any(|screen| same_mode(screen.width, screen.height));
                     let selects_screen = setting.screen_id >= 0
                         && matches!(setting.resolution_type, 0 | 1)
-                        && setting.resolution_width <= 0
-                        && setting.resolution_height <= 0
-                        && setting.resolution_pixel_width <= 0
-                        && setting.resolution_pixel_height <= 0
-                        && setting.dpi_scale == 0;
+                        && setting.dpi_scale == 0
+                        && echoes_known_mode;
                     // S456070 -> S456550: a single desktop track accepts -1
                     // for its current source. Android uses this for ordinary
                     // media settings. Do not guess a target in a multi-track session.
@@ -648,6 +669,13 @@ async fn apply_setting(
         if errors.iter().any(|e| matches!(e.error_code, -1 | -2)) {
             return Ok(errors);
         }
+        // 单轨会话换源会把整路画面搬到另一块屏，值得在日志里留一行：主控报告
+        // 「切屏没反应」时，先看这里有没有发生。
+        tracing::info!(
+            screen_id = info.screen.id,
+            track = index,
+            "host single-track capture switched to the requested screen"
+        );
         session
             .start_configured(info.screen, config)
             .await
