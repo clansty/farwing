@@ -60,10 +60,18 @@ pub(super) struct NackBatch {
     pub(super) request_keyframe: bool,
 }
 
+/// 两次关键帧请求之间的最小间隔。
+///
+/// 一帧 IDR 在弱网下要几百毫秒才传得完，这段时间里再要一次，主控只会多编一帧
+/// I 帧：带宽更紧、丢得更多、又要关键帧，画面就钉在「糊—慢慢清晰—又糊」这个
+/// 循环上。等一个窗口再问，让先发出去的那帧有机会落地。
+const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(500);
+
 #[derive(Default)]
 pub(super) struct RtcpFeedbackBuffer {
     pub(super) request_keyframe: bool,
     pub(super) nack_sequences: Vec<u16>,
+    last_keyframe_request: Option<Instant>,
 }
 
 impl RtcpFeedbackBuffer {
@@ -72,20 +80,43 @@ impl RtcpFeedbackBuffer {
         self.nack_sequences.extend(batch.sequences);
     }
 
+    /// 请求一次关键帧，受 `KEYFRAME_REQUEST_INTERVAL` 限速。
+    ///
+    /// 返回 `false` 表示这次被限速挡下、没发出去——调用方该退回去用 NACK 补包，
+    /// 而不是干等着一个不会来的 I 帧。
+    pub(super) async fn keyframe_request(
+        &mut self,
+        connection: &RTCPeerConnection,
+        media_ssrc: u32,
+    ) -> bool {
+        let now = Instant::now();
+        if self
+            .last_keyframe_request
+            .is_some_and(|at| now.duration_since(at) < KEYFRAME_REQUEST_INTERVAL)
+        {
+            return false;
+        }
+        self.last_keyframe_request = Some(now);
+        // 同时发 PLI 与 FIR：部分 host（macOS）只对 FIR 生成关键帧。
+        let pli = send_picture_loss_indication(connection, media_ssrc).await;
+        if let Err(error) = pli {
+            tracing::warn!(%error, "buffered keyframe request failed");
+        }
+        let fir = send_full_intra_request(connection, media_ssrc).await;
+        if let Err(error) = fir {
+            tracing::warn!(%error, "buffered FIR request failed");
+        }
+        true
+    }
+
     pub(super) async fn flush(&mut self, connection: &RTCPeerConnection, media_ssrc: u32) {
         let request_keyframe = std::mem::take(&mut self.request_keyframe);
         let nack_sequences = std::mem::take(&mut self.nack_sequences);
-        if request_keyframe {
-            // 同时发 PLI 与 FIR：部分 host（macOS）只对 FIR 生成关键帧。
-            let pli = send_picture_loss_indication(connection, media_ssrc).await;
-            if let Err(error) = pli {
-                tracing::warn!(%error, "buffered keyframe request failed");
-            }
-            let fir = send_full_intra_request(connection, media_ssrc).await;
-            if let Err(error) = fir {
-                tracing::warn!(%error, "buffered FIR request failed");
-            }
-        } else if !nack_sequences.is_empty()
+        // 限速挡下时照常补包：I 帧不会来了，重传是唯一能修好这一帧的办法。
+        if request_keyframe && self.keyframe_request(connection, media_ssrc).await {
+            return;
+        }
+        if !nack_sequences.is_empty()
             && let Err(error) =
                 send_transport_layer_nack(connection, media_ssrc, &nack_sequences).await
         {

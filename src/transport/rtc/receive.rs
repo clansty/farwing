@@ -2,7 +2,7 @@
 use super::clock::{RemoteNtpEstimator, frame_sender_timing};
 use super::feedback::{
     ACTIVE_STREAM_WINDOW, KEYFRAME_PACKET_WINDOW, NackRequester, RTP_NACK_PROCESS_INTERVAL,
-    RtcpFeedbackBuffer, send_full_intra_request, send_picture_loss_indication,
+    RtcpFeedbackBuffer,
 };
 use super::ingress::{
     MediaRecoveryFlags, OrderedVideoIngress, PendingMediaPacket, RedPacket, VideoIngressOrigin,
@@ -812,9 +812,9 @@ pub(super) async fn emit_official_receiver_result(
         );
     }
     if result.request_keyframe {
-        let _ = send_picture_loss_indication(connection, media_ssrc).await;
-        // 部分 host（macOS）只对 FIR 生成关键帧，因此同时发送。
-        let _ = send_full_intra_request(connection, media_ssrc).await;
+        // 与 `flush` 共用同一个限速窗口：解码器要关键帧往往意味着丢包，而弱网下
+        // 每帧都问一次只会让主控不停重编 I 帧。
+        rtcp_feedback.keyframe_request(connection, media_ssrc).await;
     }
     performance.record_predecode_drops(result.predecode_drops);
     performance.set_frame_buffer_frames(result.frame_buffer_frames);
