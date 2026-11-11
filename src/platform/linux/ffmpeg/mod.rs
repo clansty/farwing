@@ -32,11 +32,18 @@ const VBR: i64 = 3;
 /// 与 QSV 的属性）定的；在 VA-API 上照搬，低带宽的估计抖动会一直触发重开，画面
 /// 就卡在「糊 → 慢慢清晰 → 立刻又糊」。所以这里自己加两道闸：相对死区，和两次
 /// 重开之间的最短间隔。
+///
+/// 间隔要按「一个 IDR 有多贵」来定，不能按「估计抖动得多快」来定。实测移动网下
+/// 目标码率 130~210 kbps、2608x1200 的 IDR 是 100 KB 上下——单个关键帧就是
+/// 5 秒的预算，而重开还会连带把紧随其后的那帧也变成 IDR。原来 2 秒 / 500 毫秒
+/// 这两道闸在那种链路上等于没有：每 1.5 秒左右重开一次，关键帧吃掉 95% 的码流。
+/// 现在按「重开一次的代价至少值几秒」来定，宁可码率跟得钝一点。
 const RECONFIGURE_DEADBAND: u64 = 15;
-const RECONFIGURE_INTERVAL: Duration = Duration::from_secs(2);
-/// 码率明显下跌时不等待：等下去就是拿超额码流继续压拥塞。
+const RECONFIGURE_INTERVAL: Duration = Duration::from_secs(6);
+/// 码率明显下跌时不等待：等下去就是拿超额码流继续压拥塞。但也不能像原来那样
+/// 半秒就重开一次——那正好是「糊→清晰→糊」的周期。
 const URGENT_DROP: u64 = 25;
-const URGENT_INTERVAL: Duration = Duration::from_millis(500);
+const URGENT_INTERVAL: Duration = Duration::from_secs(2);
 
 fn check(code: i32, what: &str) -> Result<()> {
     ensure!(code >= 0, "{what}失败（libavcodec {code}）");

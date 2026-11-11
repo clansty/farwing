@@ -21,6 +21,13 @@ use tokio_util::sync::CancellationToken;
 mod metrics;
 mod pipeline;
 
+/// 关键帧请求的唯一入口。写明理由，否则关键帧一密就分不清是重开、丢帧还是
+/// 对端要的——这几种的修法完全不同。
+fn need_keyframe(flag: &AtomicBool, reason: &'static str) {
+    tracing::debug!(reason, "host keyframe requested");
+    flag.store(true, Ordering::Release);
+}
+
 pub(super) fn capture_loop(
     mut screen: capture::Screen,
     handle: Lease,
@@ -258,7 +265,7 @@ pub(super) fn capture_loop(
                 runtime.end_gpu_work();
             }
             last_frame = None;
-            keyframe.store(true, Ordering::Release);
+            need_keyframe(&keyframe, "capture_unavailable");
             std::thread::sleep(Duration::from_millis(20));
             continue;
         }
@@ -434,7 +441,7 @@ pub(super) fn capture_loop(
                     pipeline = None;
                     encoder = None;
                     current = None;
-                    keyframe.store(true, Ordering::Release);
+                    need_keyframe(&keyframe, "pipeline_submit_failed");
                 }
             }
             continue;
@@ -458,7 +465,7 @@ pub(super) fn capture_loop(
             current = None;
             last_frame = None;
             transfer = None;
-            keyframe.store(true, Ordering::Release);
+            need_keyframe(&keyframe, "capture_source_changed");
         }
         screen = capture_state.screen.clone();
         // A selected source remains attached during temporary capture loss.
@@ -650,7 +657,7 @@ pub(super) fn capture_loop(
                         current = Some((size, (candidate_id, wanted.color), zero_copy));
                         frame_metadata.clear();
                         encode_errors = 0;
-                        keyframe.store(true, Ordering::Release);
+                        need_keyframe(&keyframe, "pipeline_rebuilt");
                     }
                     Err(error) => {
                         tracing::warn!(%error,?candidate_id,"host encode pipeline initialization failed; disabling this candidate");
@@ -695,7 +702,7 @@ pub(super) fn capture_loop(
                     current = Some((size, (candidate_id, wanted.color), zero_copy));
                     frame_metadata.clear();
                     encode_errors = 0;
-                    keyframe.store(true, Ordering::Release);
+                    need_keyframe(&keyframe, "stream_reconfigured");
                 }
                 Ok(false) => {}
                 Err(error) => {
@@ -782,7 +789,7 @@ pub(super) fn capture_loop(
             current = Some((size, (candidate_id, wanted.color), zero_copy));
             frame_metadata.clear();
             encode_errors = 0;
-            keyframe.store(true, Ordering::Release);
+            need_keyframe(&keyframe, "encoder_created");
         }
         let active_encoder = encoder.as_mut().context("缺少编码器")?;
         let needs_transfer = device != *source_device;
@@ -826,7 +833,7 @@ pub(super) fn capture_loop(
             });
             metrics.rate.record(rate_started.elapsed());
             if reconfigured? {
-                keyframe.store(true, Ordering::Release);
+                need_keyframe(&keyframe, "rate_reconfigured");
             }
             // Network requests are rate-limited at their RTCP entry. Explicit
             // quality/source controls and failed inputs must not wait 600ms.
@@ -897,12 +904,12 @@ pub(super) fn capture_loop(
                             false
                         }
                     });
-                    keyframe.store(true, Ordering::Release);
+                    need_keyframe(&keyframe, "device_lost");
                     continue;
                 }
                 encode_errors += 1;
                 tracing::warn!(%error,hardware,consecutive=encode_errors,"host encoding failed");
-                keyframe.store(true, Ordering::Release);
+                need_keyframe(&keyframe, "encode_failed");
                 std::thread::sleep(Duration::from_secs_f64(1.0 / f64::from(wanted.fps)));
                 if encode_errors >= 10
                     || error.downcast_ref::<encoder::SwitchCandidate>().is_some()
@@ -921,8 +928,28 @@ pub(super) fn capture_loop(
             }
         };
         metrics.encoded_frames += encoded.len() as u64;
+        metrics.bitrate = media_rate;
+        for frame in &encoded {
+            metrics.encoded_bytes += frame.data.len() as u64;
+            if frame.keyframe {
+                metrics.keyframes += 1;
+                metrics.keyframe_bytes += frame.data.len() as u64;
+                // 没被要求却出了关键帧，只可能来自编码器自己的场景切换判定。
+                if force {
+                    metrics.forced_keyframes += 1;
+                } else {
+                    metrics.scene_keyframes += 1;
+                }
+                tracing::debug!(
+                    bytes = frame.data.len(),
+                    forced = force,
+                    bitrate_bps = media_rate,
+                    "host keyframe encoded"
+                );
+            }
+        }
         if force && !encoded.iter().any(|frame| frame.keyframe) {
-            keyframe.store(true, Ordering::Release);
+            need_keyframe(&keyframe, "force_retry");
         }
         last_frame = Some(frame.captured);
         if !encoded.is_empty() {
@@ -989,13 +1016,17 @@ pub(super) fn capture_loop(
             {
                 frame_metadata.pop_first();
             }
-            // 发送端过慢时丢这一帧，让采集/编码继续跑；丢掉的可能是 P 帧，
-            // 下一帧强制 IDR，避免解码器沿着一条已经断掉的参考链继续解。
+            // 发送端过慢时丢这一帧，让采集/编码继续跑。
+            //
+            // 这里**不能**顺手要一个关键帧。丢帧意味着队列已经满了，而对端丢帧
+            // 时再塞一帧 IDR 是反过来加码：一个 IDR 是 P 帧的十几倍，下一帧更塞不
+            // 进去，于是「丢帧 → IDR → 更堵 → 再丢帧」自我放大（实测动态画面下
+            // 5 秒里 22 次丢帧换出 23 个关键帧，关键帧又吃掉 72% 的码流）。
+            // 参考链断了由对端的 PLI 说，那条路有 600ms 的节流，代价可控。
             match sender.try_send(frame) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(frame)) => {
                     metrics.send_drops += 1;
-                    keyframe.store(true, Ordering::Release);
                     drop(frame);
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {

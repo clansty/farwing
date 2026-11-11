@@ -38,6 +38,14 @@ pub(super) struct Metrics {
     pub transfer_busy: u64,
     pub backpressure_waits: u64,
     pub send_drops: u64,
+    /// 本窗口编出去的关键帧，以及其中「我们要的」与「编码器自己插的」各多少。
+    pub keyframes: u64,
+    pub forced_keyframes: u64,
+    pub scene_keyframes: u64,
+    pub keyframe_bytes: u64,
+    pub encoded_bytes: u64,
+    /// 本窗口最后一帧用的目标码率，用来判断关键帧是不是被码控压成糊的。
+    pub bitrate: u32,
 }
 impl Default for Metrics {
     fn default() -> Self {
@@ -55,6 +63,12 @@ impl Default for Metrics {
             transfer_busy: 0,
             backpressure_waits: 0,
             send_drops: 0,
+            keyframes: 0,
+            forced_keyframes: 0,
+            scene_keyframes: 0,
+            keyframe_bytes: 0,
+            encoded_bytes: 0,
+            bitrate: 0,
         }
     }
 }
@@ -97,6 +111,12 @@ impl Metrics {
                 encode_max_ms = self.encode.maximum_ms(),
                 work_avg_ms = self.work.average_ms(),
                 work_max_ms = self.work.maximum_ms(),
+                bitrate_bps = self.bitrate,
+                keyframes = self.keyframes,
+                forced_keyframes = self.forced_keyframes,
+                scene_keyframes = self.scene_keyframes,
+                keyframe_share = self.keyframe_bytes as f64 / self.encoded_bytes.max(1) as f64,
+                keyframe_avg_bytes = self.keyframe_bytes / self.keyframes.max(1),
                 "host capture and encoding throughput"
             );
         }
