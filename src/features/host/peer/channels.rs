@@ -394,6 +394,48 @@ pub(super) async fn send_business(
     Ok(channel.send_text_bytes(&Bytes::from(bytes)).await?)
 }
 
+/// 主控换屏只会体现在输入上：它把指针指到另一块屏，却不发任何显示请求
+/// （macOS 逆向 + 实测都是如此）。被控端不跟着走，主控那边看到的就是
+/// 「鼠标过去了、画面没动」。
+///
+/// 只在主控从没显式要过画面时认这个信号：一旦它发过 `SimpleAction 8`（多窗口、
+/// 拖成独立窗口那类），每个窗口要哪块屏由它自己说，按鼠标位置去猜会抢画面。
+async fn follow_controller_screen(
+    screens: &Arc<tokio::sync::Mutex<super::screens::Screens>>,
+    id: i32,
+) {
+    let mut state = screens.lock().await;
+    if state.info(id).is_err() {
+        return;
+    }
+    // 主控显式要过画面（多窗口那类）就自己说了算，别按鼠标位置去猜。
+    if state.pinned_any() {
+        return;
+    }
+    let result = if state.active_slot(id).is_some() {
+        // 已经在轨道上（登记轨道池时就铺好了），只需要把它升到满帧。
+        state.watch(id)
+    } else if state.registered.len() == 1 {
+        // 单轨会话（手机端那类）：整路画面搬到这块屏。
+        state.switch_source(id).await
+    } else if let Err(error) = state.start(id).await {
+        Err(error)
+    } else {
+        state.watch(id)
+    };
+    match result {
+        Ok(()) => tracing::debug!(
+            screen_id = id,
+            "host capture followed the controller input screen"
+        ),
+        Err(error) => tracing::warn!(
+            screen_id = id,
+            %error,
+            "host could not follow the controller input screen"
+        ),
+    }
+}
+
 pub(super) async fn publish_state(
     screens: Arc<tokio::sync::Mutex<super::screens::Screens>>,
     reports: Arc<super::screens::Reports>,
@@ -405,6 +447,7 @@ pub(super) async fn publish_state(
     mut mouse_policy: tokio::sync::watch::Receiver<
         crate::features::host::input::config::MousePolicy,
     >,
+    mut observed_screen: tokio::sync::watch::Receiver<Option<i32>>,
     audio: super::super::audio::Audio,
     mut microphone: tokio::sync::watch::Receiver<super::super::microphone::Status>,
     display_geometry: bool,
@@ -429,14 +472,23 @@ pub(super) async fn publish_state(
     let mut timer = tokio::time::interval(Duration::from_secs(1));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
+        let mut follow = None;
         let refresh = tokio::select! {
             _=cancel.cancelled()=>break,
             result=changed.changed()=>{if result.is_err(){break;} false},
             result=target.changed()=>{if result.is_err(){break;} false},
             result=mouse_policy.changed()=>{if result.is_err(){break;} false},
             result=microphone.changed()=>{if result.is_err(){break;} false},
+            result=observed_screen.changed()=>{
+                if result.is_err(){break;}
+                follow = *observed_screen.borrow_and_update();
+                false
+            },
             _=timer.tick()=>true,
         };
+        if let Some(id) = follow {
+            follow_controller_screen(&screens, id).await;
+        }
         let inventory_revision = if refresh {
             screens
                 .try_lock()

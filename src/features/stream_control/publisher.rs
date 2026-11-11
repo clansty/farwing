@@ -838,7 +838,12 @@ pub(crate) fn receive(
                     PbCaptureSettingResponse { errors },
                 ))
             } else if let Some(PbRpcRequestPayload::SendVideoTrack(tracks)) = request.payload {
-                let valid = tracks.video_track_index.iter().all(|index| *index == 0);
+                // 数据通道上只能影响本路画面，但轨道号本身是全量登记（官方主控报
+                // [0,1,2,3,4]），别把多路登记当成非法请求拒掉。
+                let valid = tracks
+                    .video_track_index
+                    .iter()
+                    .all(|index| (0..5).contains(index));
                 if valid {
                     config.sending = tracks.video_track_index.contains(&0);
                     tracing::info!(

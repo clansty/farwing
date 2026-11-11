@@ -200,6 +200,8 @@ pub(crate) async fn receive_session(
                     session.resume_capture().await?;
                 } else {
                     session.start(id).await?;
+                    // 主控显式点名要看这一路：它不该再被「鼠标在哪块屏」降档。
+                    session.pin(id);
                 }
                 return Ok(Received {
                     refresh_state: true,

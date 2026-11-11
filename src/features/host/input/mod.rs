@@ -41,6 +41,14 @@ fn motion(event: &wire::Event) -> bool {
     )
 }
 
+/// 输入事件里点名的屏幕；触摸帧不带，也就没有换屏的意思。
+fn named_screen(event: &wire::Event) -> Option<i32> {
+    match event {
+        wire::Event::Absolute { screen, .. } | wire::Event::RelativeScaled { screen, .. } => *screen,
+        _ => None,
+    }
+}
+
 struct Envelope {
     generation: u64,
     event: wire::Event,
@@ -119,6 +127,9 @@ struct Shared {
     policy: wire::Policy,
     configuration: tokio::sync::watch::Sender<Arc<config::Configuration>>,
     mouse_policy: tokio::sync::watch::Sender<config::MousePolicy>,
+    /// 主控最近一次把指针指向哪块屏。单流会话的唯一换屏信号：Apple 端切屏
+    /// 只改输入里的屏幕标识，不再发任何显示请求。
+    observed_screen: tokio::sync::watch::Sender<Option<i32>>,
 }
 #[derive(Clone)]
 pub(crate) struct Receiver {
@@ -149,6 +160,7 @@ impl Session {
             policy,
             configuration: tokio::sync::watch::channel(Arc::new(Default::default())).0,
             mouse_policy: tokio::sync::watch::channel(Default::default()).0,
+            observed_screen: tokio::sync::watch::channel(None).0,
         });
         let state = shared.clone();
         let thread = std::thread::Builder::new()
@@ -194,6 +206,10 @@ impl Receiver {
     }
     pub fn mouse_policy(&self) -> tokio::sync::watch::Receiver<config::MousePolicy> {
         self.shared.mouse_policy.subscribe()
+    }
+    /// 主控在输入里点名的屏幕，变化时才通知。
+    pub(crate) fn observed_screen(&self) -> tokio::sync::watch::Receiver<Option<i32>> {
+        self.shared.observed_screen.subscribe()
     }
     pub fn bind(&self, stream: u16) -> u64 {
         let mut gate = lock(&self.shared.gate);
@@ -246,6 +262,16 @@ impl Receiver {
                 return Ok(true);
             }
         };
+        if let Some(screen) = named_screen(&event) {
+            self.shared.observed_screen.send_if_modified(|current| {
+                if *current == Some(screen) {
+                    false
+                } else {
+                    *current = Some(screen);
+                    true
+                }
+            });
+        }
         self.enqueue(Some(stream), event);
         Ok(true)
     }

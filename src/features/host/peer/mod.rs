@@ -436,6 +436,14 @@ impl Peer {
             screen.clone(),
             displays,
             deferred,
+            // 官方 macOS 主控切屏是纯本地的：只换渲染轨道，不给被控端任何请求，
+            // 所以每块屏都得预先挂在轨道上并且持续有帧，它才切得动。Windows /
+            // iOS / Android 和本项目的客户端都会自己发采集启停请求，替它们预铺
+            // 只是白占编码线程。
+            matches!(
+                clipboard_platform,
+                crate::protocol::peer_platform::PeerPlatform::Mac
+            ),
         )
         .await?;
         let sender = screen_pool.slots[0].sender.clone();
@@ -701,6 +709,7 @@ impl Peer {
             kcp.clone(),
             screen.clone(),
             input.receiver().mouse_policy(),
+            input.receiver().observed_screen(),
             audio.clone(),
             microphone.receiver().status(),
             display_geometry,

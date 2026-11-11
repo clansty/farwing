@@ -23,6 +23,13 @@ use webrtc::{
 
 pub(crate) const TRACK_COUNT: usize = 5;
 
+/// 没被主控看着、也没有被显式要过的那几路，用低帧持续发送。
+///
+/// 官方 macOS 主控把一块屏拖成独立窗口时不会告诉被控端，切页签也只换本地渲染
+/// 轨道（见 `prefill` 的注释）；靠「切了再拉起来」会黑一下，靠「全都满帧」又要
+/// 多花一份编码。低帧常发是那条中间线：编码量和码率都按帧率比例掉。
+const AWAY_FPS: u32 = 10;
+
 pub(super) struct Inventory {
     targets: Vec<Target>,
     screens: Vec<capture::Screen>,
@@ -107,6 +114,9 @@ pub(crate) struct Slot {
     observer: Option<tokio::task::JoinHandle<()>>,
     lease: Option<Lease>,
     awaiting_source: bool,
+    /// 主控显式要过这一路（SimpleAction 8）。它不受「鼠标在哪块屏」分档影响：
+    /// 多窗口观看时每个窗口都要满帧。
+    pinned: bool,
 }
 pub(crate) struct Screens {
     inventory_revision: u64,
@@ -130,6 +140,11 @@ pub(crate) struct Screens {
     /// BINARY channel. One table serves every connection so a reconnect keeps
     /// the running shells.
     terminal: Arc<Mutex<crate::features::host::terminal::Sessions>>,
+    /// 主控是官方 macOS 客户端。它切屏完全在本地换视频轨道、一个请求都不发
+    /// （逆向与实测都如此），所以要把每块屏都挂到轨道上等它切——官方被控端
+    /// 也是这么做的。Windows / iOS / Android 和本项目的客户端都会自己发采集
+    /// 启停请求，替它们预铺只是白占编码线程。
+    prefill_tracks: bool,
 }
 pub(crate) struct Deferred {
     pub options: crate::features::stream_control::publisher::ConnectOptions,
@@ -268,6 +283,7 @@ impl Screens {
         selected: Option<capture::Screen>,
         displays: Arc<crate::features::host::displays::Session>,
         deferred: Option<Deferred>,
+        prefill_tracks: bool,
     ) -> Result<Self> {
         let reports = Arc::new(Reports {
             media_ready: Arc::new(AtomicBool::new(false)),
@@ -312,6 +328,7 @@ impl Screens {
                 observer: None,
                 lease: None,
                 awaiting_source: false,
+                pinned: false,
             });
         }
         let mut state = Self {
@@ -333,6 +350,7 @@ impl Screens {
             before_super: None,
             headless: Default::default(),
             terminal: crate::features::host::terminal::shared(),
+            prefill_tracks,
         };
         state.refresh()?;
         if let Some(selected) = selected {
@@ -435,13 +453,88 @@ impl Screens {
         registered.dedup();
         self.registered = registered;
         for (index, slot) in self.slots.iter().enumerate() {
-            lock(&slot.config).sending = self.registered.contains(&index);
             if !self.registered.contains(&index) {
+                lock(&slot.config).sending = false;
                 slot.transport.pause();
             }
         }
         self.reports.notify();
+        // 主控登记轨道池等于说「这些轨道我都会看」。官方主控切屏完全在本地换渲染
+        // 轨道、一个请求都不发，所以每块屏都得先挂在某一路轨道上、并在 `Screens`
+        // 里报出真实轨道号，否则它切过去就是黑屏。
+        if self.prefill_tracks {
+            self.prefill().await;
+        }
         Ok(())
+    }
+    /// 把每块屏铺到一路已登记的轨道上，最后把「主控正在看的那块」放进唯一的
+    /// 满帧档（`tune` 会把其余几路压到 `AWAY_FPS`）。
+    ///
+    /// 铺完每块屏都是 `sending = true`：主控切过去的那一刻它已经在收画面，不会
+    /// 先黑一下再等输入事件把采集拉起来。
+    async fn prefill(&mut self) {
+        let current = self.reports.current.load(Ordering::Acquire);
+        let screens: Vec<i32> = lock(&self.reports.catalog)
+            .iter()
+            .map(|info| info.screen.id)
+            .collect();
+        for id in screens {
+            if self.available_slot().is_none() {
+                break;
+            }
+            if self.active_slot(id).is_some() {
+                continue;
+            }
+            if let Err(error) = self.start(id).await {
+                tracing::warn!(screen_id = id, %error, "host could not put screen on a track");
+            }
+        }
+        if let Err(error) = self.watch(current) {
+            tracing::warn!(screen_id = current, %error, "host could not keep the watched track");
+        }
+    }
+    /// 主控现在看的是 `id`：这一路满帧，其余在轨道上的路退回低帧继续发。
+    ///
+    /// 不把别的路关掉，是因为主控可以把屏拖成独立窗口，也可能在动鼠标之前就要
+    /// 看到新的一块（macOS 切页签不发任何请求，只有输入帧里有信号）。
+    pub(crate) fn watch(&self, id: i32) -> Result<()> {
+        let target = self
+            .active_slot(id)
+            .with_context(|| format!("显示器 {id} 尚未挂到轨道上"))?;
+        self.tune(Some(target));
+        self.reports.current.store(id, Ordering::Release);
+        self.reports.notify();
+        Ok(())
+    }
+    /// 主控有没有显式要过某一路画面（`SimpleAction 8`）。要过就说明它自己管理
+    /// 窗口，被控端不该再按输入去猜它在看哪块屏。
+    pub(crate) fn pinned_any(&self) -> bool {
+        self.slots.iter().any(|slot| slot.pinned)
+    }
+    /// 主控显式要了这一路（`SimpleAction 8`）：它得满帧，且不再随鼠标来回切档。
+    pub(crate) fn pin(&mut self, id: i32) {
+        if let Some(index) = self.active_slot(id) {
+            self.slots[index].pinned = true;
+            self.tune(Some(index));
+        }
+    }
+    /// `full` 那一路用会话的满帧，其余在采的路用 `AWAY_FPS`。
+    fn tune(&self, full: Option<usize>) {
+        for (index, slot) in self.slots.iter().enumerate() {
+            let limit = if Some(index) == full || slot.pinned {
+                self.base.fps_limit
+            } else {
+                AWAY_FPS
+            };
+            let mut config = lock(&slot.config);
+            let sending = self.registered.contains(&index) && slot.screen.is_some();
+            if config.fps_limit != limit || config.sending != sending {
+                config.fps_limit = limit;
+                config.fps = config.requested_fps.min(limit).min(config.maximum_fps);
+                config.sending = sending;
+                config.revision = config.revision.wrapping_add(1);
+            }
+        }
     }
     pub(crate) async fn start(&mut self, id: i32) -> Result<()> {
         ensure!(
@@ -506,6 +599,29 @@ impl Screens {
         );
         let index = self.registered[0];
         ensure!(self.slots[index].screen.is_some(), "当前视频采集已停止");
+        self.headless.choose(screen.id);
+        self.start_at(index, screen, config).await
+    }
+    /// 把当前唯一在采的那块屏换成另一块：还是同一路轨道、同一套编码参数。
+    ///
+    /// 主控单窗口切屏时只换输入里的屏幕标识（macOS 实测），画面得由被控端搬过去；
+    /// 不能走 `start`——它优先挑空闲轨道，会变成多采一路，主控看的那一路并没有换。
+    pub(crate) async fn switch_source(&mut self, id: i32) -> Result<()> {
+        ensure!(
+            self.lease.requested() && !self.cancel.is_cancelled(),
+            "被控许可已失效"
+        );
+        let mut capturing = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.screen.is_some());
+        let (Some((index, _)), None) = (capturing.next(), capturing.next()) else {
+            anyhow::bail!("只有一路画面时才能换源");
+        };
+        self.refresh()?;
+        let screen = self.info(id)?.screen;
+        let config = *lock(&self.slots[index].config);
         self.headless.choose(screen.id);
         self.start_at(index, screen, config).await
     }
@@ -606,6 +722,7 @@ impl Screens {
         }
         slot.transport.pause();
         slot.screen = None;
+        slot.pinned = false;
         *lock(&self.reports.publications[index]) = None;
         *lock(&self.reports.pointers[index]) = None;
         self.reports.notify();
