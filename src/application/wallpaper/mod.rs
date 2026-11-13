@@ -6,7 +6,7 @@ use std::{
     io::Cursor,
     path::Path,
     sync::mpsc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -126,9 +126,21 @@ pub(crate) struct Wallpapers {
     sender: mpsc::Sender<Loaded>,
     receiver: mpsc::Receiver<Loaded>,
     refresh: HashSet<String>,
+    /// 下载失败过的壁纸：id → (url, 可以再试的时刻)。这张表跟着墙钟走，不跟缓存
+    /// 条目走：条目会被裁掉，而失败的原因（CDN 401、链接过期）裁掉也不会变。
+    /// 不这么做的话，“条目被裁 → 下一帧重新下载 → 还是 401 → 再裁”就是个永动机：
+    /// 隐藏窗口时整张设备列表每帧都在画，本机 27 台设备而缓存只放得下 24 条，
+    /// 每帧都要裁掉刚放进来的三张，实测 30% CPU、每秒二十多次请求。
+    failed_until: HashMap<String, (String, Instant)>,
     next: u64,
     clock: u64,
 }
+
+/// 缓存里最多留几张。设备列表一次全画出来时，容量必须大于列表长度，否则每帧
+/// 都在裁剪同一批条目，谁也留不住。
+const MAX_ENTRIES: usize = 64;
+/// 一次下载失败后隔多久再试。失败多半是 401 或链接过期，重试得快不会改变结果。
+const FAILED_RETRY: Duration = Duration::from_secs(300);
 
 impl Default for Wallpapers {
     fn default() -> Self {
@@ -139,6 +151,7 @@ impl Default for Wallpapers {
             sender,
             receiver,
             refresh: HashSet::new(),
+            failed_until: HashMap::new(),
             next: 0,
             clock: 0,
         }
@@ -164,6 +177,8 @@ impl Wallpapers {
 
     pub fn refresh(&mut self, id: &str) {
         self.invalidate(id);
+        // 用户点名要重试，就不再受失败冷却的约束。
+        self.failed_until.remove(id);
         self.refresh.insert(id.into());
     }
 
@@ -190,6 +205,11 @@ impl Wallpapers {
                     ));
                 }
                 entry.failed = complete && entry.texture.is_none();
+                if entry.failed {
+                    let retry_at = Instant::now() + FAILED_RETRY;
+                    let url = entry.url.clone();
+                    self.failed_until.insert(id, (url, retry_at));
+                }
             }
         }
     }
@@ -220,17 +240,35 @@ impl Wallpapers {
         if url.is_empty() || self.tasks.len() >= 3 {
             return None;
         }
-        if self.entries.len() >= 24
+        // 刚失败过的就别再试了，理由见 `failed_until` 的注释。
+        if let Some((failed_url, retry_at)) = self.failed_until.get(id)
+            && failed_url == url
+            && *retry_at > Instant::now()
+        {
+            return None;
+        }
+        if self.entries.len() >= MAX_ENTRIES
             && let Some(oldest) = self
                 .entries
                 .iter()
-                .min_by_key(|(_, e)| e.touched)
+                // 本帧刚碰过的条目不能裁：整张列表都在同一帧里画的时候，裁掉刚
+                // 放进去的那张等于下一帧又要重新下载。
+                .filter(|(_, entry)| entry.touched < self.clock)
+                .min_by_key(|(_, entry)| entry.touched)
                 .map(|(id, _)| id.clone())
         {
             self.invalidate(&oldest);
         }
         self.next = self.next.wrapping_add(1);
         let ticket = self.next;
+        tracing::debug!(
+            target: "openuuyc::application::wallpaper",
+            entries = self.entries.len(),
+            tasks = self.tasks.len(),
+            id = id,
+            url = url,
+            "壁纸缓存未命中，起加载线程"
+        );
         let cancel = CancellationToken::new();
         self.entries.insert(
             id.into(),
