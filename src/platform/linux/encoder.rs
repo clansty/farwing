@@ -373,6 +373,89 @@ impl Encoder {
 
 #[cfg(test)]
 mod tests {
+    /// 复现被控能力探测的节奏：建编码器 → 编到能解析出序列头就停 → 立刻丢掉，
+    /// 三个编码器一轮、连做几十轮。这就是 `probe()` 干的事，也是把 VCN 挂住的
+    /// 那个用法（`Faulty UTCL2 client ID: VCNU0` + `ring vcn_unified_0 timeout`）。
+    /// `cargo test --release --lib -- --ignored probe_teardown_loop --nocapture`
+    #[test]
+    #[ignore]
+    fn probe_teardown_loop() {
+        use super::super::capture::{Device, Image};
+        use crate::media::encoding::{Codec, Color, Format, QualityTarget, Rate};
+        use std::sync::Arc;
+        // DP-1（5120x2160）按探测上限缩下来就是 1280x540。
+        let size = std::env::var("PROBE_SIZE")
+            .ok()
+            .and_then(|value| {
+                let (w, h) = value.split_once('x')?;
+                Some((w.parse().ok()?, h.parse().ok()?))
+            })
+            .unwrap_or((1280, 540));
+        let rate = Rate {
+            target: 2_000_000,
+            peak: 2_000_000,
+            fps: 30,
+            quality: 1,
+            quality_target: QualityTarget {
+                bitrate: 2_000_000,
+                fps: 30,
+            },
+        };
+        let mut pixels = vec![0u8; (size.0 * size.1 * 4) as usize];
+        for (index, pixel) in pixels.chunks_exact_mut(4).enumerate() {
+            let x = index as u32 % size.0;
+            let y = index as u32 / size.0;
+            pixel.copy_from_slice(&[x as u8, y as u8, (x + y) as u8, 255]);
+        }
+        let image = Image::Cpu {
+            pixels: Arc::new(pixels),
+            width: size.0,
+            height: size.1,
+        };
+        let backend = super::super::vaapi::hardware_backend().expect("没有 VA-API 后端");
+        // 用环境变量挑编码器与轮数，方便现场二分：PROBE_CODECS=h264|hevc|av1，逗号分隔。
+        let codecs: Vec<Codec> = std::env::var("PROBE_CODECS")
+            .unwrap_or_else(|_| "h264,hevc,av1".into())
+            .split(',')
+            .filter_map(|name| match name.trim() {
+                "h264" => Some(Codec::H264),
+                "hevc" => Some(Codec::H265),
+                "av1" => Some(Codec::Av1),
+                _ => None,
+            })
+            .collect();
+        let rounds: u32 = std::env::var("PROBE_ROUNDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(60);
+        eprintln!("尺寸 {size:?} 编码器 {codecs:?} 轮数 {rounds}");
+        for round in 0..rounds {
+            for codec in codecs.iter().copied() {
+                let format = Format {
+                    codec,
+                    chroma: 1,
+                    depth: 8,
+                };
+                let mut encoder =
+                    super::Encoder::hardware_format(backend, &Device, size, format, rate, Color::Sdr)
+                        .expect("建编码器失败");
+                // 与 probe 相同：拿到序列头就不再编，此时最后一帧还留在硬件里。
+                eprintln!("round={round} {codec:?} 开始");
+                'probe: for index in 0..20 {
+                    let packets = encoder.encode(&image, index * 333_333, true).expect("编码失败");
+                    if packets.iter().any(|encoded| {
+                        crate::media::video_format::parse_stream_format(codec.media(), &encoded.data)
+                            .is_some()
+                    }) {
+                        break 'probe;
+                    }
+                }
+                // 出了作用域就 Drop，和 probe 里那个 if 分支结束时一样。
+                eprintln!("round={round} {codec:?} ok");
+            }
+        }
+    }
+
     /// 不需要桌面：给每个 VA-API 编码器灌十帧合成画面，把码流写出来交给
     /// ffmpeg 验。`cargo test --release --lib -- --ignored vaapi_encodes_each_codec`
     #[test]
