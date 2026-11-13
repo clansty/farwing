@@ -302,6 +302,8 @@ impl Encoder {
             open_context(codec, self.frames, self.size, self.rate)?
         };
         // 先开新的再放旧的：开不出来时编码器还能按原样用下去。
+        // 放旧的之前要把在飞的那几帧收干净，理由见 `finish()`。
+        self.finish();
         unsafe { ff::avcodec_free_context(&mut self.context) };
         self.context = fresh;
         self.force_keyframe = true;
@@ -393,10 +395,35 @@ impl Encoder {
         }
         Ok(encoded)
     }
+    /// 把硬件里还没编完的帧收干净。拆上下文（`Drop`、`reopen`）之前必须先做：
+    /// VA surface 与帧池要等 VCN 真的编完才能还回去，抢先还掉的话硬件会读到
+    /// 已经释放（或已被别人重新映射）的显存，然后等一个永远不来的完成信号——
+    /// 内核侧就是 `Faulty UTCL2 client ID: VCNU0` 加 `ring vcn_unified_0 timeout`，
+    /// 进程随后在 Mesa 里 `abort()`，运气不好还会升级成整卡复位把合成器一起带走。
+    /// 能力探测那条路只要拿到序列头就 break，正好把最后一帧留在硬件里，所以每一次
+    /// 探测都是一次掷骰子；这不是「哪天状态不对」，是每次都可能中。
+    fn finish(&mut self) {
+        // Safe because the context and the packet belong to this encoder, and a
+        // flush that lands on an already drained context just reports EOF.
+        unsafe {
+            if ff::avcodec_send_frame(self.context, ptr::null()) < 0 {
+                return;
+            }
+            loop {
+                let result = ff::avcodec_receive_packet(self.context, self.packet);
+                if result < 0 {
+                    return;
+                }
+                ff::av_packet_unref(self.packet);
+            }
+        }
+    }
 }
 
 impl Drop for Encoder {
     fn drop(&mut self) {
+        // 顺序不能反：先等硬件收工，再拆 surface。
+        self.finish();
         // Safe because every handle was created by this encoder and is released
         // exactly once, in an order that leaves no borrowed child behind.
         unsafe {
