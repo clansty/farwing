@@ -115,6 +115,11 @@ makepkg --force "${makepkg_flags[@]}"
 # 所以事前算不准，直接取刚写进去的那个（mtime 最新）。
 pkg="$(ls -t "$PKGDEST"/openuuyc-clansty-*.pkg.tar.zst 2>/dev/null | head -n1 || true)"
 [[ -n $pkg && -f $pkg ]] || die "makepkg 跑完了，却没在 ${PKGDEST} 里找到包"
+# .gnogit 说明工作树不是 git 仓库（CI 里 checkout 退化成源码压缩包就是这样），
+# 这种包名跟 PKGBUILD 的版本对不上，装完 pacman 查到的版本也是错的。
+case "$pkg" in
+  *gnogit*) die "包名里是 .gnogit，版本号退化了：${pkg}" ;;
+esac
 
 # makepkg 会把 pkgver() 算出的版本写回 PKGBUILD（VCS 源的既定行为，--holdver 也拦不住），
 # 于是每打一次包仓库里就多一处 diff。构建前这文件是干净的，这里顺手还原掉。

@@ -40,6 +40,23 @@ jobs:
           chown -R builder .
           sudo -u builder env OPENUUYC_LOCAL_SRC="$PWD" ./packaging/arch/build.sh --syncdeps --noconfirm
 
+      - name: Check the version number
+        # 包名里带 .gnogit 说明工作区不是 git 仓库；tag 上还带 .r<提交数>.g<hash> 说明
+        # 当前提交没被认成 tag。两种都会让装完 pacman 查到的版本与 release 描述对不上
+        # （#1 修的就是这条），所以宁可让 CI 红掉，也别把这种包静默挂上去。
+        run: |
+          ls target/arch/*.pkg.tar.zst
+          case "$(ls target/arch/*.pkg.tar.zst)" in *gnogit*)
+            echo "::error::工作区不是 git 仓库，版本号退化成 .gnogit"; exit 1 ;;
+          esac
+          # 分支上版本号本来就该带 .r<提交数>.g<hash>，只有 tag 上必须干净。
+          case "$GITHUB_REF" in refs/tags/v*)
+            if ls target/arch/*.pkg.tar.zst | grep -qE '\.r[0-9]+\.g'; then
+              echo "::error::当前提交没被认成 tag，版本号带上了 .r<提交数>.g<hash>"
+              exit 1
+            fi ;;
+          esac
+
       - uses: actions/upload-artifact@v7
         with:
           name: openuuyc-arch
