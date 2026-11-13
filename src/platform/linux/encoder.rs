@@ -51,7 +51,14 @@ pub(crate) fn probe(
         }
     }
     if let Some(backend) = super::vaapi::hardware_backend() {
-        for codec in [Codec::H264, Codec::H265, Codec::Av1] {
+        // 只探测 H.264 与 HEVC。第三个不同的编码档位（AV1）一进来，本机
+        // navi32 + mesa 26.2 的 radeonsi 就会在编码 AV1 时把 VCN 环挂死：内核报
+        // `Faulty UTCL2 client ID: VCNU0` 与 `ring vcn_unified_0 timeout`，进程随即
+        // 在 Mesa 的 CS 线程里 abort，运气不好还会升级成整卡复位、把 niri 一起带走。
+        // 而 AV1 的探测从来没通过过（`编码器实际码流与请求格式不一致`），等于只有
+        // 风险没有收益。二分依据见 `probe_teardown_loop`：h264 单独 60 轮、h264+hevc
+        // 60 轮都干净，加上 AV1 这一档 0~2 轮内必挂。
+        for codec in [Codec::H264, Codec::H265] {
             let format = Format {
                 codec,
                 chroma: 1,
