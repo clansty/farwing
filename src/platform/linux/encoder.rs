@@ -50,25 +50,15 @@ pub(crate) fn probe(
             }
         }
     }
-    if let Some(backend) = super::vaapi::hardware_backend() {
-        // 只探测 H.264 与 HEVC。第三个不同的编码档位（AV1）一进来，本机
-        // navi32 + mesa 26.2 的 radeonsi 就会在编码 AV1 时把 VCN 环挂死：内核报
-        // `Faulty UTCL2 client ID: VCNU0` 与 `ring vcn_unified_0 timeout`，进程随即
-        // 在 Mesa 的 CS 线程里 abort，运气不好还会升级成整卡复位、把 niri 一起带走。
-        // 而 AV1 的探测从来没通过过（`编码器实际码流与请求格式不一致`），等于只有
-        // 风险没有收益。二分依据见 `probe_teardown_loop`：h264 单独 60 轮、h264+hevc
-        // 60 轮都干净，加上 AV1 这一档 0~2 轮内必挂。
-        for codec in [Codec::H264, Codec::H265] {
-            let format = Format {
-                codec,
-                chroma: 1,
-                depth: 8,
-            };
-            if super::vaapi::accepts(format) {
-                candidates.push((backend, format));
-            }
-        }
-    }
+    // VA-API 的档位**一个都不实证**，只按驱动声明的 profile 申报（见探测循环之后）。
+    // 实证要真建一个 VA 编码上下文，而在这台 navi32 + mesa 26.2 的 radeonsi 上，
+    // 同一个进程里出现多个 VA 编码上下文（哪怕是一个个建、一个个丢）就有不小的概率
+    // 让 VCN 等不到完成信号：内核报 `Faulty UTCL2 client ID: VCNU0` 或
+    // `ring vcn_unified_0|1 timeout`，进程随即在 Mesa 的 CS 线程里 abort，运气不好
+    // 还会升级成整卡复位、把 niri 一起带走。二分数据见 `probe_teardown_loop`：
+    // 单档 60 轮干净、两档组合 180 轮也干净，但现实里「启动时探一遍 DP-3、连接时再探
+    // 一遍 DP-1」这种顺序两档照样挂过，所以「几档安全」没有可靠答案 —— 干脆不建。
+    // 这样每个进程的 VA 编码上下文就只剩会话自己那一个。
     candidates.push((Backend::Software, Format::AVC));
     let rate = Rate {
         target: 2_000_000,
@@ -133,6 +123,31 @@ pub(crate) fn probe(
         }
     }
     ensure!(!result.is_empty(), "所选桌面没有可用的视频编码器");
+    // 未经实证的档位：只看驱动有没有对应的 profile/entrypoint，不做真实编码。
+    // 真有问题时 `capture_worker` 里那套 `failed` + 候选回退会把它换掉（代价是
+    // 一次会话启动失败）。AV1 故意不在列：它在探测里从来没通过过（`编码器实际码流
+    // 与请求格式不一致`），advertise 出去只会让对端选到一个我们自己都验不了的档位。
+    if let Some(backend) = super::vaapi::hardware_backend() {
+        let mut declared = Vec::new();
+        for codec in [Codec::H264, Codec::H265] {
+            let format = Format {
+                codec,
+                chroma: 1,
+                depth: 8,
+            };
+            if super::vaapi::accepts(format) {
+                declared.push(Capability {
+                    adapter: desktop.screen.adapter,
+                    backend,
+                    format,
+                    maximum: super::ffmpeg::Encoder::maximum_size(format),
+                });
+            }
+        }
+        // 硬件候选要排在软件兜底前面，保持原来的优先顺序。
+        declared.append(&mut result);
+        result = declared;
+    }
     Ok(result)
 }
 
