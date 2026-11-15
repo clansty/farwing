@@ -153,6 +153,12 @@ impl ResolvedConnection {
             bail!("cannot connect the device to itself");
         }
         report_progress(reporter, 3, "创建远程会话", "正在创建会话并获取信令凭据");
+        // 本机已经在这台设备上有房间（比如终端先连）时不再 join：第二次 join 会
+        // 让服务端释放那个房间，先连的那条随之断开。
+        let reuse_room = self.assist.is_none() && shared::room(&key).is_some();
+        if reuse_room {
+            tracing::info!("reusing the room of this device's existing session");
+        }
         let room = if let Some(assist) = &mut self.assist {
             let reply = assist
                 .join(&self.client, &self.controller_device_id, reporter, cancel)
@@ -163,7 +169,9 @@ impl ResolvedConnection {
             if !reply.device_name.is_empty() {
                 self.summary.alias = reply.device_name.clone();
             }
-            RoomSession::from_assist(&reply)
+            Some(RoomSession::from_assist(&reply))
+        } else if reuse_room {
+            None
         } else {
             // Consume before dispatch. Neither API failure nor a later room
             // reconnect may reuse this user confirmation.
@@ -176,7 +184,7 @@ impl ResolvedConnection {
             } else {
                 false
             };
-            loop {
+            let joined = loop {
                 match cancellable(
                     cancel,
                     self.client.join_device(&self.target_device_id, force_join),
@@ -212,7 +220,8 @@ impl ResolvedConnection {
                         .await?;
                     }
                 }
-            }
+            };
+            Some(joined)
         };
         if self.refresh_after_upgrade {
             // Rejoining the room establishes that the target is back online.
@@ -227,7 +236,7 @@ impl ResolvedConnection {
             self.target_version = device.version_name.clone();
             self.refresh_after_upgrade = false;
         }
-        let bitrate_limit = if room.international_connect {
+        let bitrate_limit = if room.as_ref().is_some_and(|room| room.international_connect) {
             match cancellable(cancel, self.client.international_bitrate_limit()).await {
                 Ok(limit) => limit,
                 Err(error) if cancel.is_cancelled() => return Err(error),
@@ -318,6 +327,7 @@ impl ResolvedConnection {
 
         let mut connection = ControllerConnection::establish(
             room,
+            &key,
             &self.controller_device_id,
             self.profile,
             self.client

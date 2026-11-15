@@ -45,10 +45,24 @@ pub(crate) mod host;
 mod tls;
 mod transport;
 
-/// 在已有房间里再开一路会话（终端）的请求。房间按设备分配，第二条连接
-/// 只能挂在同一条信令 socket 上，所以请求交给 socket 的所有者去做。
+/// 房间 socket 上的一路会话。
+pub(crate) struct Attached {
+    pub(crate) peer: Arc<NativePeer>,
+    pub(crate) ice_id: String,
+    pub(crate) force_relay: bool,
+}
+
+/// 交给房间 socket 所有者的请求。房间按设备分配，一个房间只有一条信令
+/// socket，观看与终端都是这条 socket 上的两路会话。
+pub(crate) enum RoomRequest {
+    /// 在这个房间里再开一路会话。
+    Attach(SideChannelRequest),
+    /// 这一路会话结束了，把它从房间里摘掉。socket 留到最后一个会话退出。
+    Detach { ice_id: String },
+}
+
 pub(crate) struct SideChannelRequest {
-    pub(crate) reply: oneshot::Sender<Result<Arc<NativePeer>>>,
+    pub(crate) reply: oneshot::Sender<Result<Attached>>,
     pub(crate) controller_device_id: String,
     pub(crate) profile: ConnectionMediaProfile,
     pub(crate) transport: crate::media::TransportChoice,
@@ -652,15 +666,447 @@ impl SignalSession {
         }
     }
 
-    pub async fn keep_alive(
-        self,
-        shutdown: oneshot::Receiver<()>,
-        peer: Option<std::sync::Arc<NativePeer>>,
-        control: Option<ControlSessionInfo>,
-        side: Option<tokio::sync::mpsc::UnboundedReceiver<SideChannelRequest>>,
+    /// 房间 socket 的保活循环。观看与终端是这个循环里的两路会话：谁先连谁是
+    /// socket 的主人，主人关掉时只摘掉自己那路，socket 留给还开着的会话。
+    pub(crate) async fn keep_alive_room(
+        mut self,
+        mut shutdown: oneshot::Receiver<()>,
+        mut requests: tokio::sync::mpsc::UnboundedReceiver<RoomRequest>,
     ) -> Result<()> {
-        self.keep_alive_inner(shutdown, peer, control, None, side)
-            .await
+        use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+        struct Slot {
+            control: ControlSessionInfo,
+            peer: Arc<NativePeer>,
+        }
+        let mut slots: Vec<Slot> = Vec::new();
+        let mut shutdown_seen = false;
+        let mut next_key_check = tokio::time::Instant::now() + RECONNECT_KEY_CHECK_INTERVAL;
+        let mut pending_key_refresh: Option<(u64, tokio::time::Instant)> = None;
+        let mut active_ice_network_type = 3_u8;
+        let mut pending_network_switch = None::<PendingNetworkSwitch>;
+        let mut candidate_stream: Option<(
+            String,
+            tokio::sync::broadcast::Receiver<Option<RTCIceCandidateInit>>,
+        )> = None;
+        let mut candidate_open = false;
+        let mut network: Option<(String, crate::features::network_control::NetworkControl)> = None;
+        let mut manual_requests: Option<(String, tokio::sync::watch::Receiver<Option<bool>>)> =
+            None;
+        let mut manual_open = false;
+        let mut network_switch_check = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        network_switch_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let result: Result<()> = loop {
+            // 主人那一路随时可能被摘掉，每轮都重新对齐它绑定的状态。
+            match slots.first() {
+                Some(primary) => {
+                    let ice = primary.control.ice_id.clone();
+                    if candidate_stream
+                        .as_ref()
+                        .is_none_or(|(current, _)| current != &ice)
+                    {
+                        candidate_stream = Some((ice.clone(), primary.peer.local_ice_candidates()));
+                        candidate_open = true;
+                        active_ice_network_type = 3;
+                        pending_network_switch = None;
+                    }
+                    if network
+                        .as_ref()
+                        .is_none_or(|(current, _)| current != &ice)
+                    {
+                        let control = primary.peer.stream_control_handle().network_control();
+                        manual_requests = Some((ice.clone(), control.subscribe()));
+                        manual_open = true;
+                        network = Some((ice, control));
+                    }
+                }
+                None => {
+                    candidate_stream = None;
+                    candidate_open = false;
+                    network = None;
+                    manual_requests = None;
+                    manual_open = false;
+                }
+            }
+            let primary_peer = slots.first().map(|slot| Arc::clone(&slot.peer));
+            let primary_control = slots.first().map(|slot| slot.control.clone());
+            tokio::select! {
+                biased;
+                _ = &mut shutdown, if !shutdown_seen => {
+                    shutdown_seen = true;
+                    // 主人只关自己那一路：房间还开着别的会话就把 socket 留着。
+                    if !slots.is_empty() {
+                        let slot = slots.remove(0);
+                        tracing::info!("room owner detached; the room stays open for its other sessions");
+                        if let Err(error) = slot.peer.close().await {
+                            tracing::warn!(%error, "room owner media teardown failed");
+                        }
+                    }
+                }
+                request = requests.recv() => {
+                    match request {
+                        Some(RoomRequest::Attach(request)) => {
+                            let result = async {
+                                let control = self
+                                    .start_control(
+                                        &request.controller_device_id,
+                                        request.profile,
+                                        crate::session::negotiation::ControlConnectType::Normal,
+                                        None,
+                                        request.purpose,
+                                    )
+                                    .await
+                                    .context("room session control handshake")?;
+
+                                let peer = NativePeer::new_with_profile(
+                                    control
+                                        .ice_servers
+                                        .iter()
+                                        .map(|server| crate::transport::rtc::IceServer {
+                                            urls: vec![server.urls.clone()],
+                                            username: server.username.clone(),
+                                            credential: server.credential.clone(),
+                                        })
+                                        .collect(),
+                                    if control.force_relay {
+                                        crate::media::TransportChoice::Relay
+                                    } else {
+                                        request.transport
+                                    },
+                                    request.profile,
+                                    request.purpose
+                                        == crate::session::negotiation::ControlPurpose::Terminal,
+                                )
+                                .await
+                                .context("room session peer")?;
+                                self.negotiate(&control, &peer, None)
+                                    .await
+                                    .context("room session negotiate")?;
+                                Ok::<_, anyhow::Error>((control, peer))
+                            }
+                            .await;
+                            match result {
+                                Ok((control, peer)) => {
+                                    let ice_id = control.ice_id.clone();
+                                    let force_relay = control.force_relay;
+                                    tracing::info!(
+                                        purpose = ?request.purpose,
+                                        %ice_id,
+                                        "room accepted another session on the same signaling socket"
+                                    );
+                                    let peer = Arc::new(peer);
+                                    slots.push(Slot {
+                                        control,
+                                        peer: Arc::clone(&peer),
+                                    });
+                                    let _ = request.reply.send(Ok(Attached {
+                                        peer,
+                                        ice_id,
+                                        force_relay,
+                                    }));
+                                }
+                                Err(error) => {
+                                    tracing::warn!(%error, "room rejected another session");
+                                    let _ = request.reply.send(Err(error));
+                                }
+                            }
+                        }
+                        Some(RoomRequest::Detach { ice_id }) => {
+                            if let Some(index) = slots
+                                .iter()
+                                .position(|slot| slot.control.ice_id == ice_id)
+                            {
+                                let slot = slots.remove(index);
+                                if let Err(error) = slot.peer.close().await {
+                                    tracing::warn!(%error, "room session teardown failed");
+                                }
+                            }
+                            if slots.is_empty() && shutdown_seen {
+                                break Ok(());
+                            }
+                        }
+                        None => {
+                            if slots.is_empty() {
+                                break Ok(());
+                            }
+                        }
+                    }
+                }
+                changed = async {
+                    match manual_requests.as_mut() {
+                        Some((_, requests)) => requests.changed().await.map_err(|_| ()),
+                        None => pending().await,
+                    }
+                }, if manual_open => {
+                    if changed.is_err() {
+                        manual_open = false;
+                        continue;
+                    }
+                    let Some((_, requests)) = manual_requests.as_mut() else { continue; };
+                    let desired = *requests.borrow_and_update();
+                    let Some(relay) = desired else { continue; };
+                    let (Some(peer), Some(info)) = (primary_peer.as_ref(), primary_control.as_ref()) else { continue; };
+                    let Some((_, network)) = network.as_ref() else { continue; };
+                    if !peer.can_switch_ice_network() || !self.transport.is_connected() {
+                        network.fail("当前连接尚未就绪，无法切换线路");
+                        continue;
+                    }
+                    if info.force_relay && !relay {
+                        network.fail("本次连接要求使用中转");
+                        continue;
+                    }
+                    let (transport_type, attempt) = if relay { (1, 2) } else { (3, 3) };
+                    match self
+                        .apply_official_network_switch(info, peer, transport_type, attempt)
+                        .await
+                    {
+                        Ok(()) => {
+                            peer.accept_manual_network_policy();
+                            active_ice_network_type = transport_type;
+                            pending_network_switch = None;
+                            network.submitted(relay);
+                            tracing::info!(relay, "manual network policy submitted");
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, relay, "manual network switch failed; retaining current path");
+                            network.fail("线路切换未完成，可稍后重试");
+                        }
+                    }
+                }
+                _ = async {
+                    if let Some((_, deadline)) = pending_key_refresh {
+                        tokio::time::sleep_until(deadline).await;
+                    } else {
+                        pending::<()>().await;
+                    }
+                } => {
+                    tracing::warn!("refresh_reconnect_key ACK timed out; keeping the current signaling socket");
+                    pending_key_refresh = None;
+                    next_key_check = tokio::time::Instant::now() + RECONNECT_KEY_CHECK_INTERVAL;
+                }
+                _ = tokio::time::sleep_until(next_key_check), if pending_key_refresh.is_none() => {
+                    if self.transport.is_connected()
+                        && self
+                            .last_reconnect_key_refresh
+                            .is_none_or(|last| last.elapsed() > RECONNECT_KEY_MAX_AGE)
+                    {
+                        let ack_id = self.next_refresh_ack_id;
+                        self.next_refresh_ack_id = ack_id.wrapping_add(1).max(3);
+                        let refresh = encode_event("refresh_reconnect_key", &[], Some(ack_id))?;
+                        if let Err(error) = self.send_text(refresh).await {
+                            tracing::warn!(%error, "refresh_reconnect_key request failed; waiting for the socket state machine");
+                        } else {
+                            pending_key_refresh =
+                                Some((ack_id, tokio::time::Instant::now() + RECONNECT_KEY_ACK_TIMEOUT));
+                        }
+                    }
+                    next_key_check = tokio::time::Instant::now() + RECONNECT_KEY_CHECK_INTERVAL;
+                }
+                candidate = async {
+                    match candidate_stream.as_mut() {
+                        Some((_, stream)) => stream.recv().await,
+                        None => pending().await,
+                    }
+                }, if candidate_open => {
+                    let Some(control) = primary_control.as_ref() else { continue; };
+                    match candidate {
+                        Ok(Some(candidate)) => {
+                            self.send_soac_candidate(control, &candidate, active_ice_network_type == 1)
+                                .await?;
+                        }
+                        Ok(None) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(skipped, "room local ICE candidate broadcast lagged");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            candidate_open = false;
+                        }
+                    }
+                }
+                packet = self.next_packet() => {
+                    match packet {
+                        Err(error) => break Err(error),
+                        Ok(EnginePacket::Message(SocketPacket::Ack { id, args, .. }))
+                            if pending_key_refresh.is_some_and(|(pending_id, _)| id == pending_id) =>
+                        {
+                            if args.len() < 2 || args[0].as_str() != Some("success") {
+                                tracing::warn!("refresh_reconnect_key ACK was rejected");
+                            } else {
+                                if let Some(value) = args[1].get("reconnect_key") {
+                                    self.reconnect_key = value
+                                        .as_str()
+                                        .filter(|key| !key.is_empty())
+                                        .map(str::to_owned);
+                                }
+                                if self.reconnect_key.is_some() {
+                                    self.transport.set_reconnect_key(self.reconnect_key.clone());
+                                    self.last_reconnect_key_refresh = Some(Instant::now());
+                                } else {
+                                    tracing::warn!(ack_id = id, "refresh_reconnect_key ACK left an empty key");
+                                }
+                            }
+                            pending_key_refresh = None;
+                            next_key_check = tokio::time::Instant::now() + RECONNECT_KEY_CHECK_INTERVAL;
+                        }
+                        Ok(EnginePacket::Message(SocketPacket::Event { event, args, binary, .. }))
+                            if event == "soac" =>
+                        {
+                            let ice = args
+                                .first()
+                                .and_then(|value| value.get("data"))
+                                .and_then(|data| data.get("ice_id"))
+                                .and_then(Value::as_str);
+                            let index = ice.and_then(|ice| {
+                                slots.iter().position(|slot| slot.control.ice_id == ice)
+                            });
+                            let Some(index) = index else { continue; };
+                            let control = slots[index].control.clone();
+                            let peer = Arc::clone(&slots[index].peer);
+                            match parse_remote_soac(&args, Some(&control)) {
+                                Ok(Some(RemoteSoac::Candidate(candidate))) => {
+                                    if let Err(error) = peer.add_remote_candidate(candidate).await {
+                                        tracing::warn!(%error, "room discarded rejected remote ICE candidate");
+                                    }
+                                }
+                                Ok(Some(RemoteSoac::Answer { sdp, restart_ice })) => {
+                                    if let Err(error) = peer.set_remote_answer(sdp, restart_ice).await {
+                                        tracing::warn!(%error, "room rejected remote answer");
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    tracing::warn!(%error, "room discarded invalid SOAC event");
+                                }
+                            }
+                        }
+                        Ok(EnginePacket::Message(SocketPacket::Event { event, args, binary, .. }))
+                            if event == "forward_setting" =>
+                        {
+                            let (Some(peer), Some(control)) =
+                                (primary_peer.as_ref(), primary_control.as_ref())
+                            else {
+                                continue;
+                            };
+                            if handle_signal_app_data(&args, &binary, peer) {
+                                continue;
+                            }
+                            let parsed = match parse_forward_setting(&args, control) {
+                                Ok(parsed) => parsed,
+                                Err(error) => {
+                                    tracing::warn!(%error, "room discarded invalid forward_setting event");
+                                    continue;
+                                }
+                            };
+                            match parsed {
+                                Some(ForwardSettingEvent::DeviceCapability(capability)) => {
+                                    apply_device_capability(capability, control, peer);
+                                }
+                                Some(ForwardSettingEvent::SenderParaInfo { ice_id, infos }) => {
+                                    tracing::debug!(%ice_id, ?infos, "official sender_para_info received");
+                                    peer.performance_monitor().set_remote_senders(infos);
+                                }
+                                Some(ForwardSettingEvent::SwitchNetwork {
+                                    transport_type,
+                                    ice_id,
+                                    attempt_switch_type,
+                                }) => {
+                                    if !peer.allows_network_switch()
+                                        || ice_id != control.ice_id
+                                        || transport_type == 0
+                                        || !peer.can_switch_ice_network()
+                                    {
+                                        continue;
+                                    }
+                                    if let Err(error) = self
+                                        .apply_official_network_switch(
+                                            control,
+                                            peer,
+                                            transport_type,
+                                            attempt_switch_type,
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(%error, "official ICE network switch attempt failed; keeping the old selected path");
+                                        pending_network_switch = None;
+                                        continue;
+                                    }
+                                    peer.performance_monitor()
+                                        .record_network_switch_attempt(attempt_switch_type);
+                                    active_ice_network_type = transport_type;
+                                    pending_network_switch =
+                                        Some(PendingNetworkSwitch { attempt_switch_type });
+                                }
+                                None => {}
+                            }
+                        }
+                        Ok(EnginePacket::Ping(payload)) => {
+                            self.send_text(encode_pong(&payload)).await?;
+                        }
+                        Ok(EnginePacket::Close)
+                        | Ok(EnginePacket::Message(SocketPacket::Disconnect { .. })) => {
+                            break Err(SignalFailure::NamespaceClosed.into());
+                        }
+                        Ok(EnginePacket::Message(SocketPacket::ConnectError { .. })) => {
+                            break Err(anyhow!("signaling server rejected the room session"));
+                        }
+                        _ => {}
+                    }
+                }
+                _ = network_switch_check.tick(), if primary_peer.is_some() => {
+                    let Some(peer) = primary_peer.as_ref() else { continue; };
+                    let selected = peer.selected_transport().await;
+                    if let Some((_, network)) = network.as_ref() {
+                        network.connected(peer.can_switch_ice_network());
+                        network.observe_route(selected.as_ref().is_some_and(|s| s.0));
+                    }
+                    let Some(pending) = pending_network_switch else { continue; };
+                    if selected_transport_matches_switch(selected, pending.attempt_switch_type) {
+                        peer.performance_monitor()
+                            .record_network_switch_success(pending.attempt_switch_type);
+                        pending_network_switch = None;
+                    }
+                }
+                state = async {
+                    match primary_peer.as_ref() {
+                        Some(peer) => peer.next_connection_state().await,
+                        None => pending().await,
+                    }
+                } => {
+                    match state {
+                        Some(RTCPeerConnectionState::Connected) => {
+                            self.transport.set_controlling(true);
+                        }
+                        Some(RTCPeerConnectionState::Disconnected) => {
+                            pending_network_switch = None;
+                            tracing::warn!("primary peer temporarily disconnected; keeping the ICE session");
+                        }
+                        Some(RTCPeerConnectionState::Failed) => {
+                            break Err(SignalFailure::Peer(
+                                "native WebRTC ICE connection failed (3021)".into(),
+                            )
+                            .into());
+                        }
+                        Some(RTCPeerConnectionState::Closed) => {
+                            self.transport.set_controlling(false);
+                            if shutdown_seen && slots.is_empty() {
+                                break Ok(());
+                            }
+                        }
+                        None => {}
+                        Some(_) => {}
+                    }
+                }
+            }
+        };
+        tracing::info!(error = ?result.as_ref().err(), "room socket loop finished");
+        for slot in &slots {
+            let _ = slot.peer.close().await;
+        }
+        self.transport.set_controlling(false);
+        self.graceful_close().await?;
+        result
     }
 
     pub(crate) async fn keep_alive_host(
@@ -668,7 +1114,7 @@ impl SignalSession {
         shutdown: oneshot::Receiver<()>,
         client: crate::session::host_client::HostClient,
     ) -> Result<()> {
-        self.keep_alive_inner(shutdown, None, None, Some(host::Session::new(client)), None)
+        self.keep_alive_inner(shutdown, None, None, Some(host::Session::new(client)))
             .await
     }
 
@@ -678,7 +1124,6 @@ impl SignalSession {
         peer: Option<std::sync::Arc<NativePeer>>,
         control: Option<ControlSessionInfo>,
         mut host: Option<host::Session>,
-        mut side: Option<tokio::sync::mpsc::UnboundedReceiver<SideChannelRequest>>,
     ) -> Result<()> {
         let mut next_key_check = tokio::time::Instant::now() + RECONNECT_KEY_CHECK_INTERVAL;
         let mut pending_key_refresh: Option<(u64, tokio::time::Instant)> = None;
@@ -799,50 +1244,6 @@ impl SignalSession {
                             local_candidate_stream_open = false;
                         }
                     }
-                }
-                request = async {
-                    if let Some(requests) = &mut side { requests.recv().await } else { pending().await }
-                }, if side.is_some() => {
-                    let Some(request) = request else { side = None; continue; };
-                    let result = async {
-                        let side_control = self
-                            .start_control(
-                                &request.controller_device_id,
-                                request.profile,
-                                crate::session::negotiation::ControlConnectType::Normal,
-                                None,
-                                request.purpose,
-                            )
-                            .await
-                            .context("side channel control handshake")?;
-                        let side_peer = NativePeer::new_with_profile(
-                            side_control
-                                .ice_servers
-                                .iter()
-                                .map(|server| crate::transport::rtc::IceServer {
-                                    urls: vec![server.urls.clone()],
-                                    username: server.username.clone(),
-                                    credential: server.credential.clone(),
-                                })
-                                .collect(),
-                            request.transport,
-                            request.profile,
-                            request.purpose
-                                == crate::session::negotiation::ControlPurpose::Terminal,
-                        )
-                        .await
-                        .context("side channel peer")?;
-                        self.negotiate(&side_control, &side_peer, None)
-                            .await
-                            .context("side channel negotiate")?;
-                        tracing::info!(
-                            purpose = ?request.purpose,
-                            "side channel negotiated inside the existing room"
-                        );
-                        Ok::<_, anyhow::Error>(Arc::new(side_peer))
-                    }
-                    .await;
-                    let _ = request.reply.send(result);
                 }
                 packet = self.next_packet() => {
                     match packet {

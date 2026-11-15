@@ -24,9 +24,36 @@ use viewing::run_viewer_window;
 pub use viewing::{run_native_viewer_session, run_saved_viewer_window};
 
 pub type ConnectionProgressReporter = Arc<dyn Fn(ConnectionProgress) + Send + Sync>;
-/// 本机已经连着的设备上再开一路会话（终端）。房间按设备分配、一条信令
-/// socket 只能属于一个房间，所以第二路必须交给已有会话去开，而不是自己
-/// join——再 join 一次会让服务端释放前一个房间，先连的那条随之断开。
+/// 让房间的 socket 所有者再开一路会话。房间按设备分配、一条信令 socket 只能
+/// 属于一个房间，所以第二路必须交给已经有房间的会话去开，而不是自己 join——
+/// 再 join 一次会让服务端释放前一个房间，先连的那条随之断开。
+async fn attach_room(
+    requests: &tokio::sync::mpsc::UnboundedSender<crate::transport::signal::RoomRequest>,
+    controller_device_id: &str,
+    profile: ConnectionMediaProfile,
+    transport: crate::media::TransportChoice,
+    purpose: crate::session::negotiation::ControlPurpose,
+    cancel: &CancellationToken,
+) -> Result<crate::transport::signal::Attached> {
+    let (reply, receiver) = oneshot::channel();
+    requests
+        .send(crate::transport::signal::RoomRequest::Attach(
+            crate::transport::signal::SideChannelRequest {
+                reply,
+                controller_device_id: controller_device_id.to_owned(),
+                profile,
+                transport,
+                purpose,
+            },
+        ))
+        .map_err(|_| anyhow!("设备房间已结束，无法再开会话"))?;
+    cancellable(cancel, async {
+        receiver.await.context("房间会话请求中断")?
+    })
+    .await
+}
+
+/// 本机已经连着的设备上再开一路会话（终端）。
 pub(crate) async fn attach_terminal(
     controller: &str,
     target: &str,
@@ -34,18 +61,18 @@ pub(crate) async fn attach_terminal(
     profile: ConnectionMediaProfile,
     transport: crate::media::TransportChoice,
     cancel: &CancellationToken,
-) -> Option<Result<Arc<NativePeer>>> {
-    let session = shared::get(&shared::key(controller, target))?;
+) -> Option<Result<crate::transport::signal::Attached>> {
+    let room = shared::room(&shared::key(controller, target))?;
     Some(
-        session
-            .open_side(
-                controller_device_id.to_owned(),
-                profile,
-                transport,
-                crate::session::negotiation::ControlPurpose::Terminal,
-                cancel,
-            )
-            .await,
+        attach_room(
+            &room.requests,
+            controller_device_id,
+            profile,
+            transport,
+            crate::session::negotiation::ControlPurpose::Terminal,
+            cancel,
+        )
+        .await,
     )
 }
 pub(crate) fn has_gui_connection(controller: &str, target: &str) -> bool {
@@ -83,6 +110,22 @@ pub struct ControllerConnection {
     profile: ConnectionMediaProfile,
     preference_writer: Option<crate::features::viewing_settings::PreferenceWriter>,
     local_preference_writer: Option<crate::features::viewing_settings::PreferenceWriter>,
+    /// 本连接是哪个房间里的哪一路会话；关闭时只摘掉自己这一路。
+    room: Option<Arc<shared::Room>>,
+    ice_id: Option<String>,
+}
+
+impl Drop for ControllerConnection {
+    fn drop(&mut self) {
+        tracing::debug!(ice_id = ?self.ice_id, "controller connection dropped");
+        if let (Some(room), Some(ice_id)) = (&self.room, &self.ice_id) {
+            let _ = room.requests.send(
+                crate::transport::signal::RoomRequest::Detach {
+                    ice_id: ice_id.clone(),
+                },
+            );
+        }
+    }
 }
 
 pub struct ConnectionSummary {
@@ -243,17 +286,28 @@ impl ControllerConnection {
         } else {
             false
         };
-        let room = cancellable(cancel, client.join_device(&device.device_id, force_join))
-            .await
-            .map_err(|error| {
-                if force_join {
-                    error.context("接管请求未确认成功，未自动重试；请检查设备状态后重新确认")
-                } else {
-                    error
-                }
-            })?;
+        // 本机已经在这台设备上有房间（终端先连）时不再 join：第二次 join 会让
+        // 服务端释放那个房间，先连的那条随之断开。
+        let room = if shared::room(&key).is_some() {
+            None
+        } else {
+            Some(
+                cancellable(cancel, client.join_device(&device.device_id, force_join))
+                    .await
+                    .map_err(|error| {
+                        if force_join {
+                            error.context(
+                                "接管请求未确认成功，未自动重试；请检查设备状态后重新确认",
+                            )
+                        } else {
+                            error
+                        }
+                    })?,
+            )
+        };
         let connection = Self::establish(
             room,
+            &key,
             &client.device_id(),
             profile,
             policy,
@@ -285,6 +339,8 @@ impl ControllerConnection {
             profile,
             preference_writer: None,
             local_preference_writer: None,
+            room: None,
+            ice_id: None,
         })
     }
     pub(crate) async fn activate_viewing(&self) -> Result<()> {
@@ -399,7 +455,8 @@ impl ControllerConnection {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn establish(
-        room: RoomSession,
+        room: Option<RoomSession>,
+        room_key: &str,
         controller_device_id: &str,
         profile: ConnectionMediaProfile,
         features: crate::account::feature_ability::FeaturePolicy,
@@ -412,21 +469,38 @@ impl ControllerConnection {
         purpose: crate::session::negotiation::ControlPurpose,
     ) -> Result<Self> {
         tracing::info!(?profile, ?transport, "establishing controller connection");
-        report_progress(
-            reporter,
-            4,
-            "连接信令服务",
-            "正在完成 TLS、WebSocket、Engine.IO 与 Socket.IO 房间握手",
-        );
-        let mut signal = SignalSession::connect_cancellable(room, SignalRole::Controller, cancel)
-            .await
-            .context("connect controller signaling")?;
-        report_progress(
-            reporter,
-            4,
-            "信令通道已连接",
-            "Socket.IO 房间验证完成，保活与断线重连密钥已就绪",
-        );
+        // 房间按设备分配，一个房间只有一条信令 socket：本机已经在这台设备上
+        // 有房间（观看或终端）就挂上去，否则自己开一个。
+        let (requests, owner, room_handle) = match shared::room(room_key) {
+            Some(existing) => (existing.requests.clone(), None, existing),
+            None => {
+                report_progress(
+                    reporter,
+                    4,
+                    "连接信令服务",
+                    "正在完成 TLS、WebSocket、Engine.IO 与 Socket.IO 房间握手",
+                );
+                let room = room.context("缺少房间凭据")?;
+                let signal = SignalSession::connect_cancellable(
+                    room,
+                    SignalRole::Controller,
+                    cancel,
+                )
+                .await
+                .context("connect controller signaling")?;
+                report_progress(
+                    reporter,
+                    4,
+                    "信令通道已连接",
+                    "Socket.IO 房间验证完成，保活与断线重连密钥已就绪",
+                );
+                let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+                let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+                let task = tokio::spawn(signal.keep_alive_room(shutdown_receiver, receiver));
+                let room = shared::publish_room(room_key, sender.clone());
+                (sender, Some((shutdown_sender, task)), room)
+            }
+        };
         report_progress(
             reporter,
             5,
@@ -437,71 +511,14 @@ impl ControllerConnection {
                 profile.codec.label()
             ),
         );
-        let control = match cancellable(
-            cancel,
-            signal.start_control(
-                controller_device_id,
-                profile,
-                connect_type,
-                preferences,
-                purpose,
-            ),
-        )
-        .await
-        {
-            Ok(control) => control,
-            Err(error) => {
-                let _ = signal.close().await;
-                return Err(error).context("complete controller handshake");
-            }
-        };
-        report_progress(
-            reporter,
-            5,
-            "控制握手已接受",
-            format!(
-                "远端返回 {} 组 ICE 服务；自动切路={}，强制 Relay={}",
-                control.ice_servers.len(),
-                if control.auto_switch_network {
-                    "启用"
-                } else {
-                    "关闭"
-                },
-                if control.force_relay { "是" } else { "否" }
-            ),
-        );
-        let transport = if control.force_relay {
+        let attached = attach_room(&requests, controller_device_id, profile, transport, purpose, cancel)
+            .await
+            .context("complete controller handshake")?;
+        let peer = Arc::clone(&attached.peer);
+        let transport = if attached.force_relay {
             crate::media::TransportChoice::Relay
         } else {
             transport
-        };
-        report_progress(
-            reporter,
-            6,
-            "创建安全传输栈",
-            "正在初始化 ICE、DTLS-SRTP、SCTP 数据通道与 RTP/RTX/FEC 接收链",
-        );
-        let peer = match NativePeer::new_with_profile(
-            control
-                .ice_servers
-                .iter()
-                .map(|server| IceServer {
-                    urls: vec![server.urls.clone()],
-                    username: server.username.clone(),
-                    credential: server.credential.clone(),
-                })
-                .collect(),
-            transport,
-            profile,
-            purpose == crate::session::negotiation::ControlPurpose::Terminal,
-        )
-        .await
-        {
-            Ok(peer) => Arc::new(peer),
-            Err(error) => {
-                let _ = signal.close().await;
-                return Err(error).context("create native WebRTC peer");
-            }
         };
         peer.stream_control_handle().set_feature_policy(features);
         peer.stream_control_handle()
@@ -514,14 +531,13 @@ impl ControllerConnection {
                 .restore_preferences(preferences)
         {
             let _ = peer.close().await;
-            let _ = signal.close().await;
             return Err(error);
         }
         // Restore before media can arrive or the playback window is exposed.
         peer.stream_control_handle()
             .audio()
             .set_settings(audio_settings);
-        peer.configure_network_control(transport, control.force_relay);
+        peer.configure_network_control(transport, attached.force_relay);
         report_progress(
             reporter,
             6,
@@ -535,84 +551,9 @@ impl ControllerConnection {
             Ok(forwarder) => forwarder,
             Err(error) => {
                 let _ = peer.close().await;
-                let _ = signal.close().await;
                 return Err(error).context("install decrypted RTP forwarder");
             }
         };
-        report_progress(
-            reporter,
-            7,
-            "交换媒体能力",
-            format!(
-                "正在发送 SDP Offer 并协商 {}、RTP 扩展、RTX/FEC 与数据通道",
-                profile.codec.label()
-            ),
-        );
-        let answer_installed = AtomicBool::new(false);
-        let negotiation_progress = |event| match event {
-            NegotiationEvent::OfferCreated {
-                sdp_bytes,
-                compressed_bytes,
-            } => report_progress(
-                reporter,
-                7,
-                "本地媒体能力已生成",
-                format!(
-                    "SDP {sdp_bytes} 字节，压缩后 {compressed_bytes} 字节；包含视频、RTP 扩展、RTX/FEC 与数据通道"
-                ),
-            ),
-            NegotiationEvent::OfferSent => report_progress(
-                reporter,
-                7,
-                "等待远端媒体答复",
-                "SDP Offer 已通过 SOAC 信令发送，正在等待 Answer 与远端候选",
-            ),
-            NegotiationEvent::LocalCandidateSent { count } => report_progress(
-                reporter,
-                if answer_installed.load(Ordering::Acquire) {
-                    8
-                } else {
-                    7
-                },
-                "收集本地网络候选",
-                format!("已向远端发送 {count} 个 ICE 候选，LAN/P2P/Relay 探测继续进行"),
-            ),
-            NegotiationEvent::AnswerInstalled { sdp_bytes } => {
-                answer_installed.store(true, Ordering::Release);
-                report_progress(
-                    reporter,
-                    8,
-                    "远端媒体能力已确认",
-                    format!(
-                        "已安装 {sdp_bytes} 字节 SDP Answer，正在检查候选对并完成 DTLS-SRTP 握手"
-                    ),
-                );
-            }
-            NegotiationEvent::RemoteCandidateInstalled { count } => report_progress(
-                reporter,
-                8,
-                "判断最佳连接线路",
-                format!(
-                    "已安装 {count} 个远端 ICE 候选，正在按优先级与连通性选择 LAN、P2P 或 Relay"
-                ),
-            ),
-            NegotiationEvent::Connected => report_progress(
-                reporter,
-                8,
-                "安全媒体通道已建立",
-                "ICE 候选对、DTLS 握手与 SRTP 密钥协商均已完成",
-            ),
-        };
-        if let Err(error) = cancellable(
-            cancel,
-            signal.negotiate(&control, &peer, Some(&negotiation_progress)),
-        )
-        .await
-        {
-            let _ = peer.close().await;
-            let _ = signal.close().await;
-            return Err(error).context("negotiate native WebRTC session");
-        }
         let route = peer
             .selected_route_details()
             .await
@@ -621,26 +562,20 @@ impl ControllerConnection {
         peer.stream_control_handle()
             .network_control()
             .connected(true);
-        let (signal_shutdown, signal_shutdown_receiver) = oneshot::channel();
-        // 房间只有这一条信令 socket：终端这类第二路会话在这里排队等它开。
-        let (side_sender, side_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let signal_peer = Arc::clone(&peer);
-        let signal_control = control.clone();
-        let signal_task = tokio::spawn(signal.keep_alive(
-            signal_shutdown_receiver,
-            Some(signal_peer),
-            Some(signal_control),
-            Some(side_receiver),
-        ));
         tracing::info!("controller WebRTC negotiation complete");
+        // 房间的主人才持有 socket 的关闭权；挂上去的会话只摘掉自己那一路。
+        let (signal_shutdown, signal_task) = match owner {
+            Some((shutdown, task)) => (Some(shutdown), Some(task)),
+            None => (None, None),
+        };
         let session = shared::Session::new(
             peer,
             forwarder,
             signal_shutdown,
             signal_task,
-            side_sender,
+            requests.clone(),
         );
-        Self::from_shared(
+        let mut connection = Self::from_shared(
             session,
             profile,
             matches!(
@@ -648,7 +583,10 @@ impl ControllerConnection {
                 crate::session::negotiation::ControlPurpose::Viewing
                     | crate::session::negotiation::ControlPurpose::Audio
             ),
-        )
+        )?;
+        connection.room = Some(room_handle);
+        connection.ice_id = Some(attached.ice_id);
+        Ok(connection)
     }
 
     pub async fn start_native_viewer(

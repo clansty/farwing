@@ -123,7 +123,7 @@ impl Connection {
         )
         .await
         {
-            let peer = result?;
+            let peer = result?.peer;
             let transport = peer.terminal_transport();
             let frames = transport
                 .take_frames()

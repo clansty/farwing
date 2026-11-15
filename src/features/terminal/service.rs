@@ -307,8 +307,32 @@ async fn run(
                 }
             }
             frame = connection.next_frame() => {
-                let Some(frame) = frame else { break Err(anyhow::anyhow!("对端关闭了终端连接")); };
-                route_frame(frame, &mut attachments);
+                match frame {
+                    Some(frame) => route_frame(frame, &mut attachments),
+                    None => {
+                        // 房间里的另一条会话（桌面）加入时，被控端会关掉已开的终端
+                        // 会话；等它稳定后重新挂上去，两路就同时在了。
+                        let mut reconnected = None;
+                        for attempt in 1..=3 {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            match Connection::connect(&client, &device, options, &stop, None).await
+                            {
+                                Ok(new) => {
+                                    tracing::info!(attempt, "remote terminal reattached");
+                                    reconnected = Some(new);
+                                    break;
+                                }
+                                Err(error) => {
+                                    tracing::warn!(attempt, %error, "remote terminal reattach failed");
+                                }
+                            }
+                        }
+                        match reconnected {
+                            Some(new) => connection = new,
+                            None => break Err(anyhow::anyhow!("对端关闭了终端连接")),
+                        }
+                    }
+                }
             }
             _ = tick.tick() => {
                 if attachments.is_empty() && last_used.elapsed() >= IDLE_TIMEOUT {

@@ -18,7 +18,7 @@ pub(super) struct Session {
     viewing: AtomicBool,
     owner: Mutex<Option<CancellationToken>>,
     /// 房间只有这一个 socket，终端之类的第二路会话要交给它去开。
-    side: tokio::sync::mpsc::UnboundedSender<crate::transport::signal::SideChannelRequest>,
+    side: tokio::sync::mpsc::UnboundedSender<crate::transport::signal::RoomRequest>,
 }
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -64,6 +64,43 @@ pub(super) async fn acquire_connection(
     })
     .await
 }
+/// 本机在这台设备上的房间。房间按设备分配，一个房间只有一条信令 socket：
+/// 观看与终端是这条 socket 上的两路会话，谁先连谁是主人。
+pub(super) struct Room {
+    key: String,
+    pub requests: tokio::sync::mpsc::UnboundedSender<crate::transport::signal::RoomRequest>,
+}
+impl Drop for Room {
+    fn drop(&mut self) {
+        let mut rooms = lock(rooms());
+        if rooms
+            .get(&self.key)
+            .is_some_and(|room| room.strong_count() == 0)
+        {
+            rooms.remove(&self.key);
+        }
+    }
+}
+fn rooms() -> &'static Mutex<HashMap<String, Weak<Room>>> {
+    static ROOMS: OnceLock<Mutex<HashMap<String, Weak<Room>>>> = OnceLock::new();
+    ROOMS.get_or_init(Mutex::default)
+}
+pub(super) fn room(key: &str) -> Option<Arc<Room>> {
+    let mut rooms = lock(rooms());
+    rooms.retain(|_, room| room.strong_count() > 0);
+    rooms.get(key).and_then(Weak::upgrade)
+}
+pub(super) fn publish_room(
+    key: &str,
+    requests: tokio::sync::mpsc::UnboundedSender<crate::transport::signal::RoomRequest>,
+) -> Arc<Room> {
+    let room = Arc::new(Room {
+        key: key.to_owned(),
+        requests,
+    });
+    lock(rooms()).insert(key.to_owned(), Arc::downgrade(&room));
+    room
+}
 fn jobs() -> &'static Mutex<Vec<(Weak<Session>, CancellationToken)>> {
     static JOBS: OnceLock<Mutex<Vec<(Weak<Session>, CancellationToken)>>> = OnceLock::new();
     JOBS.get_or_init(Mutex::default)
@@ -91,25 +128,31 @@ impl Session {
     pub fn new(
         peer: Arc<NativePeer>,
         forwarder: RtpForwarder,
-        shutdown: oneshot::Sender<()>,
-        task: tokio::task::JoinHandle<Result<()>>,
-        side: tokio::sync::mpsc::UnboundedSender<crate::transport::signal::SideChannelRequest>,
+        shutdown: Option<oneshot::Sender<()>>,
+        task: Option<tokio::task::JoinHandle<Result<()>>>,
+        side: tokio::sync::mpsc::UnboundedSender<crate::transport::signal::RoomRequest>,
     ) -> Arc<Self> {
         let (tx, ended) = watch::channel(None);
         let done = CancellationToken::new();
-        let finish = done.clone();
-        tokio::spawn(async move {
-            let _finish = finish.drop_guard();
-            let result = flatten_signal_task(task.await);
-            tx.send_replace(Some(result.err().map(|e| End {
-                signal: e.downcast_ref::<SignalFailure>().cloned(),
-                message: format!("{e:#}"),
-            })));
-        });
+        match task {
+            Some(task) => {
+                let finish = done.clone();
+                tokio::spawn(async move {
+                    let _finish = finish.drop_guard();
+                    let result = flatten_signal_task(task.await);
+                    tx.send_replace(Some(result.err().map(|e| End {
+                        signal: e.downcast_ref::<SignalFailure>().cloned(),
+                        message: format!("{e:#}"),
+                    })));
+                });
+            }
+            // 挂在本机另一次连接上的会话不拥有 socket，结束由房间那边广播。
+            None => drop(tx),
+        }
         let session = Arc::new(Self {
             peer,
             forwarder: Mutex::new(Some(forwarder)),
-            shutdown: Mutex::new(Some(shutdown)),
+            shutdown: Mutex::new(shutdown),
             ended,
             viewing: AtomicBool::new(false),
             owner: Mutex::new(None),
@@ -148,16 +191,18 @@ impl Session {
         transport: crate::media::TransportChoice,
         purpose: crate::session::negotiation::ControlPurpose,
         cancel: &CancellationToken,
-    ) -> Result<Arc<NativePeer>> {
+    ) -> Result<crate::transport::signal::Attached> {
         let (reply, receiver) = oneshot::channel();
         self.side
-            .send(crate::transport::signal::SideChannelRequest {
-                reply,
-                controller_device_id,
-                profile,
-                transport,
-                purpose,
-            })
+            .send(crate::transport::signal::RoomRequest::Attach(
+                crate::transport::signal::SideChannelRequest {
+                    reply,
+                    controller_device_id,
+                    profile,
+                    transport,
+                    purpose,
+                },
+            ))
             .map_err(|_| anyhow!("设备会话已结束，无法再开一路会话"))?;
         cancellable(cancel, async {
             receiver.await.context("再开一路会话时连接已结束")?
@@ -189,6 +234,7 @@ impl Session {
         }
     }
     pub fn request_close(&self) {
+        tracing::debug!("shared session close requested");
         if let Some(tx) = lock(&self.shutdown).take() {
             let _ = tx.send(());
         }
