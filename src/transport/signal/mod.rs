@@ -13,6 +13,7 @@ pub use negotiation::{ControlIceServer, ControlSessionInfo};
 use negotiation::{ForwardSettingEvent, RemoteSoac, parse_forward_setting, parse_remote_soac};
 use serde_json::Value;
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::future::pending;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
@@ -43,6 +44,16 @@ const MAX_SDP_BYTES: u64 = 1024 * 1024;
 pub(crate) mod host;
 mod tls;
 mod transport;
+
+/// 在已有房间里再开一路会话（终端）的请求。房间按设备分配，第二条连接
+/// 只能挂在同一条信令 socket 上，所以请求交给 socket 的所有者去做。
+pub(crate) struct SideChannelRequest {
+    pub(crate) reply: oneshot::Sender<Result<Arc<NativePeer>>>,
+    pub(crate) controller_device_id: String,
+    pub(crate) profile: ConnectionMediaProfile,
+    pub(crate) transport: crate::media::TransportChoice,
+    pub(crate) purpose: crate::session::negotiation::ControlPurpose,
+}
 
 pub struct SignalSession {
     transport: SignalTransport,
@@ -646,8 +657,10 @@ impl SignalSession {
         shutdown: oneshot::Receiver<()>,
         peer: Option<std::sync::Arc<NativePeer>>,
         control: Option<ControlSessionInfo>,
+        side: Option<tokio::sync::mpsc::UnboundedReceiver<SideChannelRequest>>,
     ) -> Result<()> {
-        self.keep_alive_inner(shutdown, peer, control, None).await
+        self.keep_alive_inner(shutdown, peer, control, None, side)
+            .await
     }
 
     pub(crate) async fn keep_alive_host(
@@ -655,7 +668,7 @@ impl SignalSession {
         shutdown: oneshot::Receiver<()>,
         client: crate::session::host_client::HostClient,
     ) -> Result<()> {
-        self.keep_alive_inner(shutdown, None, None, Some(host::Session::new(client)))
+        self.keep_alive_inner(shutdown, None, None, Some(host::Session::new(client)), None)
             .await
     }
 
@@ -665,6 +678,7 @@ impl SignalSession {
         peer: Option<std::sync::Arc<NativePeer>>,
         control: Option<ControlSessionInfo>,
         mut host: Option<host::Session>,
+        mut side: Option<tokio::sync::mpsc::UnboundedReceiver<SideChannelRequest>>,
     ) -> Result<()> {
         let mut next_key_check = tokio::time::Instant::now() + RECONNECT_KEY_CHECK_INTERVAL;
         let mut pending_key_refresh: Option<(u64, tokio::time::Instant)> = None;
@@ -785,6 +799,50 @@ impl SignalSession {
                             local_candidate_stream_open = false;
                         }
                     }
+                }
+                request = async {
+                    if let Some(requests) = &mut side { requests.recv().await } else { pending().await }
+                }, if side.is_some() => {
+                    let Some(request) = request else { side = None; continue; };
+                    let result = async {
+                        let side_control = self
+                            .start_control(
+                                &request.controller_device_id,
+                                request.profile,
+                                crate::session::negotiation::ControlConnectType::Normal,
+                                None,
+                                request.purpose,
+                            )
+                            .await
+                            .context("side channel control handshake")?;
+                        let side_peer = NativePeer::new_with_profile(
+                            side_control
+                                .ice_servers
+                                .iter()
+                                .map(|server| crate::transport::rtc::IceServer {
+                                    urls: vec![server.urls.clone()],
+                                    username: server.username.clone(),
+                                    credential: server.credential.clone(),
+                                })
+                                .collect(),
+                            request.transport,
+                            request.profile,
+                            request.purpose
+                                == crate::session::negotiation::ControlPurpose::Terminal,
+                        )
+                        .await
+                        .context("side channel peer")?;
+                        self.negotiate(&side_control, &side_peer, None)
+                            .await
+                            .context("side channel negotiate")?;
+                        tracing::info!(
+                            purpose = ?request.purpose,
+                            "side channel negotiated inside the existing room"
+                        );
+                        Ok::<_, anyhow::Error>(Arc::new(side_peer))
+                    }
+                    .await;
+                    let _ = request.reply.send(result);
                 }
                 packet = self.next_packet() => {
                     match packet {

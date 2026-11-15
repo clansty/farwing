@@ -1145,10 +1145,10 @@ impl DeviceCenterApp {
     fn needs_takeover(&self, device: &DeviceInfo) -> bool {
         device.participant_count() > 0
             && !self.devices.as_ref().is_some_and(|list| {
-                crate::session::controller::has_gui_connection(
-                    &list.current_device.device_id,
-                    &device.device_id,
-                )
+                let controller = &list.current_device.device_id;
+                crate::session::controller::has_gui_connection(controller, &device.device_id)
+                    // 本机自己占着（终端、或者刚开的另一条连接）不算别人的会话。
+                    || device.occupied_by(controller)
             })
     }
 

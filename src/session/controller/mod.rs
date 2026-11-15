@@ -24,6 +24,30 @@ use viewing::run_viewer_window;
 pub use viewing::{run_native_viewer_session, run_saved_viewer_window};
 
 pub type ConnectionProgressReporter = Arc<dyn Fn(ConnectionProgress) + Send + Sync>;
+/// 本机已经连着的设备上再开一路会话（终端）。房间按设备分配、一条信令
+/// socket 只能属于一个房间，所以第二路必须交给已有会话去开，而不是自己
+/// join——再 join 一次会让服务端释放前一个房间，先连的那条随之断开。
+pub(crate) async fn attach_terminal(
+    controller: &str,
+    target: &str,
+    controller_device_id: &str,
+    profile: ConnectionMediaProfile,
+    transport: crate::media::TransportChoice,
+    cancel: &CancellationToken,
+) -> Option<Result<Arc<NativePeer>>> {
+    let session = shared::get(&shared::key(controller, target))?;
+    Some(
+        session
+            .open_side(
+                controller_device_id.to_owned(),
+                profile,
+                transport,
+                crate::session::negotiation::ControlPurpose::Terminal,
+                cancel,
+            )
+            .await,
+    )
+}
 pub(crate) fn has_gui_connection(controller: &str, target: &str) -> bool {
     shared::get(&shared::key(controller, target)).is_some()
 }
@@ -207,7 +231,11 @@ impl ControllerConnection {
         {
             return Self::from_shared(session, profile, false);
         }
-        if device.participant_count() > 0 && takeover.is_none() {
+        // 设备已经被本机自己占着（比如桌面看着、再开终端）时不算「别人在用」，
+        // 不要接管：接管会把本机先前那条会话踢掉。多出来的那条是自己的第二次
+        // join，服务端会另给一个房间。
+        let self_occupied = device.occupied_by(&client.device_id());
+        if device.participant_count() > 0 && takeover.is_none() && !self_occupied {
             return Err(takeover::Required(device.clone()).into());
         }
         let force_join = if let Some(approval) = takeover {
@@ -259,7 +287,7 @@ impl ControllerConnection {
             local_preference_writer: None,
         })
     }
-    async fn activate_viewing(&self) -> Result<()> {
+    pub(crate) async fn activate_viewing(&self) -> Result<()> {
         if self.profile.audio_only {
             return self.start_listening().await;
         }
@@ -594,15 +622,24 @@ impl ControllerConnection {
             .network_control()
             .connected(true);
         let (signal_shutdown, signal_shutdown_receiver) = oneshot::channel();
+        // 房间只有这一条信令 socket：终端这类第二路会话在这里排队等它开。
+        let (side_sender, side_receiver) = tokio::sync::mpsc::unbounded_channel();
         let signal_peer = Arc::clone(&peer);
         let signal_control = control.clone();
         let signal_task = tokio::spawn(signal.keep_alive(
             signal_shutdown_receiver,
             Some(signal_peer),
             Some(signal_control),
+            Some(side_receiver),
         ));
         tracing::info!("controller WebRTC negotiation complete");
-        let session = shared::Session::new(peer, forwarder, signal_shutdown, signal_task);
+        let session = shared::Session::new(
+            peer,
+            forwarder,
+            signal_shutdown,
+            signal_task,
+            side_sender,
+        );
         Self::from_shared(
             session,
             profile,

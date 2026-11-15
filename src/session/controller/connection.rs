@@ -479,7 +479,11 @@ pub(super) async fn resolve_connection_with_client(
     // 会在 connect 时重新验证设备状态），只是不交互。
     let takeover =
         takeover.or_else(|| force_takeover.then(|| takeover::Approval::confirmed(device)));
+    // 本机自己已经在这台设备上（比如开着终端）时不算「别人在用」，接管会把
+    // 先前那条自己踢掉；这种情况直接按普通 join 再要一个房间。
+    let self_occupied = device.occupied_by(&client.device_id());
     if device.participant_count() != 0
+        && !self_occupied
         && shared::get(&shared::key(&client.device_id(), &device.device_id)).is_none()
         && !takeover
             .as_ref()

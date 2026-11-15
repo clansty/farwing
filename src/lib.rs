@@ -16,4 +16,78 @@ pub mod transport;
 pub mod plugins;
 mod ui;
 
+/// 本机自测用：先建一条观看会话，再在同一进程里连对端终端，打出会话列表。
+/// 房间按设备分配，两条会话必须共用一条信令连接，所以这种「同时」只能在
+/// 同一个进程里发生，命令行分两个进程测不出来。
+pub async fn debug_dual_probe(alias: &str) -> anyhow::Result<()> {
+    let options = media::preferences::load()?;
+    let (connection, _summary) = session::controller::connect_saved_alias(alias, options).await?;
+    println!("观看会话已建立");
+    let mut started = false;
+    for _ in 0..15 {
+        if connection.activate_viewing().await.is_ok() {
+            started = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    println!("观看已激活：{started}");
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+
+    let client = std::sync::Arc::new(account::client::AuthenticatedClient::from_saved_session()?);
+    let list = client.list_devices().await?;
+    let device = list
+        .my_binded_devices
+        .iter()
+        .find(|device| device.alias == alias)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("账号里没有这台设备"))?;
+    let handle = features::terminal::service::start_for(client.clone(), &device.device_id).await?;
+    let sessions = handle.list().await?;
+    println!("终端会话 {} 条", sessions.len());
+    for session in &sessions {
+        println!(
+            "  {}  {}  {}  {}",
+            session.session_id,
+            session.name,
+            session.state_label(),
+            session.shell
+        );
+    }
+    let mut attach = handle.attach(None, Some(format!("probe-{}", std::process::id())), 80, 24)?;
+    let info = attach
+        .ready
+        .await
+        .map_err(|_| anyhow::anyhow!("终端服务未回复"))?
+        .map_err(anyhow::Error::msg)?;
+    println!("已接上新会话 {} （{}）", info.handle, info.name);
+    attach
+        .input
+        .send(features::terminal::service::ClientInput::Data(
+            b"echo probe-ok\r\n".to_vec(),
+        ))
+        .await
+        .ok();
+    let mut collected = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match tokio::time::timeout_at(deadline, attach.output.recv()).await {
+            Ok(Some(features::terminal::service::ServiceOutput::Data(bytes))) => {
+                collected.extend_from_slice(&bytes)
+            }
+            _ => break,
+        }
+    }
+    println!(
+        "终端输出 {} 字节：\n{}",
+        collected.len(),
+        String::from_utf8_lossy(&collected)
+    );
+
+    features::terminal::service::shutdown_all().await;
+    drop(connection);
+    client.close().await;
+    Ok(())
+}
+
 mod platform;

@@ -580,6 +580,14 @@ impl DeviceInfo {
         self.participants_info.len()
     }
 
+    /// 设备的会话里有没有本机自己。本机先占着（看着桌面又开终端）时，
+    /// 第二次连接不该被当成「别人在用」而要求接管。
+    pub fn occupied_by(&self, device_id: &str) -> bool {
+        self.participants_info.iter().any(|info| {
+            info.get("device_id").and_then(serde_json::Value::as_str) == Some(device_id)
+        })
+    }
+
     pub fn platform_label(&self) -> String {
         match self.platform {
             1 => "Windows".to_owned(),

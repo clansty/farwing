@@ -17,6 +17,8 @@ pub(super) struct Session {
     ended: watch::Receiver<Option<Option<End>>>,
     viewing: AtomicBool,
     owner: Mutex<Option<CancellationToken>>,
+    /// 房间只有这一个 socket，终端之类的第二路会话要交给它去开。
+    side: tokio::sync::mpsc::UnboundedSender<crate::transport::signal::SideChannelRequest>,
 }
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -85,11 +87,13 @@ impl Session {
                 != crate::features::remote_input::MouseMode::View,
         }
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         peer: Arc<NativePeer>,
         forwarder: RtpForwarder,
         shutdown: oneshot::Sender<()>,
         task: tokio::task::JoinHandle<Result<()>>,
+        side: tokio::sync::mpsc::UnboundedSender<crate::transport::signal::SideChannelRequest>,
     ) -> Arc<Self> {
         let (tx, ended) = watch::channel(None);
         let done = CancellationToken::new();
@@ -109,6 +113,7 @@ impl Session {
             ended,
             viewing: AtomicBool::new(false),
             owner: Mutex::new(None),
+            side,
         });
         {
             let mut jobs = lock(jobs());
@@ -134,6 +139,30 @@ impl Session {
             forwarder,
             viewing,
         })
+    }
+    /// 在这条会话的信令 socket 上再开一路会话，返回它的 peer。
+    pub(super) async fn open_side(
+        &self,
+        controller_device_id: String,
+        profile: ConnectionMediaProfile,
+        transport: crate::media::TransportChoice,
+        purpose: crate::session::negotiation::ControlPurpose,
+        cancel: &CancellationToken,
+    ) -> Result<Arc<NativePeer>> {
+        let (reply, receiver) = oneshot::channel();
+        self.side
+            .send(crate::transport::signal::SideChannelRequest {
+                reply,
+                controller_device_id,
+                profile,
+                transport,
+                purpose,
+            })
+            .map_err(|_| anyhow!("设备会话已结束，无法再开一路会话"))?;
+        cancellable(cancel, async {
+            receiver.await.context("再开一路会话时连接已结束")?
+        })
+        .await
     }
     pub async fn ended(&self) -> Result<()> {
         self.end_waiter().await

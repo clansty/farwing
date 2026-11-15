@@ -803,7 +803,6 @@ impl DeviceCenterApp {
                 );
                 let mut terminal_ui =
                     ui.new_child(egui::UiBuilder::new().max_rect(terminal_rect));
-                let viewer_open = self.viewer_for_device(&id).is_some();
                 let terminal_button = detail_button(
                     &mut terminal_ui,
                     "终端",
@@ -811,16 +810,10 @@ impl DeviceCenterApp {
                     !self.logout_pending
                         && device.is_connected()
                         && device.controllable
-                        && device.controlled_support
-                        && !viewer_open,
+                        && device.controlled_support,
                     terminal_rect.size(),
                     ButtonTone::Normal,
                 );
-                let terminal_button = if viewer_open {
-                    terminal_button.on_disabled_hover_text("请先关闭该设备的观看窗口")
-                } else {
-                    terminal_button
-                };
                 if terminal_button.clicked() {
                     terminal_start = true;
                     self.center_ui.terminal_auto_target = None;

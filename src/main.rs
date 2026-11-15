@@ -133,6 +133,9 @@ enum Commands {
 
     #[command(hide = true)]
     PluginHost { manifest: PathBuf },
+    /// 自测：同一进程里先开观看会话再开终端
+    #[command(hide = true)]
+    DualProbe { alias: String },
     /// 打开完整图形设备中心
     Gui {
         #[arg(long)]
@@ -398,6 +401,8 @@ fn main() -> Result<()> {
             tokio::runtime::Runtime::new()?.block_on(login::interactive_login())?;
             Ok(())
         }
+        Commands::DualProbe { alias } => tokio::runtime::Runtime::new()?
+            .block_on(openuuyc::debug_dual_probe(&alias)),
         Commands::Devices => tokio::runtime::Runtime::new()?.block_on(print_devices()),
         Commands::Connect {
             device,

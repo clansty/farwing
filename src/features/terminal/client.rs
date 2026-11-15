@@ -58,11 +58,11 @@ impl Transport {
         }));
     }
 
-    fn take_frames(&self) -> Option<mpsc::UnboundedReceiver<Frame>> {
+    pub(crate) fn take_frames(&self) -> Option<mpsc::UnboundedReceiver<Frame>> {
         lock(&self.receiver).take()
     }
 
-    fn channel(&self) -> Option<Arc<RTCDataChannel>> {
+    pub(crate) fn channel(&self) -> Option<Arc<RTCDataChannel>> {
         lock(&self.channel).as_ref().and_then(Weak::upgrade)
     }
 
@@ -70,7 +70,7 @@ impl Transport {
         *lock(&self.sender) = None;
     }
 
-    async fn wait_open(&self, cancel: &CancellationToken) -> Result<Arc<RTCDataChannel>> {
+    pub(crate) async fn wait_open(&self, cancel: &CancellationToken) -> Result<Arc<RTCDataChannel>> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         loop {
             if let Some(channel) = self.channel()
@@ -90,8 +90,12 @@ impl Transport {
 }
 
 /// 一条已经握手完成的终端连接。
+///
+/// 终端要么是本机第一条会话（走自己的 `kind = 8` 连接），要么搭在已经开着的
+/// 观看会话上——房间按设备分配，再 join 一次会把观看那条踢掉。
 pub(crate) struct Connection {
-    inner: ControllerConnection,
+    inner: Option<ControllerConnection>,
+    peer: Option<Arc<crate::transport::rtc::NativePeer>>,
     transport: Arc<Transport>,
     frames: mpsc::UnboundedReceiver<Frame>,
 }
@@ -105,6 +109,33 @@ impl Connection {
         takeover: Option<crate::session::controller::takeover::Approval>,
     ) -> Result<Self> {
         let current = validate_target(client, device).await?;
+        let display = crate::media::detect_local_display()
+            .unwrap_or(crate::media::LocalDisplayInfo::FALLBACK);
+        let profile = options.resolve(display)?;
+        // 观看会话开着时，终端搭在它的信令 socket 上再开一路，房间共用。
+        if let Some(result) = crate::session::controller::attach_terminal(
+            &client.device_id(),
+            &current.device_id,
+            &client.device_id(),
+            profile,
+            options.transport,
+            cancel,
+        )
+        .await
+        {
+            let peer = result?;
+            let transport = peer.terminal_transport();
+            let frames = transport
+                .take_frames()
+                .context("终端通道已经绑定过另一条连接")?;
+            transport.wait_open(cancel).await?;
+            return Ok(Self {
+                inner: None,
+                peer: Some(peer),
+                transport,
+                frames,
+            });
+        }
         let policy = client
             .feature_catalog()
             .policy(current.platform, &current.version_name);
@@ -118,7 +149,8 @@ impl Connection {
             .context("终端通道已经绑定过另一条连接")?;
         transport.wait_open(cancel).await?;
         Ok(Self {
-            inner,
+            inner: Some(inner),
+            peer: None,
             transport,
             frames,
         })
@@ -142,7 +174,16 @@ impl Connection {
     }
 
     pub(crate) async fn close(self) -> Result<()> {
-        self.inner.close().await
+        match self.inner {
+            Some(inner) => inner.close().await,
+            None => {
+                self.transport.close();
+                match self.peer {
+                    Some(peer) => peer.close().await,
+                    None => Ok(()),
+                }
+            }
+        }
     }
 }
 

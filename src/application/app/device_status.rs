@@ -63,6 +63,13 @@ fn resolve(
 ) -> DeviceStatus {
     let activity = controller
         .and_then(|id| crate::session::controller::gui_connection_activity(id, &device.device_id));
+    // 终端、以及本机自己开着的其他连接都不占观看会话；不认它们的话，开着
+    // 终端的设备会被当成「其他设备使用」。
+    let terminal = controller.is_some_and(|id| {
+        device.occupied_by(id)
+            || crate::features::terminal::service::snapshot(id, &device.device_id)
+                .is_some_and(|state| state.phase == crate::features::terminal::service::Phase::Ready)
+    });
     let mapping = controller
         .and_then(|id| crate::features::port_mapping::service::status(id, &device.device_id));
     let forwarding =
@@ -84,7 +91,7 @@ fn resolve(
         State::Viewing
     } else if forwarding {
         State::Forwarding
-    } else if activity.is_some() {
+    } else if activity.is_some() || terminal {
         State::Connected
     } else if mapping.as_ref().is_some_and(|s| s.enabled && s.busy) {
         State::Connecting
@@ -92,7 +99,7 @@ fn resolve(
         State::Offline
     } else if !device.is_connected() {
         State::Unknown
-    } else if device.participant_count() > 0 {
+    } else if device.participant_count() > 0 && !terminal {
         State::OtherDevice
     } else if matches!(device.platform, 1 | 4)
         && (!device.controllable || !device.controlled_support)
