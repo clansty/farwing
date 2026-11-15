@@ -15,6 +15,11 @@ use std::time::{Duration, Instant};
 #[derive(Default)]
 pub(crate) struct Stats {
     pub encoded: u64,
+    pub encoded_bytes: u64,
+    pub keyframes: u64,
+    pub forced_keyframes: u64,
+    pub scene_keyframes: u64,
+    pub keyframe_bytes: u64,
     pub encode_count: u64,
     pub encode_total: Duration,
     pub encode_max: Duration,
@@ -32,6 +37,11 @@ mod real {
 
     struct Shared {
         encoded: AtomicU64,
+        encoded_bytes: AtomicU64,
+        keyframes: AtomicU64,
+        forced_keyframes: AtomicU64,
+        scene_keyframes: AtomicU64,
+        keyframe_bytes: AtomicU64,
         encode_count: AtomicU64,
         encode_ns: AtomicU64,
         encode_max_ns: AtomicU64,
@@ -42,6 +52,11 @@ mod real {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 encoded: AtomicU64::new(0),
+                encoded_bytes: AtomicU64::new(0),
+                keyframes: AtomicU64::new(0),
+                forced_keyframes: AtomicU64::new(0),
+                scene_keyframes: AtomicU64::new(0),
+                keyframe_bytes: AtomicU64::new(0),
                 encode_count: AtomicU64::new(0),
                 encode_ns: AtomicU64::new(0),
                 encode_max_ns: AtomicU64::new(0),
@@ -191,6 +206,11 @@ mod real {
             let count = self.stats.encode_count.swap(0, Ordering::AcqRel);
             Stats {
                 encoded: self.stats.encoded.swap(0, Ordering::AcqRel),
+                encoded_bytes: self.stats.encoded_bytes.swap(0, Ordering::AcqRel),
+                keyframes: self.stats.keyframes.swap(0, Ordering::AcqRel),
+                forced_keyframes: self.stats.forced_keyframes.swap(0, Ordering::AcqRel),
+                scene_keyframes: self.stats.scene_keyframes.swap(0, Ordering::AcqRel),
+                keyframe_bytes: self.stats.keyframe_bytes.swap(0, Ordering::AcqRel),
                 encode_count: count,
                 encode_total: Duration::from_nanos(ns),
                 encode_max: Duration::from_nanos(
@@ -334,6 +354,26 @@ mod real {
                 .fetch_add(encoded.len() as u64, Ordering::Relaxed);
             let encode_finished = Instant::now();
             for mut frame in encoded {
+                stats
+                    .encoded_bytes
+                    .fetch_add(frame.data.len() as u64, Ordering::Relaxed);
+                if frame.keyframe {
+                    stats.keyframes.fetch_add(1, Ordering::Relaxed);
+                    stats
+                        .keyframe_bytes
+                        .fetch_add(frame.data.len() as u64, Ordering::Relaxed);
+                    if force {
+                        stats.forced_keyframes.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        stats.scene_keyframes.fetch_add(1, Ordering::Relaxed);
+                    }
+                    tracing::debug!(
+                        bytes = frame.data.len(),
+                        forced = force,
+                        bitrate_bps = job.rate.target,
+                        "host keyframe encoded"
+                    );
+                }
                 if let Some((captured, input_started, is_new, hdr)) =
                     metadata.remove(&frame.timestamp_100ns)
                 {
@@ -355,11 +395,12 @@ mod real {
                 {
                     metadata.pop_first();
                 }
+                // 发送端过慢时丢这一帧，让采集/编码继续跑；不要顺手强制关键帧，
+                // 避免在队列已满时制造 IDR 雪崩。
                 match sender.try_send(frame) {
                     Ok(()) => {}
                     Err(tokio::sync::mpsc::error::TrySendError::Full(frame)) => {
                         stats.send_drops.fetch_add(1, Ordering::Relaxed);
-                        keyframe.store(true, Ordering::Release);
                         drop(frame);
                     }
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {

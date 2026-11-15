@@ -366,8 +366,8 @@ pub(super) fn capture_loop(
                 continue;
             }
             let rate = crate::features::host::format::Rate {
-                target: bounds.initial.max(300_000),
-                peak: bounds.initial.max(300_000),
+                target: media_rate,
+                peak,
                 fps: wanted.fps,
                 quality: wanted.quality,
                 quality_target,
@@ -382,6 +382,7 @@ pub(super) fn capture_loop(
             metrics.work.record(iteration_started.elapsed());
             match accepted {
                 Ok(true) => {
+                    metrics.bitrate = media_rate;
                     last_frame = Some(captured_at);
                     handle.source(
                         &screen,
@@ -605,8 +606,8 @@ pub(super) fn capture_loop(
         }
         if pipeline_eligible {
             let rate = crate::features::host::format::Rate {
-                target: bounds.initial.max(300_000),
-                peak: bounds.initial.max(300_000),
+                target: media_rate,
+                peak,
                 fps: wanted.fps,
                 quality: wanted.quality,
                 quality_target,
@@ -685,8 +686,8 @@ pub(super) fn capture_loop(
         }) && let Some(active) = encoder.as_mut()
         {
             let rate = crate::features::host::format::Rate {
-                target: bounds.initial.max(300_000),
-                peak: bounds.initial.max(300_000),
+                target: media_rate,
+                peak,
                 fps: wanted.fps,
                 quality: wanted.quality,
                 quality_target,
@@ -720,8 +721,8 @@ pub(super) fn capture_loop(
             // session solely for a size/candidate transition (T C2D840).
             drop(encoder.take());
             let rate = crate::features::host::format::Rate {
-                target: bounds.initial.max(300_000),
-                peak: bounds.initial.max(300_000),
+                target: media_rate,
+                peak,
                 fps: wanted.fps,
                 quality: wanted.quality,
                 quality_target,

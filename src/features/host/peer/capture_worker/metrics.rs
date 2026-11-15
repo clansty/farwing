@@ -76,6 +76,11 @@ impl Metrics {
     /// 把独立编码线程的统计并进本采样窗口。
     pub fn absorb(&mut self, stats: super::pipeline::Stats) {
         self.encoded_frames += stats.encoded;
+        self.encoded_bytes += stats.encoded_bytes;
+        self.keyframes += stats.keyframes;
+        self.forced_keyframes += stats.forced_keyframes;
+        self.scene_keyframes += stats.scene_keyframes;
+        self.keyframe_bytes += stats.keyframe_bytes;
         self.encode
             .absorb(stats.encode_count, stats.encode_total, stats.encode_max);
         self.send_drops += stats.send_drops;
