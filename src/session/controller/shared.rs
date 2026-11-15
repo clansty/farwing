@@ -15,6 +15,9 @@ pub(super) struct Session {
     forwarder: Mutex<Option<RtpForwarder>>,
     shutdown: Mutex<Option<oneshot::Sender<()>>>,
     ended: watch::Receiver<Option<Option<End>>>,
+    /// 自己那一路摘掉就算结束，不必等整条 socket 收尾（房间里可能还开着
+    /// 别的会话，socket 会继续跑）。
+    ended_sender: Mutex<Option<watch::Sender<Option<Option<End>>>>>,
     viewing: AtomicBool,
     owner: Mutex<Option<CancellationToken>>,
     /// 房间只有这一个 socket，终端之类的第二路会话要交给它去开。
@@ -133,6 +136,7 @@ impl Session {
         side: tokio::sync::mpsc::UnboundedSender<crate::transport::signal::RoomRequest>,
     ) -> Arc<Self> {
         let (tx, ended) = watch::channel(None);
+        let ended_sender = Mutex::new(Some(tx.clone()));
         let done = CancellationToken::new();
         match task {
             Some(task) => {
@@ -154,6 +158,7 @@ impl Session {
             forwarder: Mutex::new(Some(forwarder)),
             shutdown: Mutex::new(shutdown),
             ended,
+            ended_sender,
             viewing: AtomicBool::new(false),
             owner: Mutex::new(None),
             side,
@@ -237,6 +242,11 @@ impl Session {
         tracing::debug!("shared session close requested");
         if let Some(tx) = lock(&self.shutdown).take() {
             let _ = tx.send(());
+        }
+        // 房间可能还要给别的会话留着，socket 不会跟着结束；这一路已经交出去
+        // 了，等它的人马上就能走。
+        if let Some(tx) = lock(&self.ended_sender).take() {
+            tx.send_replace(Some(None));
         }
     }
 }

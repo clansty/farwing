@@ -140,6 +140,9 @@ enum Commands {
         /// 终端先连，观看后连
         #[arg(long)]
         terminal_first: bool,
+        /// 顺带拉起文件传输，检查它是否污染「有观看会话」的判断
+        #[arg(long)]
+        with_files: bool,
     },
     /// 打开完整图形设备中心
     Gui {
@@ -409,8 +412,9 @@ fn main() -> Result<()> {
         Commands::DualProbe {
             alias,
             terminal_first,
+            with_files,
         } => tokio::runtime::Runtime::new()?
-            .block_on(openuuyc::debug_dual_probe(&alias, terminal_first)),
+            .block_on(openuuyc::debug_dual_probe(&alias, terminal_first, with_files)),
         Commands::Devices => tokio::runtime::Runtime::new()?.block_on(print_devices()),
         Commands::Connect {
             device,

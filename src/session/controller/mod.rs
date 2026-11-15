@@ -322,7 +322,13 @@ impl ControllerConnection {
             purpose,
         )
         .await?;
-        if !dedicated {
+        // 池子里只放观看会话：文件、端口映射这些也是「本机连着」，但它们
+        // 复用观看的 peer 就够了，登记进来会让界面以为开着观看窗口。
+        if matches!(
+            purpose,
+            crate::session::negotiation::ControlPurpose::Viewing
+                | crate::session::negotiation::ControlPurpose::Audio
+        ) {
             shared::register(key, &connection.forwarder.session, client.ended());
         }
         Ok(connection)

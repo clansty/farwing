@@ -17,7 +17,11 @@ pub mod plugins;
 mod ui;
 
 /// 本机自测用：同一进程里既开观看又开终端，验证两者共用一条房间 socket。
-pub async fn debug_dual_probe(alias: &str, terminal_first: bool) -> anyhow::Result<()> {
+pub async fn debug_dual_probe(
+    alias: &str,
+    terminal_first: bool,
+    with_files: bool,
+) -> anyhow::Result<()> {
     let client = std::sync::Arc::new(account::client::AuthenticatedClient::from_saved_session()?);
     let list = client.list_devices().await?;
     let device = list
@@ -88,10 +92,30 @@ pub async fn debug_dual_probe(alias: &str, terminal_first: bool) -> anyhow::Resu
         String::from_utf8_lossy(&collected)
     );
     println!("终端连上时观看仍在：{}", connection.alive());
+    let closed = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        connection.close(),
+    )
+    .await;
+    println!("结束观看按时返回：{}", closed.is_ok());
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let sessions = handle.list().await?;
+    println!("关掉观看后终端仍有 {} 条会话", sessions.len());
+    if with_files {
+        let files = features::file_transfer::service::start(
+            client.clone(),
+            device.clone(),
+            media::preferences::load()?,
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+        println!(
+            "文件传输后界面认为有观看会话：{}",
+            session::controller::has_gui_connection(&client.device_id(), &device.device_id)
+        );
+        println!("文件传输期间终端仍有 {} 条会话", handle.list().await?.len());
+        drop(files);
+    }
     features::terminal::service::shutdown_all().await;
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    println!("关掉终端后观看仍在：{}", connection.alive());
-    drop(connection);
     client.close().await;
     Ok(())
 }
