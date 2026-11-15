@@ -87,12 +87,11 @@ pub async fn debug_dual_probe(alias: &str, terminal_first: bool) -> anyhow::Resu
         collected.len(),
         String::from_utf8_lossy(&collected)
     );
-    drop(connection);
-    println!("观看已关闭");
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    let sessions = handle.list().await?;
-    println!("关掉观看后终端仍有 {} 条会话", sessions.len());
+    println!("终端连上时观看仍在：{}", connection.alive());
     features::terminal::service::shutdown_all().await;
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    println!("关掉终端后观看仍在：{}", connection.alive());
+    drop(connection);
     client.close().await;
     Ok(())
 }

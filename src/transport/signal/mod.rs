@@ -819,6 +819,11 @@ impl SignalSession {
                                 .position(|slot| slot.control.ice_id == ice_id)
                             {
                                 let slot = slots.remove(index);
+                                tracing::info!(
+                                    %ice_id,
+                                    remaining = slots.len(),
+                                    "room session detached"
+                                );
                                 if let Err(error) = slot.peer.close().await {
                                     tracing::warn!(%error, "room session teardown failed");
                                 }

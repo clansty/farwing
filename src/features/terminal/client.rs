@@ -96,8 +96,19 @@ impl Transport {
 pub(crate) struct Connection {
     inner: Option<ControllerConnection>,
     peer: Option<Arc<crate::transport::rtc::NativePeer>>,
+    /// 搭在房间上时，关闭会把自己那一路摘掉，房间里的其他会话不受影响。
+    room: Option<(
+        tokio::sync::mpsc::UnboundedSender<crate::transport::signal::RoomRequest>,
+        String,
+    )>,
     transport: Arc<Transport>,
     frames: mpsc::UnboundedReceiver<Frame>,
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.detach();
+    }
 }
 
 impl Connection {
@@ -123,7 +134,9 @@ impl Connection {
         )
         .await
         {
-            let peer = result?.peer;
+            let (room, attached) = result?;
+            let peer = attached.peer;
+            let ice_id = attached.ice_id;
             let transport = peer.terminal_transport();
             let frames = transport
                 .take_frames()
@@ -132,6 +145,7 @@ impl Connection {
             return Ok(Self {
                 inner: None,
                 peer: Some(peer),
+                room: Some((room, ice_id)),
                 transport,
                 frames,
             });
@@ -151,6 +165,7 @@ impl Connection {
         Ok(Self {
             inner: Some(inner),
             peer: None,
+            room: None,
             transport,
             frames,
         })
@@ -173,12 +188,29 @@ impl Connection {
         self.frames.recv().await
     }
 
-    pub(crate) async fn close(self) -> Result<()> {
-        match self.inner {
+    pub(crate) fn alive(&self) -> bool {
+        self.peer.as_ref().is_some_and(|peer| {
+            peer.connection_state()
+                == webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Connected
+        })
+    }
+
+    /// 把自己这一路从房间里摘掉；房间里的其他会话不受影响。
+    fn detach(&mut self) {
+        if let Some((room, ice_id)) = self.room.take() {
+            let _ = room.send(crate::transport::signal::RoomRequest::Detach { ice_id });
+        }
+    }
+
+    pub(crate) async fn close(mut self) -> Result<()> {
+        let inner = self.inner.take();
+        let peer = self.peer.take();
+        self.detach();
+        match inner {
             Some(inner) => inner.close().await,
             None => {
                 self.transport.close();
-                match self.peer {
+                match peer {
                     Some(peer) => peer.close().await,
                     None => Ok(()),
                 }

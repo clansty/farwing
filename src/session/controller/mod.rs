@@ -61,19 +61,18 @@ pub(crate) async fn attach_terminal(
     profile: ConnectionMediaProfile,
     transport: crate::media::TransportChoice,
     cancel: &CancellationToken,
-) -> Option<Result<crate::transport::signal::Attached>> {
+) -> Option<Result<(tokio::sync::mpsc::UnboundedSender<crate::transport::signal::RoomRequest>, crate::transport::signal::Attached)>> {
     let room = shared::room(&shared::key(controller, target))?;
-    Some(
-        attach_room(
-            &room.requests,
-            controller_device_id,
-            profile,
-            transport,
-            crate::session::negotiation::ControlPurpose::Terminal,
-            cancel,
-        )
-        .await,
+    let attached = attach_room(
+        &room.requests,
+        controller_device_id,
+        profile,
+        transport,
+        crate::session::negotiation::ControlPurpose::Terminal,
+        cancel,
     )
+    .await;
+    Some(attached.map(|attached| (room.requests.clone(), attached)))
 }
 pub(crate) fn has_gui_connection(controller: &str, target: &str) -> bool {
     shared::get(&shared::key(controller, target)).is_some()
@@ -368,6 +367,11 @@ impl ControllerConnection {
         handle.audio().start()?;
         self.performance_monitor().set_decoder("仅音频");
         Ok(())
+    }
+    /// 这条连接的 peer 是否还连着（用于自测：另一路会话关掉后本路是否还在）。
+    pub(crate) fn alive(&self) -> bool {
+        self.peer.connection_state()
+            == webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Connected
     }
     pub(crate) fn port_mapping_transport(&self) -> Arc<crate::features::port_mapping::Transport> {
         self.peer.port_mapping()
