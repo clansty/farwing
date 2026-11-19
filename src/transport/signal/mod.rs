@@ -67,6 +67,8 @@ pub(crate) struct SideChannelRequest {
     pub(crate) profile: ConnectionMediaProfile,
     pub(crate) transport: crate::media::TransportChoice,
     pub(crate) purpose: crate::session::negotiation::ControlPurpose,
+    /// 主控账号的最新权益快照，随控制握手一起发给被控端。
+    pub(crate) entitlements: Option<crate::protocol::entitlements::Snapshot>,
 }
 
 pub struct SignalSession {
@@ -313,6 +315,7 @@ impl SignalSession {
         connect_type: crate::session::negotiation::ControlConnectType,
         preferences: Option<crate::features::stream_control::StreamControlPreferences>,
         purpose: crate::session::negotiation::ControlPurpose,
+        entitlements: Option<&crate::protocol::entitlements::Snapshot>,
     ) -> Result<ControlSessionInfo> {
         tracing::debug!(?profile, "starting control handshake");
         let decoder_support =
@@ -331,6 +334,7 @@ impl SignalSession {
             connect_type,
             preferences,
             purpose,
+            entitlements,
         )?;
         let app_control_id = frames.app_control_id;
         self.send_binary_packet(frames.header, frames.attachment)?;
@@ -672,6 +676,7 @@ impl SignalSession {
         mut self,
         mut shutdown: oneshot::Receiver<()>,
         mut requests: tokio::sync::mpsc::UnboundedReceiver<RoomRequest>,
+        mut expiration: Option<crate::account::membership::RoomExpiration>,
     ) -> Result<()> {
         use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
         struct Slot {
@@ -734,6 +739,11 @@ impl SignalSession {
             let primary_control = slots.first().map(|slot| slot.control.clone());
             tokio::select! {
                 biased;
+                // 跨境房间的有效期由账号通知决定，到期后整条信令 socket 与
+                // 其上的所有会话一起结束。
+                error = crate::account::membership::RoomExpiration::revoked(&mut expiration) => {
+                    break Err(error);
+                }
                 _ = &mut shutdown, if !shutdown_seen => {
                     shutdown_seen = true;
                     // 主人只关自己那一路：房间还开着别的会话就把 socket 留着。
@@ -756,6 +766,7 @@ impl SignalSession {
                                         crate::session::negotiation::ControlConnectType::Normal,
                                         None,
                                         request.purpose,
+                                        request.entitlements.as_ref(),
                                     )
                                     .await
                                     .context("room session control handshake")?;
@@ -1119,13 +1130,21 @@ impl SignalSession {
         shutdown: oneshot::Receiver<()>,
         client: crate::session::host_client::HostClient,
     ) -> Result<()> {
-        self.keep_alive_inner(shutdown, None, None, Some(host::Session::new(client)))
-            .await
+        self.keep_alive_inner(
+            async {
+                let _ = shutdown.await;
+                Ok(())
+            },
+            None,
+            None,
+            Some(host::Session::new(client)),
+        )
+        .await
     }
 
     async fn keep_alive_inner(
         mut self,
-        mut shutdown: oneshot::Receiver<()>,
+        shutdown: impl Future<Output = Result<()>>,
         peer: Option<std::sync::Arc<NativePeer>>,
         control: Option<ControlSessionInfo>,
         mut host: Option<host::Session>,
@@ -1148,7 +1167,7 @@ impl SignalSession {
         network_switch_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let signal_result = tokio::select! {
             biased;
-            _ = &mut shutdown => Ok(()),
+            result = shutdown => result,
             result = async {
             if peer.is_some() != control.is_some() { bail!("controller signaling lifecycle is incomplete"); }
             loop {

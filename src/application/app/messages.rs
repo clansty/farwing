@@ -127,7 +127,11 @@ pub(super) enum GuiEvent {
         error: String,
     },
     ExitReady(std::result::Result<(), String>),
-    Host(u64, crate::features::host::Handle),
+    Host(
+        u64,
+        crate::features::host::Handle,
+        Option<tokio::sync::watch::Receiver<Option<crate::account::membership::Profile>>>,
+    ),
     /// 后台的 FUSE 挂载结束；成功不代表一定挂上，界面以 `fuse::mounted_path()` 为准。
     #[cfg(target_os = "linux")]
     FuseMounted(u64, std::result::Result<(), String>),

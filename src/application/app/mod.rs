@@ -193,6 +193,8 @@ struct DeviceCenterApp {
     tag_draft: Option<view::TagDraft>,
     /// 标签同步对话框里的目录草稿。
     tag_sync: Option<String>,
+    membership_profile:
+        Option<tokio::sync::watch::Receiver<Option<crate::account::membership::Profile>>>,
     diagnostics: diagnostics::LocalDiagnostics,
     mutation_pending: bool,
     queued_mutation: Option<DeviceMutation>,
@@ -259,6 +261,7 @@ impl DeviceCenterApp {
             tags: None,
             tag_draft: None,
             tag_sync: None,
+            membership_profile: None,
             diagnostics: diagnostics::LocalDiagnostics::start(),
             mutation_pending: false,
             queued_mutation: None,
@@ -362,9 +365,10 @@ impl DeviceCenterApp {
                     }
                 }
                 GuiEvent::Presence(presence) => self.presence = presence,
-                GuiEvent::Host(generation, host) => {
+                GuiEvent::Host(generation, host, profile) => {
                     if generation == self.login_generation {
                         self.host = Some(host);
+                        self.membership_profile = profile;
                     }
                 }
                 #[cfg(target_os = "linux")]
@@ -975,6 +979,7 @@ impl DeviceCenterApp {
         self.tag_sync = None;
         self.center_ui.clear_tag_filters();
         self.account_name.clear();
+        self.membership_profile = None;
         self.center_ui.close_details();
     }
 

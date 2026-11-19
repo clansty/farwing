@@ -473,6 +473,10 @@ pub(super) async fn publish_state(
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         let mut follow = None;
+        let entitlement_delay = screens
+            .try_lock()
+            .ok()
+            .map_or(Duration::from_secs(1), |s| s.entitlement_delay());
         let refresh = tokio::select! {
             _=cancel.cancelled()=>break,
             result=changed.changed()=>{if result.is_err(){break;} false},
@@ -485,9 +489,13 @@ pub(super) async fn publish_state(
                 false
             },
             _=timer.tick()=>true,
+            _=tokio::time::sleep(entitlement_delay)=>false,
         };
         if let Some(id) = follow {
             follow_controller_screen(&screens, id).await;
+        }
+        if let Ok(mut state) = screens.try_lock() {
+            state.refresh_entitlement_limits();
         }
         let inventory_revision = if refresh {
             screens

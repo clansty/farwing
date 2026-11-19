@@ -52,7 +52,10 @@ impl ResolvedConnection {
                     .find(|d| d.device_id == self.target_device_id)
                     .context("更新后设备已不在当前账号中")?;
                 device.validated_device_id()?;
-                anyhow::ensure!(device.platform == 1, "更新后的设备类型已变化");
+                anyhow::ensure!(
+                    device.platform == self.target_platform,
+                    "更新后的设备类型已变化"
+                );
                 if readiness.observe(
                     device.is_connected() && device.controlled_support && device.controllable,
                     std::time::Instant::now(),
@@ -92,6 +95,18 @@ impl ResolvedConnection {
         if self.assist.is_none()
             && let Some(session) = shared::get(&key)
         {
+            let _membership_slot = cancellable(cancel, async {
+                Ok(self.client.membership.connecting.lock().await)
+            })
+            .await?;
+            if shared::viewing_count(&self.client.account_generation()) > 0
+                && let Ok(table) = cancellable(cancel, self.client.account_entitlements()).await
+            {
+                anyhow::ensure!(
+                    table.allows("multi_channel", None),
+                    "当前账号权益不支持同时连接多台设备"
+                );
+            }
             self.takeover = None;
             let mut connection = ControllerConnection::from_shared(session, self.profile, true)?;
             let session = Arc::clone(&connection.forwarder.session);
@@ -126,12 +141,13 @@ impl ResolvedConnection {
                         .feature_catalog()
                         .policy(self.target_platform, &self.target_version),
                 );
-                if self.target_platform == 1 {
+                if matches!(self.target_platform, 1 | 4) {
                     handle.set_remote_upgrade(crate::features::remote_upgrade::RemoteUpgrade::new(
                         Arc::clone(&self.client),
                         self.target_device_id.clone(),
                         self.summary.alias.clone(),
                         self.target_version.clone(),
+                        self.target_platform,
                         cancel,
                     ));
                 }
@@ -223,6 +239,10 @@ impl ResolvedConnection {
             };
             Some(joined)
         };
+        let expiration = room
+            .as_ref()
+            .filter(|room| room.international_connect)
+            .map(|_| self.client.membership.cross_border_room());
         if self.refresh_after_upgrade {
             // Rejoining the room establishes that the target is back online.
             // Refresh its real version before rebuilding feature policy.
@@ -232,7 +252,10 @@ impl ResolvedConnection {
                 .iter()
                 .find(|device| device.device_id == self.target_device_id)
                 .context("更新后的设备已不在当前账号中")?;
-            anyhow::ensure!(device.platform == 1, "更新后的设备类型已变化");
+            anyhow::ensure!(
+                device.platform == self.target_platform,
+                "更新后的设备类型已变化"
+            );
             self.target_version = device.version_name.clone();
             self.refresh_after_upgrade = false;
         }
@@ -328,6 +351,8 @@ impl ResolvedConnection {
         let mut connection = ControllerConnection::establish(
             room,
             &key,
+            expiration,
+            &self.client,
             &self.controller_device_id,
             self.profile,
             self.client
@@ -354,12 +379,13 @@ impl ResolvedConnection {
         if self.assist.is_none() {
             shared::register(key, &connection.forwarder.session, self.client.ended());
         }
-        if self.assist.is_none() && self.target_platform == 1 {
+        if self.assist.is_none() && matches!(self.target_platform, 1 | 4) {
             handle.set_remote_upgrade(crate::features::remote_upgrade::RemoteUpgrade::new(
                 Arc::clone(&self.client),
                 self.target_device_id.clone(),
                 self.summary.alias.clone(),
                 self.target_version.clone(),
+                self.target_platform,
                 cancel,
             ));
         }
