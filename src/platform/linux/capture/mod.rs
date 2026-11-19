@@ -176,6 +176,9 @@ pub(crate) struct Frame {
 pub(crate) struct RawCapture {
     pub width: u32,
     pub height: u32,
+    /// 与 Windows 侧对齐：只有指针更新、没有新画面的那次抓取不算新帧。Linux 没有
+    /// 原始纹理交付路径，这个字段只为了让上层的计数代码两平台共用。
+    pub is_new: bool,
     pub captured: Instant,
 }
 
