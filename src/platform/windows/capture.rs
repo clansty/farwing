@@ -372,8 +372,6 @@ impl Frame {
 /// 未经缩放的 DXGI 帧。纹理已经复制进采集→编码的共享环，`lease` 负责
 /// 让编码线程等 GPU 写入完成。
 pub(crate) struct RawCapture {
-    pub width: u32,
-    pub height: u32,
     pub captured: std::time::Instant,
     pub is_new: bool,
     pub hdr_metadata: Option<crate::media::video_color::HdrMetadata>,
@@ -964,8 +962,6 @@ impl Duplication {
                 rotation => rotation,
             };
             Ok(Some(RawCapture {
-                width: desc.Width,
-                height: desc.Height,
                 captured,
                 is_new: true,
                 hdr_metadata: if hdr { self.source_hdr } else { None },
