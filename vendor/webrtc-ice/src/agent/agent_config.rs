@@ -166,6 +166,9 @@ pub struct AgentConfig {
     /// DTLS.
     pub insecure_skip_verify: bool,
 
+    /// Opt this agent out of the process-wide SOCKS5 egress.
+    pub disable_socks5_egress: bool,
+
     /// Include loopback addresses in the candidate list.
     pub include_loopback: bool,
 

@@ -135,6 +135,7 @@ impl RTCIceGatherer {
             // UU advertises numeric TURNS endpoints whose certificate is issued to
             // *.relay.nrd.nie.163.com; its native client uses the no-name-check policy.
             insecure_skip_verify: true,
+            disable_socks5_egress: self.setting_engine.disable_socks5_egress,
             network_preference: self.setting_engine.candidates.network_preference,
             vpn_preference: self.setting_engine.candidates.vpn_preference,
             presume_writable_when_fully_relayed: self

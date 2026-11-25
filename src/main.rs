@@ -34,6 +34,12 @@ struct Cli {
     /// 指定诊断日志文件（默认写入用户日志目录并自动轮转）
     #[arg(long, global = true)]
     log_file: Option<PathBuf>,
+    /// 中转连接经 SOCKS5 出口（socks5://[用户:密码@]主机:端口）；局域网直连不受影响
+    #[arg(long, global = true, value_name = "URL")]
+    socks5: Option<String>,
+    /// 本次运行忽略已配置的 SOCKS5
+    #[arg(long, global = true, conflicts_with = "socks5")]
+    direct: bool,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -108,6 +114,18 @@ enum Commands {
     },
     #[command(hide = true)]
     DisplayRecovery { token: String },
+    /// 对比直连与 SOCKS5 的上传速度（使用 --socks5 或 network.json 里的代理）
+    NetTest {
+        /// 接收 POST 的测速地址
+        #[arg(long, default_value = "https://speed.cloudflare.com/__up")]
+        url: String,
+        /// 每轮上传大小（MiB）
+        #[arg(long, default_value_t = 10)]
+        size: usize,
+        /// 每种路径的轮数
+        #[arg(long, default_value_t = 3)]
+        rounds: usize,
+    },
     /// 列出或接上本机正在运行的被控终端会话，或指定远端设备上的终端
     Terminal {
         /// 本机会话名或编号；远端会话使用 `--list` 显示的编号
@@ -212,6 +230,7 @@ fn main() -> Result<()> {
         println!("1");
         return Ok(());
     }
+    openuuyc::features::network_proxy::configure(cli.socks5.as_deref(), cli.direct)?;
     let link = cli.link.clone();
     let command = cli.command.unwrap_or(Commands::Gui {
         background: false,
@@ -415,6 +434,9 @@ fn main() -> Result<()> {
             with_files,
         } => tokio::runtime::Runtime::new()?
             .block_on(openuuyc::debug_dual_probe(&alias, terminal_first, with_files)),
+        Commands::NetTest { url, size, rounds } => tokio::runtime::Runtime::new()?.block_on(
+            openuuyc::features::network_proxy::speed_test(&url, cli.socks5.as_deref(), size, rounds),
+        ),
         Commands::Devices => tokio::runtime::Runtime::new()?.block_on(print_devices()),
         Commands::Connect {
             device,

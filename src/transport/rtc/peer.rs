@@ -138,10 +138,12 @@ impl NativePeer {
         .context("register WebRTC transport feedback interceptors")?;
         let registry = configure_twcc_sender_only(registry, &mut media_engine)
             .context("register audio sender transport sequence extension")?;
+        let mut settings = ConnectionCore::settings();
+        settings.set_socks5_egress(crate::features::network_proxy::egress_for(false));
         let core = ConnectionCore::new(
             media_engine,
             registry,
-            ConnectionCore::settings(),
+            settings,
             RTCConfiguration {
                 ice_servers: ice_servers.into_iter().map(Into::into).collect(),
                 ice_transport_policy: if transport == TransportChoice::Relay {
@@ -421,7 +423,19 @@ impl NativePeer {
             &pair.remote.address,
         );
         let protocol = pair.local.protocol.to_string().to_uppercase();
-        let relay = if route == "relay" {
+        let proxied = pair
+            .local
+            .address
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| {
+                webrtc::ice::socks5::is_proxied(std::net::SocketAddr::new(ip, pair.local.port))
+            });
+        let route = match (proxied, route) {
+            (true, "relay") => "relay (Socks5)",
+            (true, _) => "P2P (Socks5)",
+            (false, route) => route,
+        };
+        let relay = if route.starts_with("relay") {
             let relay_protocol = if !pair.local.relay_protocol.is_empty() {
                 pair.local.relay_protocol.as_str()
             } else {

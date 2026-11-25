@@ -11,6 +11,7 @@ pub mod network_type;
 pub mod priority;
 pub mod rand;
 mod socket_options;
+pub mod socks5;
 pub mod state;
 pub mod stats;
 pub mod tcp_type;

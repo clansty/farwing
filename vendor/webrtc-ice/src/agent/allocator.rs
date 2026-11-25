@@ -40,6 +40,7 @@ pub(super) struct AllocationSession {
     sequences: Mutex<Vec<Arc<Sequence>>>,
     pending: AtomicUsize,
     completed: Notify,
+    proxy_udp: AtomicBool,
 }
 
 impl AllocationSession {
@@ -75,6 +76,7 @@ impl AllocationSession {
             sequences: Mutex::new(Vec::new()),
             pending: AtomicUsize::new(0),
             completed: Notify::new(),
+            proxy_udp: AtomicBool::new(false),
         })
     }
     fn work(self: &Arc<Self>) -> AllocationWork {
@@ -359,13 +361,75 @@ async fn prepare_udp_port(
     let stun = Arc::new(TransactionManager::new(port.closed.child_token()));
     shared.start_reader(&params.agent_internal, &port, stun.clone())?;
     *sequence.socket.lock().await = Some(shared.clone());
-    if params.candidate_types.contains(&CandidateType::Host) && !host_ip.is_unspecified() {
+    let wan_dropped = params.agent_internal.prefer_proxy() && !super::super::socks5::is_lan_ip(host_ip);
+    if wan_dropped {
+        log::info!("proxy preferred: not publishing WAN host candidate {host_ip}");
+    }
+    if params.candidate_types.contains(&CandidateType::Host)
+        && !host_ip.is_unspecified()
+        && !wan_dropped
+    {
         params
             .agent_internal
             .publish_port_candidate(&port, candidate, true)
             .await?;
     }
-    schedule_stun(&params, &session, port, shared, stun, interface.clone());
+    // Server-reflexive candidates would offer a direct WAN path that the
+    // preferred proxy is meant to replace.
+    if !params.agent_internal.prefer_proxy() {
+        schedule_stun(&params, &session, port, shared, stun, interface.clone(), false);
+    }
+    Ok(())
+}
+
+/// A UDP port whose traffic is relayed by the SOCKS5 server. Only the
+/// server-reflexive candidate learnt through it (the proxy's public endpoint)
+/// is published, never the local address.
+async fn prepare_proxied_udp(
+    params: Arc<GatherCandidatesInternalParams>,
+    session: Arc<AllocationSession>,
+    sequence: Arc<Sequence>,
+) -> Result<()> {
+    let interface = &sequence.interface;
+    let Some(proxy) = super::super::socks5::active() else {
+        return Ok(());
+    };
+    let conn = super::super::socks5::udp_associate(&proxy.0, interface.ip)
+        .await
+        .map_err(|error| Error::Other(error.to_string()))?;
+    let raw: Arc<dyn Conn + Send + Sync> = conn;
+    let shared = SharedUdpSocket::new(raw)?;
+    let owned_socket: Arc<dyn Conn + Send + Sync> = shared.clone();
+    params.owner.socket(&owned_socket);
+    let socket_addr = shared.local_addr()?;
+    let candidate: LocalCandidate = Arc::new(
+        CandidateHostConfig {
+            base_config: CandidateBaseConfig {
+                network: "udp".into(),
+                address: interface.ip.to_string(),
+                port: socket_addr.port(),
+                component: COMPONENT_RTP,
+                priority: uu_candidate_priority(126, interface.network_preference, interface.ip, 0),
+                conn: Some(shared.lease()),
+                network_key: interface.network_key.clone(),
+                network_id: interface.network_id,
+                network_cost: Some(uu_network_cost(interface.adapter_type)),
+                adapter_type: interface.adapter_type,
+                generation: session.generation,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .new_candidate_host()?,
+    );
+    let port = params
+        .agent_internal
+        .register_local_port(candidate, false, CandidatePair::now_nanos())
+        .await?;
+    sequence.add_port(&port);
+    let stun = Arc::new(TransactionManager::new(port.closed.child_token()));
+    shared.start_reader(&params.agent_internal, &port, stun.clone())?;
+    schedule_stun(&params, &session, port, shared, stun, interface.clone(), true);
     Ok(())
 }
 
@@ -384,6 +448,18 @@ async fn run_sequence(
             );
         }
     }
+    if params.agent_internal.prefer_proxy()
+        && sequence.gather_udp
+        && !session.proxy_udp.swap(true, Ordering::AcqRel)
+    {
+        if let Err(error) =
+            prepare_proxied_udp(params.clone(), session.clone(), sequence.clone()).await
+        {
+            // Another interface may reach the proxy; let it try again.
+            session.proxy_udp.store(false, Ordering::Release);
+            log::warn!("SOCKS5 UDP association failed: {error}");
+        }
+    }
     // AllocationSequence phases are 50ms apart, not a wait for STUN replies.
     tokio::select! {
         biased;
@@ -398,7 +474,16 @@ async fn run_sequence(
             .cloned()
             .collect::<Vec<_>>();
         let count = urls.len();
+        // With the proxy preferred, only stream (TCP/TLS) TURN servers can be
+        // dialled through SOCKS5; direct relays are dropped unless no such
+        // server exists, so the connection can still be established.
+        let proxied = params.agent_internal.prefer_proxy()
+            && urls.iter().any(|url| url.proto == ProtoType::Tcp);
         for (index, url) in urls.into_iter().enumerate() {
+            let stream_server = url.proto == ProtoType::Tcp;
+            if proxied && !stream_server {
+                continue;
+            }
             schedule_relay(
                 &params,
                 &session,
@@ -406,6 +491,7 @@ async fn run_sequence(
                 url,
                 (count - index) as u32,
                 true,
+                proxied,
             );
         }
     }
@@ -414,7 +500,10 @@ async fn run_sequence(
         _ = sequence.stop_phases.cancelled() => return Ok(()),
         _ = tokio::time::sleep(Duration::from_millis(50)) => {},
     }
-    if sequence.gather_tcp {
+    if sequence.gather_tcp
+        && !(params.agent_internal.prefer_proxy()
+            && !super::super::socks5::is_lan_ip(sequence.interface.ip))
+    {
         prepare_tcp_port(&params, &session, &sequence).await?;
     }
     Ok(())
@@ -488,6 +577,7 @@ fn schedule_stun(
     shared: Arc<SharedUdpSocket>,
     manager: Arc<TransactionManager>,
     interface: LocalInterface,
+    proxied: bool,
 ) {
     let work = session.work();
     let params2 = params.clone();
@@ -530,6 +620,7 @@ fn schedule_stun(
                 conn: shared.lease(),
                 interface: interface.clone(),
                 server,
+                proxied,
             };
             let work = session.work();
             params2.owner.spawn(async move {
@@ -554,6 +645,7 @@ struct StunBinding {
     conn: Arc<dyn Conn + Send + Sync>,
     interface: LocalInterface,
     server: SocketAddr,
+    proxied: bool,
 }
 
 async fn run_stun_binding(args: StunBinding, work: AllocationWork) {
@@ -616,6 +708,9 @@ async fn run_stun_binding(args: StunBinding, work: AllocationWork) {
                             rel_port: args.port.canonical.port(),
                         }
                         .new_candidate_server_reflexive();
+                        if args.proxied {
+                            super::super::socks5::note_proxied(address);
+                        }
                         if args
                             .params
                             .candidate_types
@@ -711,6 +806,7 @@ fn schedule_relay(
     url: Url,
     preference: u32,
     share_udp: bool,
+    via_proxy: bool,
 ) {
     // UU 9A306 skips a literal server of the other address family before
     // constructing a Port. Unresolved names follow the per-family resolver.
@@ -732,7 +828,8 @@ fn schedule_relay(
     params.owner.spawn(async move {
         let _work = work;
         if let Err(error) =
-            allocate_relay(params2, session2, sequence, url, preference, share_udp).await
+            allocate_relay(params2, session2, sequence, url, preference, share_udp, via_proxy)
+                .await
         {
             log::warn!("TURN Port allocation failed: {error}");
         }
@@ -778,6 +875,7 @@ async fn prepare_relay_transport(
     sequence: &Sequence,
     url: &Url,
     share_udp: bool,
+    via_proxy: bool,
     pending: &mut PendingRelay,
 ) -> Result<ReadyRelay> {
     let local_ip = sequence.interface.ip;
@@ -807,6 +905,7 @@ async fn prepare_relay_transport(
                 Some(local_ip),
                 url.scheme == SchemeType::Turns,
                 params.agent_internal.insecure_skip_verify,
+                via_proxy,
             )
             .await?
         };
@@ -910,6 +1009,7 @@ async fn allocate_relay(
     url: Url,
     preference: u32,
     share_udp: bool,
+    via_proxy: bool,
 ) -> Result<()> {
     let interface = &sequence.interface;
     let created_at = CandidatePair::now_nanos();
@@ -917,7 +1017,7 @@ async fn allocate_relay(
     let mut pending = PendingRelay::default();
     let ready = tokio::time::timeout_at(
         expiry,
-        prepare_relay_transport(&params, &sequence, &url, share_udp, &mut pending),
+        prepare_relay_transport(&params, &sequence, &url, share_udp, via_proxy, &mut pending),
     )
     .await;
     let (client, allocation, local, server) = match ready {
@@ -945,6 +1045,9 @@ async fn allocate_relay(
     actual_url.port = server.port();
     let finish = async {
         let address = allocation.local_addr()?;
+        if via_proxy {
+            super::super::socks5::note_proxied(address);
+        }
         let candidate: LocalCandidate = Arc::new(
             CandidateRelayConfig {
                 base_config: CandidateBaseConfig {

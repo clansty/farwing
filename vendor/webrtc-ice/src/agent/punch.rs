@@ -437,7 +437,13 @@ impl Coordinator {
                 return;
             };
             let key = target.base.canonical.network_key();
-            if !session.has_punch_network(&key).await {
+            // Port-prediction punching opens direct WAN sockets, which the
+            // preferred SOCKS5 egress replaces.
+            let proxy_preferred = allocation
+                .agent
+                .upgrade()
+                .is_some_and(|agent| agent.prefer_proxy());
+            if proxy_preferred || !session.has_punch_network(&key).await {
                 return;
             }
             let Some(interface) = allocation.catalog.lock().await.network(&key) else {

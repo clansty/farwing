@@ -375,6 +375,7 @@ impl Peer {
             RTPCodecType::Video,
         )?;
         let mut settings = ConnectionCore::settings();
+        settings.set_socks5_egress(crate::features::network_proxy::egress_for(true));
         settings.enable_sender_rtx(true);
         settings.enable_sender_rsfec(true);
         let core = ConnectionCore::new(

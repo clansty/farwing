@@ -103,6 +103,7 @@ pub struct SettingEngine {
     //iceProxyDialer                            :proxy.Dialer,?
     pub(crate) udp_network: UDPNetwork,
     pub(crate) disable_media_engine_copy: bool,
+    pub(crate) disable_socks5_egress: bool,
     pub(crate) disable_media_engine_multiple_codecs: bool,
     pub(crate) srtp_protection_profiles: Vec<SrtpProtectionProfile>,
     pub(crate) receive_mtu: usize,
@@ -361,6 +362,11 @@ impl SettingEngine {
     //pub fn SetICEProxyDialer(&mut self, d proxy.Dialer) {
     //    self.iceProxyDialer = d
     //}
+
+    /// Whether this connection may use the process-wide SOCKS5 egress.
+    pub fn set_socks5_egress(&mut self, enabled: bool) {
+        self.disable_socks5_egress = !enabled;
+    }
 
     /// disable_media_engine_copy stops the MediaEngine from being copied. This allows a user to modify
     /// the MediaEngine after the PeerConnection has been constructed. This is useful if you wish to

@@ -467,6 +467,10 @@ pub(super) fn private_route_address(address: &str) -> bool {
     let Ok(address) = address.parse::<IpAddr>() else {
         return false;
     };
+    if webrtc::ice::socks5::is_configured_lan(address) {
+        // Intranet ranges configured as `lan` in network.json.
+        return true;
+    }
     match address {
         IpAddr::V4(address) => {
             address.is_private()

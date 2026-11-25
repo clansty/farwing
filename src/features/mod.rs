@@ -5,6 +5,7 @@ pub(crate) mod drag_drop;
 pub(crate) mod file_transfer;
 pub(crate) mod host;
 pub(crate) mod network_control;
+pub mod network_proxy;
 pub(crate) mod port_mapping;
 pub(crate) mod remote_cursor;
 pub(crate) mod remote_input;

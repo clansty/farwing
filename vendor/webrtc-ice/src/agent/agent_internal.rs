@@ -231,6 +231,7 @@ pub struct AgentInternal {
 
     // the following variables won't be changed after init_with_defaults()
     pub(crate) insecure_skip_verify: bool,
+    pub(crate) socks5_egress: bool,
     pub(crate) max_binding_requests: u16,
     pub(crate) max_outstanding_pings: Option<u16>,
     pub(crate) host_acceptance_min_wait: Duration,
@@ -259,6 +260,11 @@ pub struct AgentInternal {
 }
 
 impl AgentInternal {
+    /// True when this agent should route through the preferred SOCKS5 egress.
+    pub(crate) fn prefer_proxy(&self) -> bool {
+        self.socks5_egress && crate::socks5::prefer_proxy()
+    }
+
     pub(super) fn new(config: &AgentConfig) -> (Self, ChanReceivers) {
         // Lifecycle notifications are ordered, not a media buffer. A close
         // invoked by a state callback must be able to enqueue Closed without
@@ -307,6 +313,7 @@ impl AgentInternal {
             ever_had_pair: AtomicBool::new(false),
             ever_writable: AtomicBool::new(false),
             insecure_skip_verify: config.insecure_skip_verify,
+            socks5_egress: !config.disable_socks5_egress,
 
             started_ch_tx: Mutex::new(Some(started_ch_tx)),
 

@@ -226,17 +226,23 @@ impl TurnStreamConn {
         local_ip: Option<IpAddr>,
         use_tls: bool,
         insecure_skip_verify: bool,
+        via_proxy: bool,
     ) -> Result<Arc<dyn Conn + Send + Sync>, util::Error> {
-        let socket = if remote_addr.is_ipv4() {
-            TcpSocket::new_v4()?
-        } else {
-            TcpSocket::new_v6()?
+        let tcp = match crate::socks5::active().filter(|_| via_proxy) {
+            Some(proxy) => crate::socks5::connect(&proxy.0, remote_addr, local_ip).await?,
+            None => {
+                let socket = if remote_addr.is_ipv4() {
+                    TcpSocket::new_v4()?
+                } else {
+                    TcpSocket::new_v6()?
+                };
+                if let Some(local_ip) = local_ip {
+                    socket.bind(SocketAddr::new(local_ip, 0))?;
+                }
+                socket.connect(remote_addr).await?
+            }
         };
-        crate::socket_options::configure_media_buffers(&socket2::SockRef::from(&socket));
-        if let Some(local_ip) = local_ip {
-            socket.bind(SocketAddr::new(local_ip, 0))?;
-        }
-        let tcp = socket.connect(remote_addr).await?;
+        crate::socket_options::configure_media_buffers(&socket2::SockRef::from(&tcp));
         tcp.set_nodelay(true)?;
         let local_addr = tcp.local_addr()?;
         // A shutdown handle wakes both halves even when TLS/socket writes are
